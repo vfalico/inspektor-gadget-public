@@ -14,6 +14,12 @@
 
 #define MAX_ENTRIES 10240
 
+/* Configurable parameter: capture user-space stacks (default: true) */
+const volatile bool capture_stacks = true;
+
+GADGET_PARAM(capture_stacks);
+
+
 enum memop {
 	malloc,
 	free,
@@ -119,7 +125,8 @@ static __always_inline int gen_alloc_exit(struct pt_regs *ctx,
 	event->size = size;
 	event->timestamp_raw = bpf_ktime_get_ns();
 
-	gadget_get_user_stack(ctx, &event->ustack);
+	if (capture_stacks)
+		gadget_get_user_stack(ctx, &event->ustack);
 
 	gadget_submit_buf(ctx, &events, event, sizeof(*event));
 
@@ -144,7 +151,8 @@ static __always_inline int gen_free_enter(struct pt_regs *ctx,
 	event->size = 0;
 	event->timestamp_raw = bpf_ktime_get_ns();
 
-	gadget_get_user_stack(ctx, &event->ustack);
+	if (capture_stacks)
+		gadget_get_user_stack(ctx, &event->ustack);
 
 	gadget_submit_buf(ctx, &events, event, sizeof(*event));
 
