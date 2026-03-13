@@ -37,6 +37,7 @@ enum memop {
 	op_new_array,
 	op_delete,
 	op_delete_array,
+	reallocarray,
 };
 
 struct event {
@@ -327,6 +328,20 @@ SEC("uprobe/libc:_ZdaPv")
 int BPF_UPROBE(trace_uprobe_delete_array, void *address)
 {
 	return gen_free_enter(ctx, op_delete_array, (u64)address);
+}
+
+/* reallocarray */
+SEC("uprobe/libc:reallocarray")
+int BPF_UPROBE(trace_uprobe_reallocarray, void *ptr, size_t nmemb, size_t size)
+{
+	gen_free_enter(ctx, realloc_free, (u64)ptr);
+	return gen_alloc_enter(nmemb * size);
+}
+
+SEC("uretprobe/libc:reallocarray")
+int trace_uretprobe_reallocarray(struct pt_regs *ctx)
+{
+	return gen_alloc_exit(ctx, reallocarray, PT_REGS_RC(ctx));
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
