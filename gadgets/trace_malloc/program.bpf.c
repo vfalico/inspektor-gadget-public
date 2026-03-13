@@ -27,6 +27,10 @@ enum memop {
 	valloc,
 	memalign,
 	pvalloc,
+	op_new,
+	op_new_array,
+	op_delete,
+	op_delete_array,
 };
 
 struct event {
@@ -276,5 +280,45 @@ int BPF_UPROBE(trace_uprobe_pvalloc, size_t size)
 }
 
 PROBE_RET_VAL_FOR_ALLOC(pvalloc)
+
+/* C++ operator new (_Znwm) */
+SEC("uprobe/libc:_Znwm")
+int BPF_UPROBE(trace_uprobe_new, size_t size)
+{
+	return gen_alloc_enter(size);
+}
+
+SEC("uretprobe/libc:_Znwm")
+int trace_uretprobe_new(struct pt_regs *ctx)
+{
+	return gen_alloc_exit(ctx, op_new, PT_REGS_RC(ctx));
+}
+
+/* C++ operator new[] (_Znam) */
+SEC("uprobe/libc:_Znam")
+int BPF_UPROBE(trace_uprobe_new_array, size_t size)
+{
+	return gen_alloc_enter(size);
+}
+
+SEC("uretprobe/libc:_Znam")
+int trace_uretprobe_new_array(struct pt_regs *ctx)
+{
+	return gen_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx));
+}
+
+/* C++ operator delete (_ZdlPv) */
+SEC("uprobe/libc:_ZdlPv")
+int BPF_UPROBE(trace_uprobe_delete, void *address)
+{
+	return gen_free_enter(ctx, op_delete, (u64)address);
+}
+
+/* C++ operator delete[] (_ZdaPv) */
+SEC("uprobe/libc:_ZdaPv")
+int BPF_UPROBE(trace_uprobe_delete_array, void *address)
+{
+	return gen_free_enter(ctx, op_delete_array, (u64)address);
+}
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
