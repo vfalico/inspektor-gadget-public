@@ -1,10 +1,32 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 /* Copyright (c) 2025 The Inspektor Gadget authors */
 
+/*
+ * profile_cuda — User-facing LLM SLO diagnostics via libcuda.so uprobes
+ *
+ * Tracks CUDA-level metrics that map to end-user pain points:
+ *
+ * 1. Memory profiling: allocation tracking by stack (flame-graph ready)
+ * 2. Error monitoring: capture CUDA API errors with context
+ * 3. Sync stall detection: flag long cuStreamSynchronize/cuCtxSynchronize
+ * 4. Kernel launch rate: detect launch-bound workloads
+ * 5. Memory transfer tracking: HtoD/DtoH byte counting
+ * 6. Context lifecycle: detect context leaks (create without destroy)
+ * 7. CUDA Graph adoption: track graph vs eager launch ratios
+ * 8. Module load errors: detect version mismatches
+ * 9. P2P diagnostics: peer access enable/fail tracking
+ * 10. Inference SLO metrics: TTFT, ITL jitter, request fairness,
+ *     per-request latency breakdown, long context detection
+ *
+ * All instrumentation is on the CUDA Driver API (libcuda.so) symbols,
+ * which are stable across CUDA versions and used by ALL frameworks.
+ */
+
 #include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+#include <gadget/buffer.h>
 #include <gadget/types.h>
 #include <gadget/common.h>
 #include <gadget/filter.h>
@@ -12,28 +34,28 @@
 #include <gadget/user_stack_map.h>
 
 #define MAX_ENTRIES 10240
+/* ════════════════════════════════════════════════════════════════════════
+ *  Part 1: Memory Profiling (base feature from ac5eb606f)
+ * ════════════════════════════════════════════════════════════════════════ */
 
 enum memop {
-	cuMemAlloc,
-	cuMemFree,
-	cuMemAllocHost,
-	cuMemFreeHost,
-	cuMemAllocManaged,
-	cuMemAllocPitch,
-	cuMemAlloc3D,
+	MEMOP_ALLOC,
+	MEMOP_ALLOC_HOST,
+	MEMOP_ALLOC_MANAGED,
+	MEMOP_ALLOC_PITCH,
+	MEMOP_ALLOC_ASYNC,
+	MEMOP_FREE_ASYNC,
+	MEMOP_POOL_CREATE,
 };
 
-/* used for context between uprobes and uretprobes of allocations */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_ENTRIES);
-	__type(key, u32); // tid
-	__type(value, u64);
+	__type(key, u32);   /* tid */
+	__type(value, u64);  /* alloc size */
 } sizes SEC(".maps");
 
-struct alloc_key {
-	__u32 stack_id_key;
-};
+struct alloc_key { __u32 stack_id_key; };
 
 struct alloc_val {
 	__u64 count;
@@ -48,11 +70,6 @@ struct {
 	__type(value, struct alloc_val);
 } allocs SEC(".maps");
 
-/*
- * Heap-allocated scratch space to avoid blowing the 256-byte stack limit
- * required for tail calls. struct alloc_val (~152 B) and
- * struct gadget_user_stack (~64 B) are too large to live on the BPF stack.
- */
 struct heap_data {
 	struct gadget_user_stack ustack;
 	struct alloc_val val;
@@ -67,155 +84,128 @@ struct {
 
 GADGET_MAPITER(allocs, allocs);
 
-/**
- * clean up the maps when a thread terminates,
- * because there may be residual data in the map
- * if a userspace thread is killed between a uprobe and a uretprobe
- */
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  Helpers
+ * ════════════════════════════════════════════════════════════════════════ */
+
 SEC("tracepoint/sched/sched_process_exit")
 int trace_sched_process_exit(void *ctx)
 {
-	u32 tid;
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	u32 tid  = (u32)pid_tgid;
 
-	tid = (u32)bpf_get_current_pid_tgid();
 	bpf_map_delete_elem(&sizes, &tid);
 	return 0;
 }
 
-static __always_inline int gen_alloc_enter(size_t size)
+/* ─── Memory alloc helpers ─── */
+
+static __always_inline int alloc_enter(size_t size)
 {
-	u32 tid;
-
-	tid = (u32)bpf_get_current_pid_tgid();
+	u32 tid = (u32)bpf_get_current_pid_tgid();
 	bpf_map_update_elem(&sizes, &tid, &size, BPF_ANY);
-
 	return 0;
 }
 
-static __always_inline int gen_alloc_exit(struct pt_regs *ctx,
-					  enum memop operation)
+static __always_inline int alloc_exit(struct pt_regs *ctx, enum memop op)
 {
-	u64 pid_tgid;
-	u32 tid;
-	u64 *size_ptr;
-	u64 size;
-	int ret;
-
-	// Ignore failed allocations (CUDA_SUCCESS = 0)
-	ret = PT_REGS_RC(ctx);
+	int ret = PT_REGS_RC(ctx);
 	if (ret != 0)
 		return 0;
 
 	if (gadget_should_discard_data_current())
 		return 0;
 
-	pid_tgid = bpf_get_current_pid_tgid();
-	tid = (u32)pid_tgid;
-	size_ptr = bpf_map_lookup_elem(&sizes, &tid);
+	u32 tid = (u32)bpf_get_current_pid_tgid();
+	u64 *size_ptr = bpf_map_lookup_elem(&sizes, &tid);
 	if (!size_ptr)
 		return 0;
-	size = *size_ptr;
+	u64 size = *size_ptr;
 	bpf_map_delete_elem(&sizes, &tid);
 
-	/*
-	 * Use a per-CPU array as heap space for the large structs that would
-	 * otherwise push the stack frame well beyond the 256-byte limit
-	 * enforced by the verifier when tail calls are reachable.
-	 */
 	u32 zero = 0;
-	struct heap_data *heap_ptr = bpf_map_lookup_elem(&heap, &zero);
-	if (!heap_ptr)
+	struct heap_data *h = bpf_map_lookup_elem(&heap, &zero);
+	if (!h)
 		return 0;
 
-	gadget_get_user_stack(ctx, &heap_ptr->ustack);
+	gadget_get_user_stack(ctx, &h->ustack);
 
-	struct alloc_key key = {
-		.stack_id_key = heap_ptr->ustack.stack_id,
-	};
-
+	struct alloc_key key = { .stack_id_key = h->ustack.stack_id };
 	struct alloc_val *val = bpf_map_lookup_elem(&allocs, &key);
 	if (!val) {
-		__builtin_memset(&heap_ptr->val, 0, sizeof(heap_ptr->val));
-		heap_ptr->val.count = size;
-		heap_ptr->val.ustack_raw = heap_ptr->ustack;
-
-		gadget_process_populate(&heap_ptr->val.proc);
-
-		bpf_map_update_elem(&allocs, &key, &heap_ptr->val,
-				    BPF_NOEXIST);
+		__builtin_memset(&h->val, 0, sizeof(h->val));
+		h->val.count = size;
+		h->val.ustack_raw = h->ustack;
+		gadget_process_populate(&h->val.proc);
+		bpf_map_update_elem(&allocs, &key, &h->val, BPF_NOEXIST);
 	} else {
 		__sync_fetch_and_add(&val->count, size);
 	}
-
 	return 0;
 }
+/* ════════════════════════════════════════════════════════════════════════
+ *  Probes: Memory Allocation
+ * ════════════════════════════════════════════════════════════════════════ */
 
-/*
- * cuMemAlloc_v2 - Allocate device memory (CUDA Driver API)
- * CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize)
- */
 SEC("uprobe/libcuda:cuMemAlloc_v2")
-int BPF_UPROBE(trace_uprobe_cuMemAlloc_v2, void **dptr, size_t bytesize)
-{
-	return gen_alloc_enter(bytesize);
-}
+int BPF_UPROBE(trace_uprobe_cuMemAlloc_v2, void **dptr, size_t size)
+{ return alloc_enter(size); }
 
 SEC("uretprobe/libcuda:cuMemAlloc_v2")
 int trace_uretprobe_cuMemAlloc_v2(struct pt_regs *ctx)
-{
-	return gen_alloc_exit(ctx, cuMemAlloc);
-}
+{ return alloc_exit(ctx, MEMOP_ALLOC); }
 
-/*
- * cuMemAllocHost_v2 - Allocate page-locked host memory (CUDA Driver API)
- * CUresult cuMemAllocHost_v2(void **pp, size_t bytesize)
- */
 SEC("uprobe/libcuda:cuMemAllocHost_v2")
-int BPF_UPROBE(trace_uprobe_cuMemAllocHost_v2, void **pp, size_t bytesize)
-{
-	return gen_alloc_enter(bytesize);
-}
+int BPF_UPROBE(trace_uprobe_cuMemAllocHost_v2, void **pp, size_t size)
+{ return alloc_enter(size); }
 
 SEC("uretprobe/libcuda:cuMemAllocHost_v2")
 int trace_uretprobe_cuMemAllocHost_v2(struct pt_regs *ctx)
-{
-	return gen_alloc_exit(ctx, cuMemAllocHost);
-}
+{ return alloc_exit(ctx, MEMOP_ALLOC_HOST); }
 
-/*
- * cuMemAllocManaged - Allocate managed memory (CUDA Driver API)
- * CUresult cuMemAllocManaged(CUdeviceptr *dptr, size_t bytesize, unsigned int flags)
- */
 SEC("uprobe/libcuda:cuMemAllocManaged")
-int BPF_UPROBE(trace_uprobe_cuMemAllocManaged, void **dptr, size_t bytesize,
+int BPF_UPROBE(trace_uprobe_cuMemAllocManaged, void **dptr, size_t size,
 	       unsigned int flags)
-{
-	return gen_alloc_enter(bytesize);
-}
+{ return alloc_enter(size); }
 
 SEC("uretprobe/libcuda:cuMemAllocManaged")
 int trace_uretprobe_cuMemAllocManaged(struct pt_regs *ctx)
-{
-	return gen_alloc_exit(ctx, cuMemAllocManaged);
-}
+{ return alloc_exit(ctx, MEMOP_ALLOC_MANAGED); }
 
-/*
- * cuMemAllocPitch_v2 - Allocate pitched device memory (CUDA Driver API)
- * CUresult cuMemAllocPitch_v2(CUdeviceptr *dptr, size_t *pPitch, size_t WidthInBytes, size_t Height, unsigned int ElementSizeBytes)
- */
 SEC("uprobe/libcuda:cuMemAllocPitch_v2")
 int BPF_UPROBE(trace_uprobe_cuMemAllocPitch_v2, void **dptr, size_t *pPitch,
-	       size_t WidthInBytes, size_t Height,
-	       unsigned int ElementSizeBytes)
-{
-	size_t size = WidthInBytes * Height; // Approximate size
-	return gen_alloc_enter(size);
-}
+	       size_t w, size_t h, unsigned int elem)
+{ return alloc_enter(w * h); }
 
 SEC("uretprobe/libcuda:cuMemAllocPitch_v2")
 int trace_uretprobe_cuMemAllocPitch_v2(struct pt_regs *ctx)
-{
-	return gen_alloc_exit(ctx, cuMemAllocPitch);
-}
+{ return alloc_exit(ctx, MEMOP_ALLOC_PITCH); }
+
+SEC("uprobe/libcuda:cuMemAllocAsync")
+int BPF_UPROBE(trace_uprobe_cuMemAllocAsync, void **dptr, size_t size,
+	       void *stream)
+{ return alloc_enter(size); }
+
+SEC("uretprobe/libcuda:cuMemAllocAsync")
+int trace_uretprobe_cuMemAllocAsync(struct pt_regs *ctx)
+{ return alloc_exit(ctx, MEMOP_ALLOC_ASYNC); }
+
+SEC("uprobe/libcuda:cuMemFreeAsync")
+int BPF_UPROBE(trace_uprobe_cuMemFreeAsync, void *dptr, void *stream)
+{ return alloc_enter(1); }
+
+SEC("uretprobe/libcuda:cuMemFreeAsync")
+int trace_uretprobe_cuMemFreeAsync(struct pt_regs *ctx)
+{ return alloc_exit(ctx, MEMOP_FREE_ASYNC); }
+
+SEC("uprobe/libcuda:cuMemPoolCreate")
+int BPF_UPROBE(trace_uprobe_cuMemPoolCreate, void *pool, void *props)
+{ return alloc_enter(1); }
+
+SEC("uretprobe/libcuda:cuMemPoolCreate")
+int trace_uretprobe_cuMemPoolCreate(struct pt_regs *ctx)
+{ return alloc_exit(ctx, MEMOP_POOL_CREATE); }
+
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";

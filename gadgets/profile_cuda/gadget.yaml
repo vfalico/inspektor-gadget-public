@@ -1,5 +1,7 @@
 name: profile cuda
-description: Profiles CUDA memory allocations in libcuda.so (Driver API)
+description: >-
+  CUDA memory profiling via libcuda.so uprobes — tracks allocations
+  including async alloc, free, and pool create with stack traces.
 homepageURL: https://inspektor-gadget.io/
 documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/profile_cuda
 sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/profile_cuda
