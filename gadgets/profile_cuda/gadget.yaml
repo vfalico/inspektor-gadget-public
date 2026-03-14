@@ -1,7 +1,9 @@
 name: profile cuda
 description: >-
-  CUDA memory profiling via libcuda.so uprobes — tracks allocations
-  including async alloc, free, and pool create with stack traces.
+  User-facing LLM SLO diagnostics: per-request latency breakdown,
+  streaming smoothness (ITL jitter), long context detection, memory
+  profiling, error monitoring, sync stall detection, kernel launch
+  tracking, and CUDA Graph adoption metrics.
 homepageURL: https://inspektor-gadget.io/
 documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/profile_cuda
 sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/profile_cuda
@@ -91,9 +93,127 @@ datasources:
         annotations:
           description: "1=create, 2=destroy, 3=set_current"
           columns.width: 12
+  ttft:
+    annotations:
+      description: "Time To First Token events for LLM inference"
+    fields:
+      ttft_ns:
+        annotations:
+          description: "Time To First Token (prefill duration, ns)"
+          columns.width: 16
+      prefill_kernels:
+        annotations:
+          description: "CUDA kernel launches during prefill"
+          columns.width: 16
+      prefill_start:
+        annotations:
+          columns.hidden: "true"
+      prefill_end:
+        annotations:
+          columns.hidden: "true"
+      detected_stack:
+        annotations:
+          description: "0=auto,1=llama.cpp,2=vllm,3=tgi,4=trtllm,5=hf_sdpa"
+          columns.width: 12
+  tokens:
+    annotations:
+      description: "Per-token events during LLM decode"
+    fields:
+      timestamp_ns:
+        annotations:
+          columns.hidden: "true"
+      inter_token_ns:
+        annotations:
+          description: "Inter-token latency (ns)"
+          columns.width: 16
+      token_index:
+        annotations:
+          description: "0-based token index in request"
+          columns.width: 10
+      detected_stack:
+        annotations:
+          columns.width: 12
+  requests:
+    annotations:
+      description: "LLM request completion with SLO metrics"
+    fields:
+      e2e_latency_ns:
+        annotations:
+          description: "End-to-end request latency (ns)"
+          columns.width: 16
+      ttft_ns:
+        annotations:
+          description: "Time To First Token (ns)"
+          columns.width: 16
+      decode_duration_ns:
+        annotations:
+          description: "Total decode phase duration (ns)"
+          columns.width: 16
+      total_tokens:
+        annotations:
+          description: "Total tokens generated"
+          columns.width: 12
+      detected_stack:
+        annotations:
+          columns.width: 12
+      itl_max_ns:
+        annotations:
+          description: "Worst inter-token latency spike (ns)"
+          columns.width: 14
+      itl_min_ns:
+        annotations:
+          description: "Best inter-token latency (ns)"
+          columns.width: 14
+      itl_avg_ns:
+        annotations:
+          description: "Mean inter-token latency (ns)"
+          columns.width: 14
+      itl_jitter_ns:
+        annotations:
+          description: "ITL jitter: max - min (ns)"
+          columns.width: 14
+      is_long_context:
+        annotations:
+          description: "1 if input exceeded long_ctx_kernels threshold"
+          columns.width: 10
+  long_ctx_alerts:
+    annotations:
+      description: "Alerts when prefill exceeds long context threshold"
+    fields:
+      timestamp_ns:
+        annotations:
+          columns.hidden: "true"
+      prefill_kernels:
+        annotations:
+          description: "Prefill kernel count at alert time"
+          columns.width: 16
+      estimated_ttft_ns:
+        annotations:
+          description: "Elapsed prefill time at alert (ns)"
+          columns.width: 18
 params:
   ebpf:
+    gap_threshold_ns:
+      key: gap_threshold_ns
+      description: "Gap (ns) between kernel launches for prefill→decode"
+      defaultValue: "200000"
+    min_prefill_kernels:
+      key: min_prefill_kernels
+      description: "Minimum kernel launches to qualify as prefill"
+      defaultValue: "10"
+    cooldown_ns:
+      key: cooldown_ns
+      description: "Cooldown (ns) after decode before new request detection"
+      defaultValue: "100000000"
+    stack_hint:
+      key: stack_hint
+      description: "0=auto, 1=llama.cpp, 2=vllm, 3=tgi, 4=trtllm, 5=hf_sdpa"
+      defaultValue: "0"
     sync_threshold_ns:
       key: sync_threshold_ns
       description: "Sync duration threshold (ns) to emit stall event"
       defaultValue: "10000000"
+    long_ctx_kernels:
+      key: long_ctx_kernels
+      description: "Prefill kernel count threshold for long context alert"
+      defaultValue: "500"

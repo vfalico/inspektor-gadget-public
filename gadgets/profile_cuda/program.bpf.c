@@ -34,6 +34,7 @@
 #include <gadget/user_stack_map.h>
 
 #define MAX_ENTRIES 10240
+
 /* ════════════════════════════════════════════════════════════════════════
  *  Part 1: Memory Profiling (base feature from ac5eb606f)
  * ════════════════════════════════════════════════════════════════════════ */
@@ -192,9 +193,132 @@ struct ctx_event {
 GADGET_TRACER_MAP(ctx_events, 262144);
 GADGET_TRACER(contexts, ctx_events, ctx_event);
 
+/* ════════════════════════════════════════════════════════════════════════
+ *  Part 7: Inference SLO Metrics (TTFT / Token / Request / SLO)
+ * ════════════════════════════════════════════════════════════════════════ */
+
+#define STACK_AUTO      0
+#define STACK_LLAMACPP  1
+#define STACK_VLLM      2
+#define STACK_TGI       3
+#define STACK_TRTLLM    4
+#define STACK_HF_SDPA   5
+
+enum phase {
+	PHASE_IDLE    = 0,
+	PHASE_PREFILL = 1,
+	PHASE_DECODE  = 2,
+};
+
+struct infer_state {
+	enum phase phase;
+	__u64 prefill_start_ns;
+	__u64 last_kernel_ns;
+	__u64 first_token_ns;
+	__u64 last_token_ns;
+	__u32 prefill_kernels;
+	__u32 decode_tokens;
+	__u32 detected_stack;
+	__u32 request_count;
+	__u32 graph_launches;
+	__u32 event_syncs;
+	__u32 stream_syncs;
+	__u32 memcpy_asyncs;
+	__u32 dtoh_asyncs;
+	__u32 kernel_launches;
+	__u32 req_event_syncs;
+	__u32 req_dtoh_asyncs;
+	/* SLO: streaming smoothness tracking */
+	__u64 itl_max_ns;        /* max inter-token latency in request */
+	__u64 itl_min_ns;        /* min inter-token latency in request */
+	__u64 itl_sum_ns;        /* sum of ITL for mean calculation */
+	__u64 itl_sum_sq_ns;     /* sum of squared ITL / 1000 for variance */
+	/* SLO: long-context tracking */
+	__u32 is_long_context;   /* 1 if prefill_kernels > threshold */
+};
+
+struct ttft_event {
+	struct gadget_process proc;
+	__u64 ttft_ns;
+	__u32 prefill_kernels;
+	__u64 prefill_start;
+	__u64 prefill_end;
+	__u32 detected_stack;
+};
+
+struct token_event {
+	struct gadget_process proc;
+	__u64 timestamp_ns;
+	__u64 inter_token_ns;
+	__u32 token_index;
+	__u32 detected_stack;
+};
+
+struct request_event {
+	struct gadget_process proc;
+	__u64 e2e_latency_ns;
+	__u64 ttft_ns;
+	__u64 decode_duration_ns;
+	__u32 total_tokens;
+	__u32 detected_stack;
+	/* SLO: streaming smoothness */
+	__u64 itl_max_ns;        /* worst ITL spike */
+	__u64 itl_min_ns;        /* best ITL */
+	__u64 itl_avg_ns;        /* mean ITL */
+	__u64 itl_jitter_ns;     /* max - min ITL (simple jitter) */
+	/* SLO: context size indicator */
+	__u32 is_long_context;   /* 1 if input was detected as long */
+};
+
+/* SLO: long context alert event */
+struct long_ctx_event {
+	struct gadget_process proc;
+	__u64 timestamp_ns;
+	__u32 prefill_kernels;
+	__u64 estimated_ttft_ns; /* current elapsed since prefill start */
+};
+
+GADGET_TRACER_MAP(long_ctx_events, 262144);
+GADGET_TRACER(long_ctx_alerts, long_ctx_events, long_ctx_event);
+
+/* ─── Parameters ─── */
+
+const volatile __u64 gap_threshold_ns = 200000;
+GADGET_PARAM(gap_threshold_ns);
+
+const volatile __u32 min_prefill_kernels = 10;
+GADGET_PARAM(min_prefill_kernels);
+
+const volatile __u64 cooldown_ns = 100000000;
+GADGET_PARAM(cooldown_ns);
+
+const volatile __u32 stack_hint = 0;
+GADGET_PARAM(stack_hint);
 
 const volatile __u64 sync_threshold_ns = 10000000;
 GADGET_PARAM(sync_threshold_ns);
+
+/* SLO: long context alert threshold (prefill kernels) */
+const volatile __u32 long_ctx_kernels = 500;
+GADGET_PARAM(long_ctx_kernels);
+
+/* ─── Inference state map ─── */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u32);   /* tgid */
+	__type(value, struct infer_state);
+} infer_states SEC(".maps");
+
+GADGET_TRACER_MAP(ttft_events, 262144);
+GADGET_TRACER(ttft, ttft_events, ttft_event);
+
+GADGET_TRACER_MAP(token_events, 1048576);
+GADGET_TRACER(tokens, token_events, token_event);
+
+GADGET_TRACER_MAP(request_events, 262144);
+GADGET_TRACER(requests, request_events, request_event);
 
 /* ════════════════════════════════════════════════════════════════════════
  *  Helpers
@@ -205,11 +329,15 @@ int trace_sched_process_exit(void *ctx)
 {
 	u64 pid_tgid = bpf_get_current_pid_tgid();
 	u32 tid  = (u32)pid_tgid;
+	u32 tgid = (u32)(pid_tgid >> 32);
 
 	bpf_map_delete_elem(&sizes, &tid);
 	bpf_map_delete_elem(&sync_entry, &tid);
+	if (tid == tgid)
+		bpf_map_delete_elem(&infer_states, &tgid);
 	return 0;
 }
+
 /* ─── Memory alloc helpers ─── */
 
 static __always_inline int alloc_enter(size_t size)
@@ -386,6 +514,270 @@ static __always_inline void emit_launch(void *ctx, __u64 now, __u32 ltype)
 	gadget_submit_buf(ctx, &launch_events, evt, sizeof(*evt));
 }
 
+/* ─── Inference metric helpers ─── */
+
+static __always_inline struct infer_state *get_or_init_state(__u32 tgid)
+{
+	struct infer_state *st = bpf_map_lookup_elem(&infer_states, &tgid);
+	if (st)
+		return st;
+	struct infer_state new_st = {};
+	new_st.detected_stack = stack_hint;
+	bpf_map_update_elem(&infer_states, &tgid, &new_st, BPF_NOEXIST);
+	return bpf_map_lookup_elem(&infer_states, &tgid);
+}
+
+static __always_inline __u32 auto_detect_stack(struct infer_state *st)
+{
+	if (stack_hint != STACK_AUTO)
+		return stack_hint;
+	if (st->memcpy_asyncs > 0 && st->dtoh_asyncs == 0 &&
+	    st->graph_launches == 0)
+		return STACK_TRTLLM;
+	if (st->graph_launches > 0 && st->event_syncs > 0)
+		return STACK_VLLM;
+	if (st->graph_launches > 0 && st->event_syncs == 0)
+		return STACK_LLAMACPP;
+	if (st->graph_launches > 0 &&
+	    st->kernel_launches > st->graph_launches * 5)
+		return STACK_TGI;
+	if (st->kernel_launches > 0 && st->graph_launches == 0 &&
+	    st->event_syncs == 0)
+		return STACK_HF_SDPA;
+	return STACK_AUTO;
+}
+
+static __always_inline void emit_token(void *ctx, struct infer_state *st,
+					__u64 now)
+{
+	__u64 itl = st->last_token_ns ? now - st->last_token_ns : 0;
+
+	struct token_event *evt =
+		gadget_reserve_buf(&token_events, sizeof(*evt));
+	if (evt) {
+		__builtin_memset(evt, 0, sizeof(*evt));
+		gadget_process_populate(&evt->proc);
+		evt->timestamp_ns = now;
+		evt->inter_token_ns = itl;
+		evt->token_index = st->decode_tokens;
+		evt->detected_stack = st->detected_stack;
+		gadget_submit_buf(ctx, &token_events, evt, sizeof(*evt));
+	}
+
+	/* SLO: update streaming smoothness stats */
+	if (itl > 0) {
+		st->itl_sum_ns += itl;
+		/* Track max/min for jitter calculation */
+		if (itl > st->itl_max_ns)
+			st->itl_max_ns = itl;
+		if (st->itl_min_ns == 0 || itl < st->itl_min_ns)
+			st->itl_min_ns = itl;
+		/*
+		 * Accumulate sum of squares / 1000000 to avoid overflow.
+		 * itl is in ns, divide by 1000 (us), square, accumulate.
+		 * This gives us variance in us^2 units.
+		 */
+		__u64 itl_us = itl / 1000;
+		st->itl_sum_sq_ns += itl_us * itl_us;
+	}
+
+	if (st->decode_tokens == 0)
+		st->first_token_ns = now;
+	st->last_token_ns = now;
+	st->decode_tokens++;
+}
+
+static __always_inline void emit_request_complete(void *ctx,
+						   struct infer_state *st,
+						   __u64 now)
+{
+	if (st->decode_tokens == 0)
+		return;
+	struct request_event *evt =
+		gadget_reserve_buf(&request_events, sizeof(*evt));
+	if (evt) {
+		__builtin_memset(evt, 0, sizeof(*evt));
+		gadget_process_populate(&evt->proc);
+		evt->e2e_latency_ns = now - st->prefill_start_ns;
+		evt->ttft_ns = st->first_token_ns - st->prefill_start_ns;
+		evt->decode_duration_ns =
+			st->last_token_ns - st->first_token_ns;
+		evt->total_tokens = st->decode_tokens;
+		evt->detected_stack = st->detected_stack;
+
+		/* SLO: streaming smoothness */
+		evt->itl_max_ns = st->itl_max_ns;
+		evt->itl_min_ns = st->itl_min_ns;
+		if (st->decode_tokens > 1)
+			evt->itl_avg_ns =
+				st->itl_sum_ns / (st->decode_tokens - 1);
+		else
+			evt->itl_avg_ns = 0;
+		evt->itl_jitter_ns = st->itl_max_ns - st->itl_min_ns;
+
+		/* SLO: long context flag */
+		evt->is_long_context = st->is_long_context;
+
+		gadget_submit_buf(ctx, &request_events, evt, sizeof(*evt));
+	}
+}
+
+static __always_inline void handle_kernel(void *ctx, __u64 now, int is_graph)
+{
+	if (gadget_should_discard_data_current())
+		return;
+
+	u32 tgid = (u32)(bpf_get_current_pid_tgid() >> 32);
+	struct infer_state *st = get_or_init_state(tgid);
+	if (!st)
+		return;
+
+	if (is_graph)
+		st->graph_launches++;
+	else
+		st->kernel_launches++;
+
+	u64 gap = now - st->last_kernel_ns;
+
+	switch (st->phase) {
+	case PHASE_IDLE:
+		st->phase = PHASE_PREFILL;
+		st->prefill_start_ns = now;
+		st->last_kernel_ns = now;
+		st->prefill_kernels = 1;
+		st->decode_tokens = 0;
+		st->first_token_ns = 0;
+		st->last_token_ns = 0;
+		st->req_event_syncs = 0;
+		st->req_dtoh_asyncs = 0;
+		/* SLO: reset streaming stats */
+		st->itl_max_ns = 0;
+		st->itl_min_ns = 0;
+		st->itl_sum_ns = 0;
+		st->itl_sum_sq_ns = 0;
+		st->is_long_context = 0;
+		break;
+
+	case PHASE_PREFILL:
+		if (gap > gap_threshold_ns &&
+		    st->prefill_kernels >= min_prefill_kernels) {
+			st->detected_stack = auto_detect_stack(st);
+			struct ttft_event *evt =
+				gadget_reserve_buf(&ttft_events, sizeof(*evt));
+			if (evt) {
+				__builtin_memset(evt, 0, sizeof(*evt));
+				gadget_process_populate(&evt->proc);
+				evt->ttft_ns =
+					st->last_kernel_ns -
+					st->prefill_start_ns;
+				evt->prefill_kernels = st->prefill_kernels;
+				evt->prefill_start = st->prefill_start_ns;
+				evt->prefill_end = st->last_kernel_ns;
+				evt->detected_stack = st->detected_stack;
+				gadget_submit_buf(ctx, &ttft_events,
+						  evt, sizeof(*evt));
+			}
+			st->phase = PHASE_DECODE;
+		}
+		st->last_kernel_ns = now;
+		st->prefill_kernels++;
+
+		/* SLO: long context detection and alert */
+		if (st->prefill_kernels == long_ctx_kernels) {
+			st->is_long_context = 1;
+			struct long_ctx_event *lce =
+				gadget_reserve_buf(&long_ctx_events,
+						   sizeof(*lce));
+			if (lce) {
+				__builtin_memset(lce, 0, sizeof(*lce));
+				gadget_process_populate(&lce->proc);
+				lce->timestamp_ns = now;
+				lce->prefill_kernels = st->prefill_kernels;
+				lce->estimated_ttft_ns =
+					now - st->prefill_start_ns;
+				gadget_submit_buf(ctx, &long_ctx_events,
+						  lce, sizeof(*lce));
+			}
+		}
+		break;
+
+	case PHASE_DECODE:
+		if (gap > cooldown_ns) {
+			emit_request_complete(ctx, st, st->last_token_ns);
+			st->phase = PHASE_PREFILL;
+			st->prefill_start_ns = now;
+			st->prefill_kernels = 1;
+			st->decode_tokens = 0;
+			st->first_token_ns = 0;
+			st->last_token_ns = 0;
+			st->req_event_syncs = 0;
+			st->req_dtoh_asyncs = 0;
+			/* SLO: reset streaming stats */
+			st->itl_max_ns = 0;
+			st->itl_min_ns = 0;
+			st->itl_sum_ns = 0;
+			st->itl_sum_sq_ns = 0;
+			st->is_long_context = 0;
+		}
+		st->last_kernel_ns = now;
+		break;
+	}
+}
+
+static __always_inline void handle_token_signal(void *ctx, __u64 now,
+						 int signal_type)
+{
+	if (gadget_should_discard_data_current())
+		return;
+
+	u32 tgid = (u32)(bpf_get_current_pid_tgid() >> 32);
+	struct infer_state *st = bpf_map_lookup_elem(&infer_states, &tgid);
+	if (!st || st->phase != PHASE_DECODE)
+		return;
+
+	switch (signal_type) {
+	case 2: st->dtoh_asyncs++; st->req_dtoh_asyncs++; break;
+	case 3: st->event_syncs++; st->req_event_syncs++; break;
+	case 4: st->stream_syncs++; break;
+	case 5: st->memcpy_asyncs++; break;
+	}
+
+	__u32 stack = st->detected_stack;
+	if (stack == STACK_AUTO ||
+	    (st->decode_tokens > 0 && st->decode_tokens % 10 == 0))
+		stack = auto_detect_stack(st);
+	if (stack != st->detected_stack)
+		st->detected_stack = stack;
+
+	int is_token = 0;
+	switch (stack) {
+	case STACK_LLAMACPP:
+	case STACK_VLLM:
+	case STACK_TGI:
+		is_token = (signal_type == 1);
+		break;
+	case STACK_TRTLLM:
+		is_token = (signal_type == 3 &&
+			    (st->req_event_syncs % 2 == 0));
+		break;
+	case STACK_HF_SDPA:
+		is_token = (signal_type == 2 &&
+			    (st->req_dtoh_asyncs % 2 == 0));
+		break;
+	default:
+		if (st->graph_launches > 0)
+			is_token = (signal_type == 1);
+		else if (st->event_syncs > 0)
+			is_token = (signal_type == 3);
+		else
+			is_token = (signal_type == 2);
+		break;
+	}
+
+	if (is_token)
+		emit_token(ctx, st, now);
+}
+
 /* ════════════════════════════════════════════════════════════════════════
  *  Probes: Kernel Launch
  * ════════════════════════════════════════════════════════════════════════ */
@@ -394,6 +786,7 @@ SEC("uprobe/libcuda:cuLaunchKernel")
 int BPF_UPROBE(trace_uprobe_cuLaunchKernel)
 {
 	u64 now = bpf_ktime_get_ns();
+	handle_kernel(ctx, now, 0);
 	emit_launch(ctx, now, LAUNCH_KERNEL);
 	return 0;
 }
@@ -402,6 +795,7 @@ SEC("uprobe/libcuda:cuLaunchKernelEx")
 int BPF_UPROBE(trace_uprobe_cuLaunchKernelEx)
 {
 	u64 now = bpf_ktime_get_ns();
+	handle_kernel(ctx, now, 0);
 	emit_launch(ctx, now, LAUNCH_KERNEL);
 	return 0;
 }
@@ -410,6 +804,8 @@ SEC("uprobe/libcuda:cuGraphLaunch")
 int BPF_UPROBE(trace_uprobe_cuGraphLaunch)
 {
 	u64 now = bpf_ktime_get_ns();
+	handle_kernel(ctx, now, 1);
+	handle_token_signal(ctx, now, 1);
 	emit_launch(ctx, now, LAUNCH_GRAPH);
 	return 0;
 }
@@ -435,6 +831,8 @@ int trace_uretprobe_cuCtxSynchronize(struct pt_regs *ctx)
 SEC("uprobe/libcuda:cuStreamSynchronize")
 int BPF_UPROBE(trace_uprobe_cuStreamSynchronize)
 {
+	u64 now = bpf_ktime_get_ns();
+	handle_token_signal(ctx, now, 4);
 	sync_enter_ts();
 	return 0;
 }
@@ -449,6 +847,8 @@ int trace_uretprobe_cuStreamSynchronize(struct pt_regs *ctx)
 SEC("uprobe/libcuda:cuEventSynchronize")
 int BPF_UPROBE(trace_uprobe_cuEventSynchronize)
 {
+	u64 now = bpf_ktime_get_ns();
+	handle_token_signal(ctx, now, 3);
 	sync_enter_ts();
 	return 0;
 }
@@ -485,6 +885,7 @@ int BPF_UPROBE(trace_uprobe_cuMemcpyDtoH_v2, void *dst, void *src,
 	       size_t size)
 {
 	emit_memcpy(ctx, size, DIR_DTOH, 0);
+	handle_token_signal(ctx, bpf_ktime_get_ns(), 2);
 	return 0;
 }
 
@@ -493,6 +894,7 @@ int BPF_UPROBE(trace_uprobe_cuMemcpyDtoHAsync_v2, void *dst, void *src,
 	       size_t size)
 {
 	emit_memcpy(ctx, size, DIR_DTOH, 1);
+	handle_token_signal(ctx, bpf_ktime_get_ns(), 2);
 	return 0;
 }
 
@@ -515,6 +917,7 @@ int BPF_UPROBE(trace_uprobe_cuMemcpyDtoDAsync_v2, void *dst, void *src,
 SEC("uprobe/libcuda:cuMemcpyAsync")
 int BPF_UPROBE(trace_uprobe_cuMemcpyAsync)
 {
+	handle_token_signal(ctx, bpf_ktime_get_ns(), 5);
 	return 0;
 }
 
@@ -689,6 +1092,5 @@ int BPF_UPROBE(trace_uprobe_cuMemPoolCreate, void *pool, void *props)
 SEC("uretprobe/libcuda:cuMemPoolCreate")
 int trace_uretprobe_cuMemPoolCreate(struct pt_regs *ctx)
 { return alloc_exit(ctx, MEMOP_POOL_CREATE, API_ID_MEM_ALLOC); }
-
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
