@@ -80,6 +80,17 @@ datasources:
         annotations:
           description: "0=synchronous, 1=asynchronous"
           columns.width: 8
+  contexts:
+    annotations:
+      description: "CUDA context lifecycle events (create/destroy/set)"
+    fields:
+      timestamp_ns:
+        annotations:
+          columns.hidden: "true"
+      event_type:
+        annotations:
+          description: "1=create, 2=destroy, 3=set_current"
+          columns.width: 12
 params:
   ebpf:
     sync_threshold_ns:

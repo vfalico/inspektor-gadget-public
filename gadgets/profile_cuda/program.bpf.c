@@ -175,6 +175,23 @@ struct memcpy_event {
 GADGET_TRACER_MAP(memcpy_events, 524288);
 GADGET_TRACER(memcpys, memcpy_events, memcpy_event);
 
+/* ════════════════════════════════════════════════════════════════════════
+ *  Part 6: Context Lifecycle
+ * ════════════════════════════════════════════════════════════════════════ */
+
+struct ctx_event {
+	struct gadget_process proc;
+	__u64 timestamp_ns;
+	__u32 event_type;      /* 1=create, 2=destroy, 3=set_current */
+};
+
+#define CTX_CREATE  1
+#define CTX_DESTROY 2
+#define CTX_SET     3
+
+GADGET_TRACER_MAP(ctx_events, 262144);
+GADGET_TRACER(contexts, ctx_events, ctx_event);
+
 
 const volatile __u64 sync_threshold_ns = 10000000;
 GADGET_PARAM(sync_threshold_ns);
@@ -333,6 +350,23 @@ static __always_inline void emit_memcpy(void *ctx, __u64 size, __u32 dir,
 	evt->direction = dir;
 	evt->is_async = is_async;
 	gadget_submit_buf(ctx, &memcpy_events, evt, sizeof(*evt));
+}
+
+/* ─── Context event helper ─── */
+
+static __always_inline void emit_ctx(void *ctx, __u32 etype)
+{
+	if (gadget_should_discard_data_current())
+		return;
+	struct ctx_event *evt =
+		gadget_reserve_buf(&ctx_events, sizeof(*evt));
+	if (!evt)
+		return;
+	__builtin_memset(evt, 0, sizeof(*evt));
+	gadget_process_populate(&evt->proc);
+	evt->timestamp_ns = bpf_ktime_get_ns();
+	evt->event_type = etype;
+	gadget_submit_buf(ctx, &ctx_events, evt, sizeof(*evt));
 }
 
 /* ─── Launch event helper ─── */
@@ -497,6 +531,99 @@ int BPF_UPROBE(trace_uprobe_cuMemcpyPeerAsync, void *dst, void *dstCtx,
 	       void *src, void *srcCtx, size_t size)
 {
 	emit_memcpy(ctx, size, DIR_PEER, 1);
+	return 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  Probes: Context Lifecycle
+ * ════════════════════════════════════════════════════════════════════════ */
+
+SEC("uprobe/libcuda:cuCtxCreate_v2")
+int BPF_UPROBE(trace_uprobe_cuCtxCreate_v2)
+{
+	emit_ctx(ctx, CTX_CREATE);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuCtxCreate_v3")
+int BPF_UPROBE(trace_uprobe_cuCtxCreate_v3)
+{
+	emit_ctx(ctx, CTX_CREATE);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuCtxDestroy_v2")
+int BPF_UPROBE(trace_uprobe_cuCtxDestroy_v2)
+{
+	emit_ctx(ctx, CTX_DESTROY);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuCtxSetCurrent")
+int BPF_UPROBE(trace_uprobe_cuCtxSetCurrent)
+{
+	emit_ctx(ctx, CTX_SET);
+	return 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  Probes: Module Load
+ * ════════════════════════════════════════════════════════════════════════ */
+
+SEC("uretprobe/libcuda:cuModuleLoad")
+int trace_uretprobe_cuModuleLoad(struct pt_regs *ctx)
+{
+	emit_error(ctx, API_ID_MODULE_LOAD, PT_REGS_RC(ctx));
+	return 0;
+}
+
+SEC("uretprobe/libcuda:cuModuleLoadData")
+int trace_uretprobe_cuModuleLoadData(struct pt_regs *ctx)
+{
+	emit_error(ctx, API_ID_MODULE_LOAD_DATA, PT_REGS_RC(ctx));
+	return 0;
+}
+
+SEC("uretprobe/libcuda:cuModuleLoadDataEx")
+int trace_uretprobe_cuModuleLoadDataEx(struct pt_regs *ctx)
+{
+	emit_error(ctx, API_ID_MODULE_LOAD_DATA, PT_REGS_RC(ctx));
+	return 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  Probes: P2P
+ * ════════════════════════════════════════════════════════════════════════ */
+
+SEC("uretprobe/libcuda:cuCtxEnablePeerAccess")
+int trace_uretprobe_cuCtxEnablePeerAccess(struct pt_regs *ctx)
+{
+	emit_error(ctx, API_ID_P2P_ENABLE, PT_REGS_RC(ctx));
+	return 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  Probes: Graph Instantiation
+ * ════════════════════════════════════════════════════════════════════════ */
+
+SEC("uretprobe/libcuda:cuGraphInstantiate")
+int trace_uretprobe_cuGraphInstantiate(struct pt_regs *ctx)
+{
+	emit_error(ctx, API_ID_GRAPH_INSTANTIATE, PT_REGS_RC(ctx));
+	return 0;
+}
+
+SEC("uretprobe/libcuda:cuGraphInstantiateWithFlags")
+int trace_uretprobe_cuGraphInstantiateWithFlags(struct pt_regs *ctx)
+{
+	emit_error(ctx, API_ID_GRAPH_INSTANTIATE, PT_REGS_RC(ctx));
+	return 0;
+}
+
+SEC("uretprobe/libcuda:cuGraphInstantiateWithParams")
+int trace_uretprobe_cuGraphInstantiateWithParams(struct pt_regs *ctx)
+{
+	emit_error(ctx, API_ID_GRAPH_INSTANTIATE, PT_REGS_RC(ctx));
 	return 0;
 }
 
