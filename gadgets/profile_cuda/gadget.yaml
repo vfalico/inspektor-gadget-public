@@ -20,3 +20,18 @@ datasources:
           flamegraph.level: 10
           flamegraph.type: single
           profiles.sample-attribute: "true"
+  errors:
+    annotations:
+      description: "CUDA API errors with function identification"
+    fields:
+      timestamp_ns:
+        annotations:
+          columns.hidden: "true"
+      error_code:
+        annotations:
+          description: "CUDA error code (2=OOM, 700=illegal_addr, etc.)"
+          columns.width: 12
+      api_id:
+        annotations:
+          description: "API function ID (1=MemAlloc, 3=ModuleLoad, 7=LaunchKernel, etc.)"
+          columns.width: 10

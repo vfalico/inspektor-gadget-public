@@ -84,6 +84,36 @@ struct {
 
 GADGET_MAPITER(allocs, allocs);
 
+/* ════════════════════════════════════════════════════════════════════════
+ *  Part 2: Error Monitoring
+ * ════════════════════════════════════════════════════════════════════════ */
+
+struct error_event {
+	struct gadget_process proc;
+	__u64 timestamp_ns;
+	__u32 error_code;     /* CUDA error code */
+	__u32 api_id;         /* which API function */
+};
+
+#define API_ID_MEM_ALLOC         1
+#define API_ID_MEM_ALLOC_ASYNC   2
+#define API_ID_MODULE_LOAD       3
+#define API_ID_MODULE_LOAD_DATA  4
+#define API_ID_CTX_SYNC          5
+#define API_ID_STREAM_SYNC       6
+#define API_ID_LAUNCH_KERNEL     7
+#define API_ID_GRAPH_LAUNCH      8
+#define API_ID_GRAPH_INSTANTIATE 9
+#define API_ID_P2P_ENABLE       10
+#define API_ID_EVENT_SYNC       11
+#define API_ID_MEM_ALLOC_HOST   12
+#define API_ID_CTX_CREATE       13
+#define API_ID_MEMCPY_HTOD      14
+#define API_ID_MEMCPY_DTOH      15
+
+GADGET_TRACER_MAP(error_events, 262144);
+GADGET_TRACER(errors, error_events, error_event);
+
 
 /* ════════════════════════════════════════════════════════════════════════
  *  Helpers
@@ -98,7 +128,6 @@ int trace_sched_process_exit(void *ctx)
 	bpf_map_delete_elem(&sizes, &tid);
 	return 0;
 }
-
 /* ─── Memory alloc helpers ─── */
 
 static __always_inline int alloc_enter(size_t size)
@@ -108,11 +137,27 @@ static __always_inline int alloc_enter(size_t size)
 	return 0;
 }
 
-static __always_inline int alloc_exit(struct pt_regs *ctx, enum memop op)
+static __always_inline int alloc_exit(struct pt_regs *ctx, enum memop op,
+				      __u32 api_id)
 {
 	int ret = PT_REGS_RC(ctx);
-	if (ret != 0)
+
+	if (ret != 0) {
+		if (!gadget_should_discard_data_current()) {
+			struct error_event *err =
+				gadget_reserve_buf(&error_events, sizeof(*err));
+			if (err) {
+				__builtin_memset(err, 0, sizeof(*err));
+				gadget_process_populate(&err->proc);
+				err->timestamp_ns = bpf_ktime_get_ns();
+				err->error_code = (__u32)ret;
+				err->api_id = api_id;
+				gadget_submit_buf(ctx, &error_events,
+						  err, sizeof(*err));
+			}
+		}
 		return 0;
+	}
 
 	if (gadget_should_discard_data_current())
 		return 0;
@@ -144,6 +189,26 @@ static __always_inline int alloc_exit(struct pt_regs *ctx, enum memop op)
 	}
 	return 0;
 }
+
+/* ─── Error emit helper ─── */
+
+static __always_inline void emit_error(struct pt_regs *ctx, __u32 api_id,
+					int ret)
+{
+	if (ret == 0 || gadget_should_discard_data_current())
+		return;
+	struct error_event *err =
+		gadget_reserve_buf(&error_events, sizeof(*err));
+	if (!err)
+		return;
+	__builtin_memset(err, 0, sizeof(*err));
+	gadget_process_populate(&err->proc);
+	err->timestamp_ns = bpf_ktime_get_ns();
+	err->error_code = (__u32)ret;
+	err->api_id = api_id;
+	gadget_submit_buf(ctx, &error_events, err, sizeof(*err));
+}
+
 /* ════════════════════════════════════════════════════════════════════════
  *  Probes: Memory Allocation
  * ════════════════════════════════════════════════════════════════════════ */
@@ -154,7 +219,7 @@ int BPF_UPROBE(trace_uprobe_cuMemAlloc_v2, void **dptr, size_t size)
 
 SEC("uretprobe/libcuda:cuMemAlloc_v2")
 int trace_uretprobe_cuMemAlloc_v2(struct pt_regs *ctx)
-{ return alloc_exit(ctx, MEMOP_ALLOC); }
+{ return alloc_exit(ctx, MEMOP_ALLOC, API_ID_MEM_ALLOC); }
 
 SEC("uprobe/libcuda:cuMemAllocHost_v2")
 int BPF_UPROBE(trace_uprobe_cuMemAllocHost_v2, void **pp, size_t size)
@@ -162,7 +227,7 @@ int BPF_UPROBE(trace_uprobe_cuMemAllocHost_v2, void **pp, size_t size)
 
 SEC("uretprobe/libcuda:cuMemAllocHost_v2")
 int trace_uretprobe_cuMemAllocHost_v2(struct pt_regs *ctx)
-{ return alloc_exit(ctx, MEMOP_ALLOC_HOST); }
+{ return alloc_exit(ctx, MEMOP_ALLOC_HOST, API_ID_MEM_ALLOC_HOST); }
 
 SEC("uprobe/libcuda:cuMemAllocManaged")
 int BPF_UPROBE(trace_uprobe_cuMemAllocManaged, void **dptr, size_t size,
@@ -171,7 +236,7 @@ int BPF_UPROBE(trace_uprobe_cuMemAllocManaged, void **dptr, size_t size,
 
 SEC("uretprobe/libcuda:cuMemAllocManaged")
 int trace_uretprobe_cuMemAllocManaged(struct pt_regs *ctx)
-{ return alloc_exit(ctx, MEMOP_ALLOC_MANAGED); }
+{ return alloc_exit(ctx, MEMOP_ALLOC_MANAGED, API_ID_MEM_ALLOC); }
 
 SEC("uprobe/libcuda:cuMemAllocPitch_v2")
 int BPF_UPROBE(trace_uprobe_cuMemAllocPitch_v2, void **dptr, size_t *pPitch,
@@ -180,7 +245,7 @@ int BPF_UPROBE(trace_uprobe_cuMemAllocPitch_v2, void **dptr, size_t *pPitch,
 
 SEC("uretprobe/libcuda:cuMemAllocPitch_v2")
 int trace_uretprobe_cuMemAllocPitch_v2(struct pt_regs *ctx)
-{ return alloc_exit(ctx, MEMOP_ALLOC_PITCH); }
+{ return alloc_exit(ctx, MEMOP_ALLOC_PITCH, API_ID_MEM_ALLOC); }
 
 SEC("uprobe/libcuda:cuMemAllocAsync")
 int BPF_UPROBE(trace_uprobe_cuMemAllocAsync, void **dptr, size_t size,
@@ -189,7 +254,7 @@ int BPF_UPROBE(trace_uprobe_cuMemAllocAsync, void **dptr, size_t size,
 
 SEC("uretprobe/libcuda:cuMemAllocAsync")
 int trace_uretprobe_cuMemAllocAsync(struct pt_regs *ctx)
-{ return alloc_exit(ctx, MEMOP_ALLOC_ASYNC); }
+{ return alloc_exit(ctx, MEMOP_ALLOC_ASYNC, API_ID_MEM_ALLOC_ASYNC); }
 
 SEC("uprobe/libcuda:cuMemFreeAsync")
 int BPF_UPROBE(trace_uprobe_cuMemFreeAsync, void *dptr, void *stream)
@@ -197,7 +262,7 @@ int BPF_UPROBE(trace_uprobe_cuMemFreeAsync, void *dptr, void *stream)
 
 SEC("uretprobe/libcuda:cuMemFreeAsync")
 int trace_uretprobe_cuMemFreeAsync(struct pt_regs *ctx)
-{ return alloc_exit(ctx, MEMOP_FREE_ASYNC); }
+{ return alloc_exit(ctx, MEMOP_FREE_ASYNC, API_ID_MEM_ALLOC_ASYNC); }
 
 SEC("uprobe/libcuda:cuMemPoolCreate")
 int BPF_UPROBE(trace_uprobe_cuMemPoolCreate, void *pool, void *props)
@@ -205,7 +270,7 @@ int BPF_UPROBE(trace_uprobe_cuMemPoolCreate, void *pool, void *props)
 
 SEC("uretprobe/libcuda:cuMemPoolCreate")
 int trace_uretprobe_cuMemPoolCreate(struct pt_regs *ctx)
-{ return alloc_exit(ctx, MEMOP_POOL_CREATE); }
+{ return alloc_exit(ctx, MEMOP_POOL_CREATE, API_ID_MEM_ALLOC); }
 
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
