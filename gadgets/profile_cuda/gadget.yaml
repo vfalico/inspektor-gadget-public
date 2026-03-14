@@ -61,6 +61,25 @@ datasources:
         annotations:
           description: "1=cuLaunchKernel, 2=cuGraphLaunch"
           columns.width: 12
+  memcpys:
+    annotations:
+      description: "Host-device memory transfer events"
+    fields:
+      timestamp_ns:
+        annotations:
+          columns.hidden: "true"
+      size_bytes:
+        annotations:
+          description: "Transfer size in bytes"
+          columns.width: 14
+      direction:
+        annotations:
+          description: "1=HtoD, 2=DtoH, 3=DtoD, 4=Peer"
+          columns.width: 10
+      is_async:
+        annotations:
+          description: "0=synchronous, 1=asynchronous"
+          columns.width: 8
 params:
   ebpf:
     sync_threshold_ns:

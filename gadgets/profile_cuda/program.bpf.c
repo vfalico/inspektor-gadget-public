@@ -155,6 +155,26 @@ struct launch_event {
 GADGET_TRACER_MAP(launch_events, 1048576);
 GADGET_TRACER(launches, launch_events, launch_event);
 
+/* ════════════════════════════════════════════════════════════════════════
+ *  Part 5: Memory Transfer Tracking
+ * ════════════════════════════════════════════════════════════════════════ */
+
+struct memcpy_event {
+	struct gadget_process proc;
+	__u64 timestamp_ns;
+	__u64 size_bytes;
+	__u32 direction;       /* 1=HtoD, 2=DtoH, 3=DtoD, 4=Peer */
+	__u32 is_async;
+};
+
+#define DIR_HTOD  1
+#define DIR_DTOH  2
+#define DIR_DTOD  3
+#define DIR_PEER  4
+
+GADGET_TRACER_MAP(memcpy_events, 524288);
+GADGET_TRACER(memcpys, memcpy_events, memcpy_event);
+
 
 const volatile __u64 sync_threshold_ns = 10000000;
 GADGET_PARAM(sync_threshold_ns);
@@ -295,6 +315,26 @@ static __always_inline void sync_exit_check(struct pt_regs *ctx,
 	}
 }
 
+/* ─── Memcpy emit helper ─── */
+
+static __always_inline void emit_memcpy(void *ctx, __u64 size, __u32 dir,
+					 __u32 is_async)
+{
+	if (gadget_should_discard_data_current())
+		return;
+	struct memcpy_event *evt =
+		gadget_reserve_buf(&memcpy_events, sizeof(*evt));
+	if (!evt)
+		return;
+	__builtin_memset(evt, 0, sizeof(*evt));
+	gadget_process_populate(&evt->proc);
+	evt->timestamp_ns = bpf_ktime_get_ns();
+	evt->size_bytes = size;
+	evt->direction = dir;
+	evt->is_async = is_async;
+	gadget_submit_buf(ctx, &memcpy_events, evt, sizeof(*evt));
+}
+
 /* ─── Launch event helper ─── */
 
 static __always_inline void emit_launch(void *ctx, __u64 now, __u32 ltype)
@@ -383,6 +423,80 @@ SEC("uretprobe/libcuda:cuEventSynchronize")
 int trace_uretprobe_cuEventSynchronize(struct pt_regs *ctx)
 {
 	sync_exit_check(ctx, SYNC_EVENT, API_ID_EVENT_SYNC);
+	return 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  Probes: Memory Transfers
+ * ════════════════════════════════════════════════════════════════════════ */
+
+SEC("uprobe/libcuda:cuMemcpyHtoD_v2")
+int BPF_UPROBE(trace_uprobe_cuMemcpyHtoD_v2, void *dst, void *src,
+	       size_t size)
+{
+	emit_memcpy(ctx, size, DIR_HTOD, 0);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemcpyHtoDAsync_v2")
+int BPF_UPROBE(trace_uprobe_cuMemcpyHtoDAsync_v2, void *dst, void *src,
+	       size_t size)
+{
+	emit_memcpy(ctx, size, DIR_HTOD, 1);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemcpyDtoH_v2")
+int BPF_UPROBE(trace_uprobe_cuMemcpyDtoH_v2, void *dst, void *src,
+	       size_t size)
+{
+	emit_memcpy(ctx, size, DIR_DTOH, 0);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemcpyDtoHAsync_v2")
+int BPF_UPROBE(trace_uprobe_cuMemcpyDtoHAsync_v2, void *dst, void *src,
+	       size_t size)
+{
+	emit_memcpy(ctx, size, DIR_DTOH, 1);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemcpyDtoD_v2")
+int BPF_UPROBE(trace_uprobe_cuMemcpyDtoD_v2, void *dst, void *src,
+	       size_t size)
+{
+	emit_memcpy(ctx, size, DIR_DTOD, 0);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemcpyDtoDAsync_v2")
+int BPF_UPROBE(trace_uprobe_cuMemcpyDtoDAsync_v2, void *dst, void *src,
+	       size_t size)
+{
+	emit_memcpy(ctx, size, DIR_DTOD, 1);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemcpyAsync")
+int BPF_UPROBE(trace_uprobe_cuMemcpyAsync)
+{
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemcpyPeer")
+int BPF_UPROBE(trace_uprobe_cuMemcpyPeer, void *dst, void *dstCtx,
+	       void *src, void *srcCtx, size_t size)
+{
+	emit_memcpy(ctx, size, DIR_PEER, 0);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemcpyPeerAsync")
+int BPF_UPROBE(trace_uprobe_cuMemcpyPeerAsync, void *dst, void *dstCtx,
+	       void *src, void *srcCtx, size_t size)
+{
+	emit_memcpy(ctx, size, DIR_PEER, 1);
 	return 0;
 }
 
