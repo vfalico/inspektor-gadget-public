@@ -114,6 +114,34 @@ struct error_event {
 GADGET_TRACER_MAP(error_events, 262144);
 GADGET_TRACER(errors, error_events, error_event);
 
+/* ════════════════════════════════════════════════════════════════════════
+ *  Part 3: Sync Stall Detection
+ * ════════════════════════════════════════════════════════════════════════ */
+
+struct sync_event {
+	struct gadget_process proc;
+	__u64 timestamp_ns;
+	__u64 duration_ns;
+	__u32 sync_type;       /* 1=ctx, 2=stream, 3=event */
+};
+
+#define SYNC_CTX     1
+#define SYNC_STREAM  2
+#define SYNC_EVENT   3
+
+GADGET_TRACER_MAP(sync_events, 262144);
+GADGET_TRACER(syncs, sync_events, sync_event);
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_ENTRIES);
+	__type(key, u32);   /* tid */
+	__type(value, u64);  /* entry timestamp */
+} sync_entry SEC(".maps");
+
+
+const volatile __u64 sync_threshold_ns = 10000000;
+GADGET_PARAM(sync_threshold_ns);
 
 /* ════════════════════════════════════════════════════════════════════════
  *  Helpers
@@ -126,6 +154,7 @@ int trace_sched_process_exit(void *ctx)
 	u32 tid  = (u32)pid_tgid;
 
 	bpf_map_delete_elem(&sizes, &tid);
+	bpf_map_delete_elem(&sync_entry, &tid);
 	return 0;
 }
 /* ─── Memory alloc helpers ─── */
@@ -207,6 +236,93 @@ static __always_inline void emit_error(struct pt_regs *ctx, __u32 api_id,
 	err->error_code = (__u32)ret;
 	err->api_id = api_id;
 	gadget_submit_buf(ctx, &error_events, err, sizeof(*err));
+}
+
+/* ─── Sync stall helper ─── */
+
+static __always_inline void sync_enter_ts(void)
+{
+	u32 tid = (u32)bpf_get_current_pid_tgid();
+	u64 ts = bpf_ktime_get_ns();
+	bpf_map_update_elem(&sync_entry, &tid, &ts, BPF_ANY);
+}
+
+static __always_inline void sync_exit_check(struct pt_regs *ctx,
+					     __u32 sync_type, __u32 api_id)
+{
+	if (gadget_should_discard_data_current())
+		return;
+
+	int ret = PT_REGS_RC(ctx);
+	if (ret != 0)
+		emit_error(ctx, api_id, ret);
+
+	u32 tid = (u32)bpf_get_current_pid_tgid();
+	u64 *entry = bpf_map_lookup_elem(&sync_entry, &tid);
+	if (!entry)
+		return;
+	u64 duration = bpf_ktime_get_ns() - *entry;
+	bpf_map_delete_elem(&sync_entry, &tid);
+
+	if (duration > sync_threshold_ns) {
+		struct sync_event *evt =
+			gadget_reserve_buf(&sync_events, sizeof(*evt));
+		if (evt) {
+			__builtin_memset(evt, 0, sizeof(*evt));
+			gadget_process_populate(&evt->proc);
+			evt->timestamp_ns = bpf_ktime_get_ns();
+			evt->duration_ns = duration;
+			evt->sync_type = sync_type;
+			gadget_submit_buf(ctx, &sync_events,
+					  evt, sizeof(*evt));
+		}
+	}
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  Probes: Synchronization
+ * ════════════════════════════════════════════════════════════════════════ */
+
+SEC("uprobe/libcuda:cuCtxSynchronize")
+int BPF_UPROBE(trace_uprobe_cuCtxSynchronize)
+{
+	sync_enter_ts();
+	return 0;
+}
+
+SEC("uretprobe/libcuda:cuCtxSynchronize")
+int trace_uretprobe_cuCtxSynchronize(struct pt_regs *ctx)
+{
+	sync_exit_check(ctx, SYNC_CTX, API_ID_CTX_SYNC);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuStreamSynchronize")
+int BPF_UPROBE(trace_uprobe_cuStreamSynchronize)
+{
+	sync_enter_ts();
+	return 0;
+}
+
+SEC("uretprobe/libcuda:cuStreamSynchronize")
+int trace_uretprobe_cuStreamSynchronize(struct pt_regs *ctx)
+{
+	sync_exit_check(ctx, SYNC_STREAM, API_ID_STREAM_SYNC);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuEventSynchronize")
+int BPF_UPROBE(trace_uprobe_cuEventSynchronize)
+{
+	sync_enter_ts();
+	return 0;
+}
+
+SEC("uretprobe/libcuda:cuEventSynchronize")
+int trace_uretprobe_cuEventSynchronize(struct pt_regs *ctx)
+{
+	sync_exit_check(ctx, SYNC_EVENT, API_ID_EVENT_SYNC);
+	return 0;
 }
 
 /* ════════════════════════════════════════════════════════════════════════

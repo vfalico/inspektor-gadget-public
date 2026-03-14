@@ -35,3 +35,24 @@ datasources:
         annotations:
           description: "API function ID (1=MemAlloc, 3=ModuleLoad, 7=LaunchKernel, etc.)"
           columns.width: 10
+  syncs:
+    annotations:
+      description: "Sync stall events exceeding threshold"
+    fields:
+      timestamp_ns:
+        annotations:
+          columns.hidden: "true"
+      duration_ns:
+        annotations:
+          description: "Duration the sync call blocked (ns)"
+          columns.width: 16
+      sync_type:
+        annotations:
+          description: "1=cuCtxSync, 2=cuStreamSync, 3=cuEventSync"
+          columns.width: 10
+params:
+  ebpf:
+    sync_threshold_ns:
+      key: sync_threshold_ns
+      description: "Sync duration threshold (ns) to emit stall event"
+      defaultValue: "10000000"
