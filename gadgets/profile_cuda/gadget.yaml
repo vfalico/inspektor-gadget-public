@@ -50,6 +50,17 @@ datasources:
         annotations:
           description: "1=cuCtxSync, 2=cuStreamSync, 3=cuEventSync"
           columns.width: 10
+  launches:
+    annotations:
+      description: "Kernel and graph launch events for launch-rate analysis"
+    fields:
+      timestamp_ns:
+        annotations:
+          columns.hidden: "true"
+      launch_type:
+        annotations:
+          description: "1=cuLaunchKernel, 2=cuGraphLaunch"
+          columns.width: 12
 params:
   ebpf:
     sync_threshold_ns:

@@ -139,6 +139,22 @@ struct {
 	__type(value, u64);  /* entry timestamp */
 } sync_entry SEC(".maps");
 
+/* ════════════════════════════════════════════════════════════════════════
+ *  Part 4: Kernel Launch Tracking
+ * ════════════════════════════════════════════════════════════════════════ */
+
+struct launch_event {
+	struct gadget_process proc;
+	__u64 timestamp_ns;
+	__u32 launch_type;    /* 1=kernel, 2=graph */
+};
+
+#define LAUNCH_KERNEL 1
+#define LAUNCH_GRAPH  2
+
+GADGET_TRACER_MAP(launch_events, 1048576);
+GADGET_TRACER(launches, launch_events, launch_event);
+
 
 const volatile __u64 sync_threshold_ns = 10000000;
 GADGET_PARAM(sync_threshold_ns);
@@ -277,6 +293,51 @@ static __always_inline void sync_exit_check(struct pt_regs *ctx,
 					  evt, sizeof(*evt));
 		}
 	}
+}
+
+/* ─── Launch event helper ─── */
+
+static __always_inline void emit_launch(void *ctx, __u64 now, __u32 ltype)
+{
+	if (gadget_should_discard_data_current())
+		return;
+	struct launch_event *evt =
+		gadget_reserve_buf(&launch_events, sizeof(*evt));
+	if (!evt)
+		return;
+	__builtin_memset(evt, 0, sizeof(*evt));
+	gadget_process_populate(&evt->proc);
+	evt->timestamp_ns = now;
+	evt->launch_type = ltype;
+	gadget_submit_buf(ctx, &launch_events, evt, sizeof(*evt));
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  Probes: Kernel Launch
+ * ════════════════════════════════════════════════════════════════════════ */
+
+SEC("uprobe/libcuda:cuLaunchKernel")
+int BPF_UPROBE(trace_uprobe_cuLaunchKernel)
+{
+	u64 now = bpf_ktime_get_ns();
+	emit_launch(ctx, now, LAUNCH_KERNEL);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuLaunchKernelEx")
+int BPF_UPROBE(trace_uprobe_cuLaunchKernelEx)
+{
+	u64 now = bpf_ktime_get_ns();
+	emit_launch(ctx, now, LAUNCH_KERNEL);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuGraphLaunch")
+int BPF_UPROBE(trace_uprobe_cuGraphLaunch)
+{
+	u64 now = bpf_ktime_get_ns();
+	emit_launch(ctx, now, LAUNCH_GRAPH);
+	return 0;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
