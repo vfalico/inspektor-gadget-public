@@ -15,6 +15,7 @@
 package ebpfoperator
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -34,6 +35,12 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 )
 
+// tlvFieldInfo maps a TLV type ID to a datasource field accessor.
+type tlvFieldInfo struct {
+	id       uint16
+	accessor datasource.FieldAccessor
+}
+
 type Tracer struct {
 	mapName    string
 	structName string
@@ -42,6 +49,12 @@ type Tracer struct {
 	accessor        datasource.FieldAccessor
 	restAccessor    datasource.FieldAccessor
 	restLenAccessor datasource.FieldAccessor
+
+	// TLV support: optional big fields encoded as Type-Length-Value after the fixed struct.
+	tlvEnabled        bool
+	tlvFields         map[uint16]*tlvFieldInfo
+	tlvRestOffset     uint32                    // offset of variable-length "rest" field (e.g., args)
+	tlvRestLenAccessor datasource.FieldAccessor // accessor for the rest length field (e.g., args_size)
 
 	mapType       ebpf.MapType
 	eventSize     uint32 // needed to trim trailing bytes when reading for perf event array
@@ -231,13 +244,26 @@ func (t *Tracer) processEvent(gadgetCtx operators.GadgetContext, fullSample []by
 		}
 		sample = t.slowBuf
 	} else if sampleLen > t.eventSize {
-		// event has trailing garbage, remove it
+		// Event has trailing data. If TLV or rest is enabled, the trailing
+		// data contains TLV entries or rest field data — don't discard it.
+		// Only trim to eventSize for the accessor (which expects the fixed struct).
 		sample = sample[:t.eventSize]
 	}
 
 	if err := t.accessor.Set(pSingle, sample); err != nil {
 		t.ds.Release(pSingle)
 		return fmt.Errorf("setting buffer: %w", err)
+	}
+
+	restEnd := t.eventSize // tracks where rest data ends (= start of TLV)
+
+	// When TLV is enabled with a variable-length rest field, compute
+	// the actual end of the fixed+variable data to find TLV entries.
+	if t.tlvEnabled && t.tlvRestLenAccessor != nil {
+		restLen, err2 := t.tlvRestLenAccessor.Uint32(pSingle)
+		if err2 == nil {
+			restEnd = t.tlvRestOffset + restLen
+		}
 	}
 
 	if t.restAccessor != nil && sampleLen > t.eventSize {
@@ -257,10 +283,47 @@ func (t *Tracer) processEvent(gadgetCtx operators.GadgetContext, fullSample []by
 		}
 
 		t.restAccessor.Set(pSingle, fullSample[t.eventSize:t.eventSize+xlen])
+		restEnd = t.eventSize + xlen
+	}
+
+	// Parse TLV entries if enabled
+	if t.tlvEnabled && sampleLen > restEnd {
+		if err := t.parseTLV(pSingle, fullSample, restEnd, sampleLen); err != nil {
+			gadgetCtx.Logger().Warnf("error parsing TLV: %v", err)
+		}
 	}
 
 	if err := t.ds.EmitAndRelease(pSingle); err != nil {
 		return fmt.Errorf("emitting data: %w", err)
+	}
+
+	return nil
+}
+
+// parseTLV decodes TLV entries from the event buffer and sets the corresponding
+// datasource fields.
+func (t *Tracer) parseTLV(pSingle datasource.Data, buf []byte, start, end uint32) error {
+	const tlvHdrSize = 4 // sizeof(gadget_tlv_header): type(2) + length(2)
+	pos := start
+
+	for pos+tlvHdrSize <= end {
+		tlvType := binary.LittleEndian.Uint16(buf[pos : pos+2])
+		tlvLen := binary.LittleEndian.Uint16(buf[pos+2 : pos+4])
+		pos += tlvHdrSize
+
+		valEnd := pos + uint32(tlvLen)
+		if valEnd > end {
+			return fmt.Errorf("TLV entry type=%d length=%d exceeds buffer (pos=%d end=%d)",
+				tlvType, tlvLen, pos, end)
+		}
+
+		if fi, ok := t.tlvFields[tlvType]; ok {
+			if err := fi.accessor.Set(pSingle, buf[pos:valEnd]); err != nil {
+				return fmt.Errorf("setting TLV field type=%d: %w", tlvType, err)
+			}
+		}
+
+		pos = valEnd
 	}
 
 	return nil

@@ -73,6 +73,12 @@ const (
 	AnnotationIterFetchOnStop = "ebpf.iter.fetch-on-stop"
 	AnnotationRestName        = "ebpf.rest.name"
 	AnnotationRestLen         = "ebpf.rest.len"
+
+	// TLV annotations: mark a datasource as TLV-enabled and assign field IDs.
+	AnnotationTLVEnabled  = "ebpf.tlv"
+	AnnotationTLVFieldID  = "ebpf.tlv.id"
+	AnnotationTLVRestName = "ebpf.tlv.rest"     // field name of the variable-length "rest" data (e.g., "args")
+	AnnotationTLVRestLen  = "ebpf.tlv.rest_len" // field name containing the length of rest data (e.g., "args_size")
 )
 
 type gadgetObjects struct {
@@ -520,6 +526,101 @@ func (i *ebpfInstance) register(gadgetCtx operators.GadgetContext) error {
 			}
 		}
 		m.ds = ds
+
+		// TLV field registration: when a datasource is marked with ebpf.tlv=true,
+		// fields listed in gadget.yaml with ebpf.tlv.id annotations are created
+		// as dynamic datasource fields (since they're not in the BTF struct)
+		// and populated from TLV entries appended after the fixed event struct.
+		if tlvEnabled, ok := ds.Annotations()[AnnotationTLVEnabled]; ok && tlvEnabled == "true" {
+			m.tlvEnabled = true
+			m.tlvFields = make(map[uint16]*tlvFieldInfo)
+
+			// Check existing struct fields for TLV annotations
+			for _, fa := range ds.Accessors(true) {
+				ann := fa.Annotations()
+				if idStr, ok := ann[AnnotationTLVFieldID]; ok {
+					id, err := strconv.ParseUint(idStr, 10, 16)
+					if err != nil {
+						return fmt.Errorf("parsing TLV field ID %q: %w", idStr, err)
+					}
+					m.tlvFields[uint16(id)] = &tlvFieldInfo{
+						id:       uint16(id),
+						accessor: fa,
+					}
+					i.logger.Debugf("registered TLV field %q (struct) with ID %d", fa.Name(), id)
+				}
+			}
+
+			// Read TLV field definitions from metadata config (gadget.yaml).
+			// These fields may NOT exist in the BTF struct — they are TLV-only
+			// fields that need to be created as dynamic datasource fields.
+			if i.config != nil {
+				dsConfig := i.config.Sub("datasources." + name + ".fields")
+				if dsConfig == nil {
+					dsConfig = i.config.Sub("datasources." + m.structName + ".fields")
+				}
+				if dsConfig != nil {
+					for _, key := range dsConfig.AllKeys() {
+						// keys look like "cwd.annotations.ebpf.tlv.id"
+						// We need to find field names that have the tlv.id annotation
+						parts := strings.SplitN(key, ".", 2)
+						if len(parts) < 2 {
+							continue
+						}
+						fieldName := parts[0]
+						if !strings.HasSuffix(key, "annotations."+AnnotationTLVFieldID) {
+							continue
+						}
+						idStr := dsConfig.GetString(key)
+						if idStr == "" {
+							continue
+						}
+						id, err := strconv.ParseUint(idStr, 10, 16)
+						if err != nil {
+							return fmt.Errorf("parsing TLV field ID %q for %q: %w", idStr, fieldName, err)
+						}
+						if _, exists := m.tlvFields[uint16(id)]; exists {
+							continue
+						}
+						// Create a dynamic CString field for this TLV entry
+						fa, err := ds.AddField(fieldName, api.Kind_CString)
+						if err != nil {
+							return fmt.Errorf("adding TLV field %q: %w", fieldName, err)
+						}
+						// Apply annotations from metadata
+						fieldConfig := dsConfig.Sub(fieldName + ".annotations")
+						if fieldConfig != nil {
+							for _, ak := range fieldConfig.AllKeys() {
+								fa.AddAnnotation(ak, fieldConfig.GetString(ak))
+							}
+						}
+						m.tlvFields[uint16(id)] = &tlvFieldInfo{
+							id:       uint16(id),
+							accessor: fa,
+						}
+						i.logger.Debugf("registered TLV field %q (dynamic) with ID %d", fieldName, id)
+					}
+				}
+			}
+
+			// Configure TLV rest field offset and length accessor
+			if restFieldName, ok := ds.Annotations()[AnnotationTLVRestName]; ok {
+				restField := ds.GetField(restFieldName)
+				if restField != nil {
+					// Get the field's offset from the struct
+					for _, sf := range i.structs[m.structName].Fields {
+						if sf.FieldName() == restFieldName {
+							m.tlvRestOffset = sf.Offset
+							break
+						}
+					}
+				}
+			}
+			if restLenName, ok := ds.Annotations()[AnnotationTLVRestLen]; ok {
+				m.tlvRestLenAccessor = ds.GetField(restLenName)
+			}
+			i.logger.Debugf("TLV enabled for datasource %q with %d fields (restOffset=%d)", name, len(m.tlvFields), m.tlvRestOffset)
+		}
 	}
 	for name, m := range i.iterators {
 		ds, accessor, err := i.addDataSource(gadgetCtx, datasource.TypeArray, name, i.structs[m.structName].Size, i.structs[m.structName].Fields)
