@@ -88,3 +88,40 @@ datasources:
         annotations:
           columns.width: 10
           description: "Process ID"
+  fragmentation_events:
+    annotations:
+      ebpf.map.flush-on-stop: "true"
+      cli.clear-screen-before: "false"
+    fields:
+      proc.comm:
+        annotations:
+          columns.width: 20
+          description: "Process name"
+      requested_size:
+        annotations:
+          columns.width: 18
+          description: "Requested allocation size (bytes)"
+      total_allocated:
+        annotations:
+          columns.width: 18
+          description: "Total VRAM allocated (bytes) at event time"
+      total_freed:
+        annotations:
+          columns.width: 18
+          description: "Total VRAM freed (bytes) at event time"
+      net_allocated:
+        annotations:
+          columns.width: 18
+          description: "Net VRAM in use (allocated - freed)"
+      error_code:
+        annotations:
+          columns.width: 12
+          description: "CUDA error code (2 = OUT_OF_MEMORY)"
+      timestamp:
+        annotations:
+          columns.width: 20
+          description: "Event timestamp (ktime ns)"
+      pid:
+        annotations:
+          columns.width: 10
+          description: "Process ID"

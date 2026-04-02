@@ -126,6 +126,42 @@ struct {
 } exception_path_allocs SEC(".maps");
 GADGET_MAPITER(exception_path_allocs, exception_path_allocs);
 
+/* ===== Fragmentation Detection ===== */
+
+/*
+ * Running VRAM counters: [0]=total_allocated, [1]=total_freed, [2]=failed_count.
+ * Updated atomically.  Provides context for failed allocation events.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 3);
+	__type(key, u32);
+	__type(value, __u64);
+} vram_counters SEC(".maps");
+
+struct frag_event_entry {
+	struct gadget_process proc;
+	__u64 requested_size;
+	__u64 total_allocated;
+	__u64 total_freed;
+	__u64 net_allocated;
+	__u64 timestamp;
+	__u32 pid;
+	__u32 error_code;
+};
+
+struct frag_event_key {
+	__u64 event_id;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, struct frag_event_key);
+	__type(value, struct frag_event_entry);
+} fragmentation_events SEC(".maps");
+GADGET_MAPITER(fragmentation_events, fragmentation_events);
+
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -148,6 +184,10 @@ struct heap_leaked {
 
 struct heap_exception {
 	struct exception_alloc_entry entry;
+};
+
+struct heap_frag {
+	struct frag_event_entry entry;
 };
 
 /* used for context between uprobes and uretprobes of allocations */
@@ -274,7 +314,65 @@ static __always_inline int gen_alloc_exit_with_vram(struct pt_regs *ctx,
 	tid = (u32)pid_tgid;
 
 	if (ret != 0) {
-		/* Clean up scratch on failed alloc */
+		/* Capture failed allocs for fragmentation analysis */
+		if (track_vram) {
+			struct alloc_scratch *scratch =
+				bpf_map_lookup_elem(&alloc_scratch_map, &tid);
+			if (scratch) {
+				__u64 req_size = scratch->size;
+				bpf_map_delete_elem(&alloc_scratch_map, &tid);
+
+				u32 zero = 0;
+				struct heap_frag *hf =
+					bpf_map_lookup_elem(&heap_frag_map,
+							    &zero);
+				if (hf) {
+					__builtin_memset(&hf->entry, 0,
+							 sizeof(hf->entry));
+					hf->entry.requested_size = req_size;
+					hf->entry.error_code = (__u32)ret;
+					hf->entry.timestamp =
+						bpf_ktime_get_ns();
+					hf->entry.pid =
+						(u32)(pid_tgid >> 32);
+					gadget_process_populate(
+						&hf->entry.proc);
+
+					u32 k0 = 0, k1 = 1;
+					__u64 *ta = bpf_map_lookup_elem(
+						&vram_counters, &k0);
+					__u64 *tf = bpf_map_lookup_elem(
+						&vram_counters, &k1);
+					if (ta)
+						hf->entry.total_allocated = *ta;
+					if (tf)
+						hf->entry.total_freed = *tf;
+					hf->entry.net_allocated =
+						hf->entry.total_allocated -
+						hf->entry.total_freed;
+
+					__u64 *ctr = bpf_map_lookup_elem(
+						&frag_event_counter, &zero);
+					__u64 event_id = 0;
+					if (ctr)
+						event_id =
+							__sync_fetch_and_add(
+								ctr, 1);
+					struct frag_event_key fk = {
+						.event_id = event_id
+					};
+					bpf_map_update_elem(
+						&fragmentation_events, &fk,
+						&hf->entry, BPF_ANY);
+				}
+
+				u32 k2 = 2;
+				__u64 *fc = bpf_map_lookup_elem(
+					&vram_counters, &k2);
+				if (fc)
+					__sync_fetch_and_add(fc, 1);
+			}
+		}
 		bpf_map_delete_elem(&sizes, &tid);
 		bpf_map_delete_elem(&alloc_scratch_map, &tid);
 		return 0;
@@ -347,6 +445,16 @@ static __always_inline int gen_alloc_exit_with_vram(struct pt_regs *ctx,
 								BPF_ANY);
 						}
 
+						/* Update allocation counter */
+						u32 ctr_key = 0;
+						__u64 *total_alloc =
+							bpf_map_lookup_elem(
+								&vram_counters,
+								&ctr_key);
+						if (total_alloc)
+							__sync_fetch_and_add(
+								total_alloc,
+								alloc_size);
 					}
 				}
 			}
@@ -648,6 +756,12 @@ int BPF_UPROBE(trace_uprobe_cuMemFree_v2, __u64 dptr)
 		struct exception_key ek = { .ptr_id = dptr };
 		bpf_map_delete_elem(&exception_path_allocs, &ek);
 
+		/* Update freed counter for fragmentation context */
+		u32 ctr_key = 1;
+		__u64 *total_freed =
+			bpf_map_lookup_elem(&vram_counters, &ctr_key);
+		if (total_freed)
+			__sync_fetch_and_add(total_freed, info->size);
 	}
 	bpf_map_delete_elem(&vram_tracker, &dptr);
 	return 0;
