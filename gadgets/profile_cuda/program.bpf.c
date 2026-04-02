@@ -12,6 +12,7 @@
 #include <gadget/user_stack_map.h>
 
 #define MAX_ENTRIES 10240
+#define MAX_VRAM_ENTRIES 4096
 
 enum memop {
 	cuMemAlloc,
@@ -21,6 +22,55 @@ enum memop {
 	cuMemAllocManaged,
 	cuMemAllocPitch,
 	cuMemAlloc3D,
+};
+
+/* ===== VRAM Allocation Lifecycle Tracking ===== */
+
+/*
+ * Core tracking structure for each device memory allocation.
+ * Inserted on successful cuMemAlloc (and variants), looked up on
+ * memcpy/memset/launch to mark as "used", removed on cuMemFree.
+ */
+struct vram_alloc_info {
+	__u64 devptr;
+	__u64 size;
+	__u64 alloc_ts;
+	__u32 used;       /* 0 = never accessed, 1 = accessed */
+	__u32 pid;
+	struct gadget_process proc;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_VRAM_ENTRIES);
+	__type(key, __u64);              /* device pointer */
+	__type(value, struct vram_alloc_info);
+} vram_tracker SEC(".maps");
+
+/*
+ * Scratch space to carry the userspace dptr address and requested size
+ * from uprobe (entry) to uretprobe (return) of allocation calls.
+ * Keyed by thread ID — a thread can only be in one call at a time.
+ */
+struct alloc_scratch {
+	__u64 dptr_user_addr;
+	__u64 size;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_ENTRIES);
+	__type(key, u32);
+	__type(value, struct alloc_scratch);
+} alloc_scratch_map SEC(".maps");
+
+/* Per-CPU heap maps — BPF stack is limited to 512 bytes */
+struct heap_vram {
+	struct vram_alloc_info info;
+};
+
+struct heap_devptr {
+	__u64 devptr;
 };
 
 /* used for context between uprobes and uretprobes of allocations */
@@ -48,6 +98,37 @@ struct {
 	__type(value, struct alloc_val);
 } allocs SEC(".maps");
 
+/*
+ * Heap-allocated scratch space to avoid blowing the 256-byte stack limit
+ * required for tail calls. struct alloc_val (~152 B) and
+ * struct gadget_user_stack (~64 B) are too large to live on the BPF stack.
+ */
+struct heap_data {
+	struct gadget_user_stack ustack;
+	struct alloc_val val;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct heap_data);
+} heap SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct heap_vram);
+} heap_vram_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct heap_devptr);
+} heap_devptr_map SEC(".maps");
+
 GADGET_MAPITER(allocs, allocs);
 
 /**
@@ -62,6 +143,7 @@ int trace_sched_process_exit(void *ctx)
 
 	tid = (u32)bpf_get_current_pid_tgid();
 	bpf_map_delete_elem(&sizes, &tid);
+	bpf_map_delete_elem(&alloc_scratch_map, &tid);
 	return 0;
 }
 
