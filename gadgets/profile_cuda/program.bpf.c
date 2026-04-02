@@ -83,6 +83,56 @@ struct {
 } unused_allocs SEC(".maps");
 GADGET_MAPITER(unused_allocs, unused_allocs);
 
+/* Output: allocations that were used but never freed (traditional leak) */
+struct leaked_alloc_entry {
+	struct gadget_process proc;
+	__u64 devptr;
+	__u64 size;
+	__u64 alloc_ts;
+	__u64 first_use_ts;
+	__u32 pid;
+};
+
+struct leaked_key {
+	__u64 ptr_id;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_VRAM_ENTRIES);
+	__type(key, struct leaked_key);
+	__type(value, struct leaked_alloc_entry);
+} leaked_allocs SEC(".maps");
+GADGET_MAPITER(leaked_allocs, leaked_allocs);
+
+/* Output: allocations never used AND never freed (exception-path leak) */
+struct exception_alloc_entry {
+	struct gadget_process proc;
+	__u64 devptr;
+	__u64 size;
+	__u64 alloc_ts;
+	__u32 pid;
+};
+
+struct exception_key {
+	__u64 ptr_id;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_VRAM_ENTRIES);
+	__type(key, struct exception_key);
+	__type(value, struct exception_alloc_entry);
+} exception_path_allocs SEC(".maps");
+GADGET_MAPITER(exception_path_allocs, exception_path_allocs);
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, __u64);
+} frag_event_counter SEC(".maps");
+
 /* Per-CPU heap maps — BPF stack is limited to 512 bytes */
 struct heap_vram {
 	struct vram_alloc_info info;
@@ -90,6 +140,14 @@ struct heap_vram {
 
 struct heap_devptr {
 	__u64 devptr;
+};
+
+struct heap_leaked {
+	struct leaked_alloc_entry entry;
+};
+
+struct heap_exception {
+	struct exception_alloc_entry entry;
 };
 
 /* used for context between uprobes and uretprobes of allocations */
@@ -147,6 +205,27 @@ struct {
 	__type(key, u32);
 	__type(value, struct heap_devptr);
 } heap_devptr_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct heap_leaked);
+} heap_leaked_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct heap_exception);
+} heap_exception_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct heap_frag);
+} heap_frag_map SEC(".maps");
 
 GADGET_MAPITER(allocs, allocs);
 
@@ -238,6 +317,36 @@ static __always_inline int gen_alloc_exit_with_vram(struct pt_regs *ctx,
 							&vram_tracker,
 							&hdp->devptr,
 							&hv->info, BPF_ANY);
+
+						/* Presumed exception-path until used or freed */
+						struct exception_key ek = {
+							.ptr_id = hdp->devptr
+						};
+						struct heap_exception *he =
+							bpf_map_lookup_elem(
+								&heap_exception_map,
+								&zero);
+						if (he) {
+							__builtin_memset(
+								&he->entry, 0,
+								sizeof(he->entry));
+							he->entry.proc =
+								hv->info.proc;
+							he->entry.devptr =
+								hv->info.devptr;
+							he->entry.size =
+								hv->info.size;
+							he->entry.alloc_ts =
+								hv->info.alloc_ts;
+							he->entry.pid =
+								hv->info.pid;
+							bpf_map_update_elem(
+								&exception_path_allocs,
+								&ek,
+								&he->entry,
+								BPF_ANY);
+						}
+
 					}
 				}
 			}
@@ -279,7 +388,9 @@ static __always_inline int gen_alloc_exit_with_vram(struct pt_regs *ctx,
 
 /*
  * Mark a device pointer as "used" in the VRAM tracker.
- * Called from memcpy, memset, and kernel launch probes.
+ * On first use (0->1):
+ *   - Add to leaked_allocs (presumed leak until freed)
+ *   - Remove from exception_path_allocs (it IS being used)
  */
 static __always_inline void mark_devptr_used(__u64 devptr)
 {
@@ -288,8 +399,34 @@ static __always_inline void mark_devptr_used(__u64 devptr)
 
 	struct vram_alloc_info *info =
 		bpf_map_lookup_elem(&vram_tracker, &devptr);
-	if (info)
+	if (!info)
+		return;
+
+	if (!info->used) {
 		info->used = 1;
+
+		/* Add to leaked_allocs — will be removed if freed */
+		u32 zero = 0;
+		struct heap_leaked *hl =
+			bpf_map_lookup_elem(&heap_leaked_map, &zero);
+		if (hl) {
+			__builtin_memset(&hl->entry, 0, sizeof(hl->entry));
+			hl->entry.proc = info->proc;
+			hl->entry.devptr = info->devptr;
+			hl->entry.size = info->size;
+			hl->entry.alloc_ts = info->alloc_ts;
+			hl->entry.first_use_ts = bpf_ktime_get_ns();
+			hl->entry.pid = info->pid;
+
+			struct leaked_key lk = { .ptr_id = devptr };
+			bpf_map_update_elem(&leaked_allocs, &lk, &hl->entry,
+					    BPF_ANY);
+		}
+
+		/* No longer an exception-path alloc — it was used */
+		struct exception_key ek = { .ptr_id = devptr };
+		bpf_map_delete_elem(&exception_path_allocs, &ek);
+	}
 }
 
 /* ===== cuMemAlloc_v2 ===== */
@@ -492,14 +629,25 @@ int BPF_UPROBE(trace_uprobe_cuMemFree_v2, __u64 dptr)
 
 	struct vram_alloc_info *info =
 		bpf_map_lookup_elem(&vram_tracker, &dptr);
-	if (info && !info->used) {
-		/* Allocation freed without ever being accessed */
-		struct unused_key uk = { .ptr_id = dptr };
-		struct unused_alloc_entry entry = {};
-		entry.proc = info->proc;
-		entry.devptr = info->devptr;
-		entry.size = info->size;
-		bpf_map_update_elem(&unused_allocs, &uk, &entry, BPF_ANY);
+	if (info) {
+		if (!info->used) {
+			/* Freed without being accessed — unused */
+			struct unused_key uk = { .ptr_id = dptr };
+			struct unused_alloc_entry entry = {};
+			entry.proc = info->proc;
+			entry.devptr = info->devptr;
+			entry.size = info->size;
+			bpf_map_update_elem(&unused_allocs, &uk, &entry,
+					    BPF_ANY);
+		}
+
+		/* Freed — not a leak and not an exception-path alloc */
+		struct leaked_key lk = { .ptr_id = dptr };
+		bpf_map_delete_elem(&leaked_allocs, &lk);
+
+		struct exception_key ek = { .ptr_id = dptr };
+		bpf_map_delete_elem(&exception_path_allocs, &ek);
+
 	}
 	bpf_map_delete_elem(&vram_tracker, &dptr);
 	return 0;
