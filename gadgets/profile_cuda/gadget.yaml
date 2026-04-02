@@ -18,3 +18,19 @@ datasources:
           flamegraph.level: 10
           flamegraph.type: single
           profiles.sample-attribute: "true"
+  unused_allocs:
+    annotations:
+      ebpf.map.flush-on-stop: "true"
+      cli.clear-screen-before: "false"
+    fields:
+      proc.comm:
+        annotations:
+          columns.width: 20
+      devptr:
+        annotations:
+          columns.width: 20
+          description: "Device pointer (VRAM address)"
+      size:
+        annotations:
+          columns.width: 15
+          description: "Allocation size in bytes"

@@ -64,6 +64,25 @@ struct {
 	__type(value, struct alloc_scratch);
 } alloc_scratch_map SEC(".maps");
 
+/* Output: allocations that were freed without ever being accessed */
+struct unused_alloc_entry {
+	struct gadget_process proc;
+	__u64 devptr;
+	__u64 size;
+};
+
+struct unused_key {
+	__u64 ptr_id;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_VRAM_ENTRIES);
+	__type(key, struct unused_key);
+	__type(value, struct unused_alloc_entry);
+} unused_allocs SEC(".maps");
+GADGET_MAPITER(unused_allocs, unused_allocs);
+
 /* Per-CPU heap maps — BPF stack is limited to 512 bytes */
 struct heap_vram {
 	struct vram_alloc_info info;
@@ -157,8 +176,13 @@ static __always_inline int gen_alloc_enter(size_t size)
 	return 0;
 }
 
-static __always_inline int gen_alloc_exit(struct pt_regs *ctx,
-					  enum memop operation)
+/*
+ * Combined flamegraph recording + VRAM lifecycle tracking.
+ * track_vram: 1 for device allocs, 0 for host-only (cuMemAllocHost).
+ */
+static __always_inline int gen_alloc_exit_with_vram(struct pt_regs *ctx,
+						    enum memop operation,
+						    int track_vram)
 {
 	u64 pid_tgid;
 	u32 tid;
@@ -166,16 +190,63 @@ static __always_inline int gen_alloc_exit(struct pt_regs *ctx,
 	u64 size;
 	int ret;
 
-	// Ignore failed allocations (CUDA_SUCCESS = 0)
 	ret = PT_REGS_RC(ctx);
-	if (ret != 0)
+	pid_tgid = bpf_get_current_pid_tgid();
+	tid = (u32)pid_tgid;
+
+	if (ret != 0) {
+		/* Clean up scratch on failed alloc */
+		bpf_map_delete_elem(&sizes, &tid);
+		bpf_map_delete_elem(&alloc_scratch_map, &tid);
 		return 0;
+	}
+
+	/* VRAM tracking: read device pointer from userspace */
+	if (track_vram) {
+		struct alloc_scratch *scratch =
+			bpf_map_lookup_elem(&alloc_scratch_map, &tid);
+		if (scratch) {
+			__u64 dptr_addr = scratch->dptr_user_addr;
+			__u64 alloc_size = scratch->size;
+			bpf_map_delete_elem(&alloc_scratch_map, &tid);
+
+			u32 zero = 0;
+			struct heap_devptr *hdp =
+				bpf_map_lookup_elem(&heap_devptr_map, &zero);
+			if (hdp) {
+				hdp->devptr = 0;
+				if (bpf_probe_read_user(&hdp->devptr,
+							sizeof(__u64),
+							(void *)dptr_addr) == 0
+				    && hdp->devptr != 0) {
+					struct heap_vram *hv =
+						bpf_map_lookup_elem(
+							&heap_vram_map, &zero);
+					if (hv) {
+						__builtin_memset(&hv->info, 0,
+								 sizeof(hv->info));
+						hv->info.devptr = hdp->devptr;
+						hv->info.size = alloc_size;
+						hv->info.alloc_ts =
+							bpf_ktime_get_ns();
+						hv->info.used = 0;
+						hv->info.pid =
+							(u32)(pid_tgid >> 32);
+						gadget_process_populate(
+							&hv->info.proc);
+						bpf_map_update_elem(
+							&vram_tracker,
+							&hdp->devptr,
+							&hv->info, BPF_ANY);
+					}
+				}
+			}
+		}
+	}
 
 	if (gadget_should_discard_data_current())
 		return 0;
 
-	pid_tgid = bpf_get_current_pid_tgid();
-	tid = (u32)pid_tgid;
 	size_ptr = bpf_map_lookup_elem(&sizes, &tid);
 	if (!size_ptr)
 		return 0;
@@ -207,25 +278,44 @@ static __always_inline int gen_alloc_exit(struct pt_regs *ctx,
 }
 
 /*
- * cuMemAlloc_v2 - Allocate device memory (CUDA Driver API)
- * CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize)
+ * Mark a device pointer as "used" in the VRAM tracker.
+ * Called from memcpy, memset, and kernel launch probes.
  */
+static __always_inline void mark_devptr_used(__u64 devptr)
+{
+	if (!devptr)
+		return;
+
+	struct vram_alloc_info *info =
+		bpf_map_lookup_elem(&vram_tracker, &devptr);
+	if (info)
+		info->used = 1;
+}
+
+/* ===== cuMemAlloc_v2 ===== */
+
 SEC("uprobe/libcuda:cuMemAlloc_v2")
 int BPF_UPROBE(trace_uprobe_cuMemAlloc_v2, void **dptr, size_t bytesize)
 {
-	return gen_alloc_enter(bytesize);
+	gen_alloc_enter(bytesize);
+
+	u32 tid = (u32)bpf_get_current_pid_tgid();
+	struct alloc_scratch scratch = {
+		.dptr_user_addr = (__u64)dptr,
+		.size = bytesize,
+	};
+	bpf_map_update_elem(&alloc_scratch_map, &tid, &scratch, BPF_ANY);
+
+	return 0;
 }
 
 SEC("uretprobe/libcuda:cuMemAlloc_v2")
 int trace_uretprobe_cuMemAlloc_v2(struct pt_regs *ctx)
 {
-	return gen_alloc_exit(ctx, cuMemAlloc);
+	return gen_alloc_exit_with_vram(ctx, cuMemAlloc, 1);
 }
 
-/*
- * cuMemAllocHost_v2 - Allocate page-locked host memory (CUDA Driver API)
- * CUresult cuMemAllocHost_v2(void **pp, size_t bytesize)
- */
+/* cuMemAllocHost_v2 — host memory, no VRAM tracking */
 SEC("uprobe/libcuda:cuMemAllocHost_v2")
 int BPF_UPROBE(trace_uprobe_cuMemAllocHost_v2, void **pp, size_t bytesize)
 {
@@ -235,43 +325,184 @@ int BPF_UPROBE(trace_uprobe_cuMemAllocHost_v2, void **pp, size_t bytesize)
 SEC("uretprobe/libcuda:cuMemAllocHost_v2")
 int trace_uretprobe_cuMemAllocHost_v2(struct pt_regs *ctx)
 {
-	return gen_alloc_exit(ctx, cuMemAllocHost);
+	return gen_alloc_exit_with_vram(ctx, cuMemAllocHost, 0);
 }
 
-/*
- * cuMemAllocManaged - Allocate managed memory (CUDA Driver API)
- * CUresult cuMemAllocManaged(CUdeviceptr *dptr, size_t bytesize, unsigned int flags)
- */
+/* cuMemAllocManaged — managed memory, track VRAM */
 SEC("uprobe/libcuda:cuMemAllocManaged")
 int BPF_UPROBE(trace_uprobe_cuMemAllocManaged, void **dptr, size_t bytesize,
 	       unsigned int flags)
 {
-	return gen_alloc_enter(bytesize);
+	gen_alloc_enter(bytesize);
+
+	u32 tid = (u32)bpf_get_current_pid_tgid();
+	struct alloc_scratch scratch = {
+		.dptr_user_addr = (__u64)dptr,
+		.size = bytesize,
+	};
+	bpf_map_update_elem(&alloc_scratch_map, &tid, &scratch, BPF_ANY);
+
+	return 0;
 }
 
 SEC("uretprobe/libcuda:cuMemAllocManaged")
 int trace_uretprobe_cuMemAllocManaged(struct pt_regs *ctx)
 {
-	return gen_alloc_exit(ctx, cuMemAllocManaged);
+	return gen_alloc_exit_with_vram(ctx, cuMemAllocManaged, 1);
 }
 
-/*
- * cuMemAllocPitch_v2 - Allocate pitched device memory (CUDA Driver API)
- * CUresult cuMemAllocPitch_v2(CUdeviceptr *dptr, size_t *pPitch, size_t WidthInBytes, size_t Height, unsigned int ElementSizeBytes)
- */
+/* cuMemAllocPitch_v2 — pitched memory, track VRAM */
 SEC("uprobe/libcuda:cuMemAllocPitch_v2")
 int BPF_UPROBE(trace_uprobe_cuMemAllocPitch_v2, void **dptr, size_t *pPitch,
 	       size_t WidthInBytes, size_t Height,
 	       unsigned int ElementSizeBytes)
 {
-	size_t size = WidthInBytes * Height; // Approximate size
-	return gen_alloc_enter(size);
+	size_t size = WidthInBytes * Height;
+	gen_alloc_enter(size);
+
+	u32 tid = (u32)bpf_get_current_pid_tgid();
+	struct alloc_scratch scratch = {
+		.dptr_user_addr = (__u64)dptr,
+		.size = size,
+	};
+	bpf_map_update_elem(&alloc_scratch_map, &tid, &scratch, BPF_ANY);
+
+	return 0;
 }
 
 SEC("uretprobe/libcuda:cuMemAllocPitch_v2")
 int trace_uretprobe_cuMemAllocPitch_v2(struct pt_regs *ctx)
 {
-	return gen_alloc_exit(ctx, cuMemAllocPitch);
+	return gen_alloc_exit_with_vram(ctx, cuMemAllocPitch, 1);
+}
+
+/* ===== VRAM Usage Tracking Probes ===== */
+
+SEC("uprobe/libcuda:cuMemcpyHtoD_v2")
+int BPF_UPROBE(trace_uprobe_cuMemcpyHtoD_v2, __u64 dstDevice, void *srcHost,
+	       size_t ByteCount)
+{
+	mark_devptr_used(dstDevice);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemcpyDtoH_v2")
+int BPF_UPROBE(trace_uprobe_cuMemcpyDtoH_v2, void *dstHost, __u64 srcDevice,
+	       size_t ByteCount)
+{
+	mark_devptr_used(srcDevice);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemcpyDtoD_v2")
+int BPF_UPROBE(trace_uprobe_cuMemcpyDtoD_v2, __u64 dstDevice, __u64 srcDevice,
+	       size_t ByteCount)
+{
+	mark_devptr_used(dstDevice);
+	mark_devptr_used(srcDevice);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemcpyHtoDAsync_v2")
+int BPF_UPROBE(trace_uprobe_cuMemcpyHtoDAsync_v2, __u64 dstDevice,
+	       void *srcHost, size_t ByteCount)
+{
+	mark_devptr_used(dstDevice);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemcpyDtoHAsync_v2")
+int BPF_UPROBE(trace_uprobe_cuMemcpyDtoHAsync_v2, void *dstHost,
+	       __u64 srcDevice, size_t ByteCount)
+{
+	mark_devptr_used(srcDevice);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemsetD8_v2")
+int BPF_UPROBE(trace_uprobe_cuMemsetD8_v2, __u64 dstDevice)
+{
+	mark_devptr_used(dstDevice);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemsetD16_v2")
+int BPF_UPROBE(trace_uprobe_cuMemsetD16_v2, __u64 dstDevice)
+{
+	mark_devptr_used(dstDevice);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuMemsetD32_v2")
+int BPF_UPROBE(trace_uprobe_cuMemsetD32_v2, __u64 dstDevice)
+{
+	mark_devptr_used(dstDevice);
+	return 0;
+}
+
+SEC("uprobe/libcuda:cuLaunchKernel")
+int trace_uprobe_cuLaunchKernel(struct pt_regs *ctx)
+{
+	/*
+	 * cuLaunchKernel has 11 args.  kernelParams is #10.
+	 * On x86_64 SysV: args 1-6 in registers, 7+ on stack.
+	 * At uprobe entry the return address is pushed, so
+	 * arg10 is at [rsp + 32].
+	 */
+	__u64 sp = PT_REGS_SP(ctx);
+	void **kernelParams = NULL;
+
+#if defined(__TARGET_ARCH_x86)
+	bpf_probe_read_user(&kernelParams, sizeof(kernelParams),
+			    (void *)(sp + 32));
+#elif defined(__TARGET_ARCH_arm64)
+	bpf_probe_read_user(&kernelParams, sizeof(kernelParams),
+			    (void *)(sp + 16));
+#else
+	return 0;
+#endif
+
+	if (!kernelParams)
+		return 0;
+
+	__u64 param;
+	#pragma unroll
+	for (int i = 0; i < 8; i++) {
+		void *param_ptr = NULL;
+		if (bpf_probe_read_user(&param_ptr, sizeof(param_ptr),
+					&kernelParams[i]) < 0)
+			break;
+		if (!param_ptr)
+			break;
+		if (bpf_probe_read_user(&param, sizeof(param), param_ptr) < 0)
+			break;
+		mark_devptr_used(param);
+	}
+
+	return 0;
+}
+
+/* ===== cuMemFree_v2: report unused allocs before removing from tracker ===== */
+
+SEC("uprobe/libcuda:cuMemFree_v2")
+int BPF_UPROBE(trace_uprobe_cuMemFree_v2, __u64 dptr)
+{
+	if (!dptr)
+		return 0;
+
+	struct vram_alloc_info *info =
+		bpf_map_lookup_elem(&vram_tracker, &dptr);
+	if (info && !info->used) {
+		/* Allocation freed without ever being accessed */
+		struct unused_key uk = { .ptr_id = dptr };
+		struct unused_alloc_entry entry = {};
+		entry.proc = info->proc;
+		entry.devptr = info->devptr;
+		entry.size = info->size;
+		bpf_map_update_elem(&unused_allocs, &uk, &entry, BPF_ANY);
+	}
+	bpf_map_delete_elem(&vram_tracker, &dptr);
+	return 0;
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
