@@ -1,0 +1,18 @@
+version: "1"
+name: cuda_error_trace
+displayName: CUDA Error Trace
+createdAt: "2025-01-01T00:00:00Z"
+description: |
+  Trace CUDA Driver API errors with enriched human-readable descriptions.
+  Hooks into 22 CUDA Driver API functions via eBPF uprobes. A bundled WASM
+  enricher maps numeric error codes to symbolic names, descriptions,
+  categories, and actionable remediation suggestions at runtime.
+logoURL: https://inspektor-gadget.io/logo.png
+homeURL: https://inspektor-gadget.io
+links:
+  - name: source
+    url: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/cuda_error_trace
+license: Apache-2.0
+annotations:
+  gadget.category: tracing
+  gadget.tags: cuda,gpu,nvidia,tracing,errors,debugging
