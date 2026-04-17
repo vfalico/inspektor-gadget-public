@@ -1,0 +1,158 @@
+name: nvidia_trace_errors
+description: Trace NVIDIA CUDA Driver API errors and in-kernel XID events with enrichment
+homepageURL: https://github.com/inspektor-gadget/inspektor-gadget
+documentationURL: https://github.com/inspektor-gadget/inspektor-gadget/blob/main/gadgets/nvidia_trace_errors/README.md
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget
+datasources:
+  nvidia_errors:
+    fields:
+      timestamp_raw:
+        annotations:
+          description: Event timestamp (boot nanoseconds)
+          columns.hidden: "true"
+      proc.pid:
+        annotations:
+          description: Process ID
+          columns.width: "7"
+      proc.tid:
+        annotations:
+          description: Thread ID
+          columns.hidden: "true"
+      proc.comm:
+        annotations:
+          description: Process name
+          columns.width: "16"
+      source_raw:
+        annotations:
+          description: "Raw source discriminator (1=CUDA API, 2=XID)"
+          columns.hidden: "true"
+          value.one-of: |
+            1: SOURCE_CUDA_API
+            2: SOURCE_XID
+      error_code_raw:
+        annotations:
+          description: "Raw CUDA error code (CUresult). Only meaningful for CUDA API events."
+          columns.hidden: "true"
+          value.one-of: |
+            0: CUDA_SUCCESS
+            1: CUDA_ERROR_INVALID_VALUE
+            2: CUDA_ERROR_OUT_OF_MEMORY
+            3: CUDA_ERROR_NOT_INITIALIZED
+            4: CUDA_ERROR_DEINITIALIZED
+            34: CUDA_ERROR_STUB_LIBRARY
+            100: CUDA_ERROR_NO_DEVICE
+            101: CUDA_ERROR_INVALID_DEVICE
+            200: CUDA_ERROR_INVALID_IMAGE
+            201: CUDA_ERROR_INVALID_CONTEXT
+            209: CUDA_ERROR_NO_BINARY_FOR_GPU
+            214: CUDA_ERROR_ECC_UNCORRECTABLE
+            218: CUDA_ERROR_INVALID_PTX
+            220: CUDA_ERROR_NVLINK_UNCORRECTABLE
+            700: CUDA_ERROR_ILLEGAL_ADDRESS
+            701: CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES
+            719: CUDA_ERROR_LAUNCH_FAILED
+            999: CUDA_ERROR_UNKNOWN
+      api_id_raw:
+        annotations:
+          description: "Raw CUDA API identifier (see api_name for string)"
+          columns.hidden: "true"
+          value.one-of: |
+            1: cuMemAlloc_v2
+            2: cuMemAllocPitch_v2
+            3: cuMemAllocManaged
+            4: cuLaunchKernel
+            5: cuCtxCreate_v2
+            6: cuDeviceGet
+            7: cuDeviceGetCount
+            8: cuModuleLoad
+            9: cuModuleLoadData
+            10: cuModuleGetFunction
+            11: cuMemcpyHtoD_v2
+            12: cuMemcpyDtoH_v2
+            13: cuStreamCreate
+            14: cuStreamQuery
+            15: cuStreamSynchronize
+            16: cuEventCreate
+            17: cuEventRecord
+            18: cuEventQuery
+            19: cuEventSynchronize
+            20: cuMemFree_v2
+            21: cuCtxSynchronize
+            22: cuInit
+      xid_code:
+        annotations:
+          description: "NVIDIA XID number (only for SOURCE_XID events)"
+          columns.width: "5"
+          columns.alignment: right
+      source:
+        annotations:
+          description: "Event source (added by WASM enricher)"
+          columns.width: "16"
+      error_code:
+        annotations:
+          description: "CUDA error name (added by WASM enricher)"
+          columns.width: "36"
+      api_id:
+        annotations:
+          description: "CUDA API name (added by WASM enricher)"
+          columns.width: "22"
+      severity:
+        annotations:
+          description: "Severity: LOW | MEDIUM | HIGH | CRITICAL (added by WASM enricher)"
+          columns.width: "10"
+      category:
+        annotations:
+          description: "Error category (added by WASM enricher)"
+          columns.width: "14"
+      description:
+        annotations:
+          description: "Plain-English description (added by WASM enricher)"
+          columns.hidden: "true"
+      why:
+        annotations:
+          description: "Why this happened in this context (added by WASM enricher)"
+          columns.width: "48"
+      suggestion:
+        annotations:
+          description: "Actionable remediation suggestion (added by WASM enricher)"
+          columns.hidden: "true"
+      context_info:
+        annotations:
+          description: "Humanised argument/context details (added by WASM enricher)"
+          columns.width: "40"
+      gpu_pci_addr:
+        annotations:
+          description: "GPU PCI address DDDD:BB:SS.F for XID events (added by WASM enricher)"
+          columns.width: "14"
+      pci_domain:
+        annotations:
+          description: "PCI domain (raw)"
+          columns.hidden: "true"
+      pci_bus:
+        annotations:
+          description: "PCI bus (raw)"
+          columns.hidden: "true"
+      pci_slot:
+        annotations:
+          description: "PCI slot (raw)"
+          columns.hidden: "true"
+      pci_func:
+        annotations:
+          description: "PCI function (raw)"
+          columns.hidden: "true"
+      arg1:
+        annotations: { description: "Raw argument 1", columns.hidden: "true" }
+      arg2:
+        annotations: { description: "Raw argument 2", columns.hidden: "true" }
+      arg3:
+        annotations: { description: "Raw argument 3", columns.hidden: "true" }
+      arg4:
+        annotations: { description: "Raw argument 4", columns.hidden: "true" }
+      arg5:
+        annotations: { description: "Raw argument 5", columns.hidden: "true" }
+      arg6:
+        annotations: { description: "Raw argument 6", columns.hidden: "true" }
+      ustack_raw:
+        annotations:
+          description: "User-space call stack (CUDA API events only)"
+          columns.hidden: "true"

@@ -47,6 +47,7 @@ GADGETS ?= \
 	trace_lsm \
 	traceloop \
 	trace_malloc \
+	nvidia_trace_errors \
 	trace_mount \
 	trace_oomkill \
 	trace_init_module \
