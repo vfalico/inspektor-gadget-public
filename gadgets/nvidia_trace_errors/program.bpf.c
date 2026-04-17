@@ -151,6 +151,37 @@ handle_return(struct pt_regs *ctx)
 	return 0;
 }
 
+/* ─── XID kprobe ──────────────────────────────────────────────────────────
+ * nv_report_error is exported by the NVIDIA kernel module (open-source build).
+ * Signature: void nv_report_error(struct pci_dev *dev, NvU32 error_number,
+ *                                 const char *format, va_list ap);
+ * We only read the first two args.
+ */
+SEC("kprobe/nv_report_error")
+int BPF_KPROBE(trace_nv_report_error, struct pci_dev *dev, __u32 error_number)
+{
+	struct event *e = gadget_reserve_buf(&events, sizeof(*e));
+	if (!e)
+		return 0;
+
+	e->timestamp_raw = bpf_ktime_get_boot_ns();
+	gadget_process_populate(&e->proc);
+
+	e->source_raw = SOURCE_XID;
+	e->xid_code   = error_number;
+
+	if (dev) {
+		e->pci_bus    = BPF_CORE_READ(dev, bus, number);
+		__u32 devfn   = BPF_CORE_READ(dev, devfn);
+		e->pci_slot   = devfn >> 3;
+		e->pci_func   = devfn & 0x7;
+		e->pci_domain = 0;
+	}
+
+	gadget_submit_buf(ctx, &events, e, sizeof(*e));
+	return 0;
+}
+
 /* ─── libcuda uprobes (22 entry/return pairs) ───────────────────────────── */
 
 SEC("uprobe/libcuda:cuInit")
