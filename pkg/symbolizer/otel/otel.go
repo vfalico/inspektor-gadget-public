@@ -190,8 +190,8 @@ func (o *otelResolverInstance) startOtelEbpfProfiler(ctx context.Context) error 
 		Intervals:              intervals,
 		IncludeTracers:         includeTracers,
 		FilterErrorFrames:      true,
-		SamplesPerSecond:       0,
-		MapScaleFactor:         0,
+		SamplesPerSecond:       99,
+		MapScaleFactor:         2,
 		KernelVersionCheck:     false,
 		VerboseMode:            true,
 		BPFVerifierLogLevel:    2, // 0=none, 1=basic, 2=full
