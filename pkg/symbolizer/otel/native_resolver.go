@@ -344,3 +344,95 @@ func baseOf(p string) string {
 	}
 	return p
 }
+
+// resolveAddr resolves one runtime virtual address from the target process
+// <tgid> to a function name by walking /proc/<tgid>/maps to locate the
+// covering ELF mapping, then searching that file's .dynsym / .symtab for
+// the nearest-covering symbol. Used when the otel profiler has no
+// correlated trace for the event (e.g. fork()-spawned children whose
+// stacks the profiler could not walk): the ustack operator then still
+// delivers raw kernel-captured addresses in stackQueries and we resolve
+// them here.
+//
+// Returns "" if the address has no readable backing file (anonymous /
+// JIT). Returns "<basename>+0x<fileoff>" if the file is readable but
+// no covering symbol is found; the caller may choose to drop that.
+func (c *nativeSymbolCache) resolveAddr(tgid uint32, runtimeAddr uint64, mapsCache *procMapsCache) string {
+	if runtimeAddr == 0 {
+		return ""
+	}
+	m, ok := mapsCache.find(tgid, runtimeAddr)
+	if !ok {
+		return ""
+	}
+	// ELF virtual address: runtime addr normalized to the ELF's own VA
+	// space. For shared libraries loaded at runtime-base B where the
+	// first PT_LOAD has (p_vaddr=V0, p_offset=O0), the relation
+	//   runtime_addr - B + O0 == file_offset
+	// and the ELF VA used by st_value for code is
+	//   elf_va = runtime_addr - (B - V0) = runtime_addr - B + V0
+	// For the vast majority of shared libraries V0==O0 (first PT_LOAD
+	// starts at offset 0, vaddr 0) so file_offset == elf_va. We use the
+	// (simpler) runtime_addr - (start - offset) form which is exact
+	// when each mapping describes a single PT_LOAD segment.
+	elfAddr := runtimeAddr - (m.start - m.offset)
+	path := hostPath(tgid, m.path)
+	if name := c.lookup(path, elfAddr); name != "" {
+		return name
+	}
+	fileOff := runtimeAddr - m.start + m.offset
+	return fmt.Sprintf("%s+0x%x", baseOf(m.path), fileOff)
+}
+
+// procMapsCache caches the parsed /proc/<tgid>/maps table per-call. The
+// same tgid typically appears on every frame of a given stack; reparsing
+// the table for every frame would be wasteful.
+type procMapsCache struct {
+	entries map[uint32][]mapsEntry
+}
+
+type mapsEntry struct {
+	start  uint64
+	end    uint64
+	offset uint64
+	path   string
+}
+
+func newProcMapsCache() *procMapsCache {
+	return &procMapsCache{entries: make(map[uint32][]mapsEntry)}
+}
+
+func (pc *procMapsCache) find(tgid uint32, addr uint64) (mapsEntry, bool) {
+	entries, ok := pc.entries[tgid]
+	if !ok {
+		entries = readProcMaps(tgid)
+		pc.entries[tgid] = entries
+	}
+	for _, e := range entries {
+		if addr >= e.start && addr < e.end {
+			return e, true
+		}
+	}
+	return mapsEntry{}, false
+}
+
+func readProcMaps(tgid uint32) []mapsEntry {
+	data, err := os.ReadFile(fmt.Sprintf("%s/%d/maps", procfsRoot, tgid))
+	if err != nil {
+		return nil
+	}
+	var out []mapsEntry
+	for _, line := range splitLines(data) {
+		addr, perms, off, p, ok := parseMapsLine(line)
+		if !ok || !perms.x || p == "" || p[0] != '/' {
+			continue
+		}
+		out = append(out, mapsEntry{
+			start:  addr.start,
+			end:    addr.end,
+			offset: off,
+			path:   p,
+		})
+	}
+	return out
+}

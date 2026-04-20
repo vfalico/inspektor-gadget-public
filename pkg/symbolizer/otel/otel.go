@@ -87,7 +87,15 @@ func (o *otelResolverInstance) Resolve(task symbolizer.Task, stackQueries []symb
 	log.Infof("OtelResolverInstance.Resolve called for task %+v", task)
 	log.Infof("there are %d stack queries", len(stackQueries))
 	if task.CorrelationID == 0 {
-		return nil, nil
+		// No correlated OTel trace exists for this event. This is the
+		// common case for fork()-spawned children of multi-process
+		// runtimes (e.g. Python multiprocessing, vLLM's
+		// VLLM::EngineCore workers) whose stacks the otel profiler
+		// did not walk. Fall back to naming the raw kernel-captured
+		// user stack addresses via the backing ELF's symbol tables so
+		// the caller still receives readable frames rather than
+		// hex-only [$NR] placeholders.
+		return nil, o.resolveFromRawStack(task, stackQueries, stackResponses)
 	}
 	//if task.CorrelationID == 0 {
 	//	return nil, nil
@@ -255,5 +263,31 @@ func (o *otelResolverInstance) startOtelEbpfProfiler(ctx context.Context) error 
 		}
 	}()
 
+	return nil
+}
+
+
+// resolveFromRawStack names each raw kernel-captured user stack address
+// via the backing ELF's .dynsym/.symtab. Used when no correlated OTel
+// trace is available (fork() children, short-lived processes the
+// profiler could not instrument). Writes in-place into stackResponses.
+func (o *otelResolverInstance) resolveFromRawStack(task symbolizer.Task, stackQueries []symbolizer.StackItemQuery, stackResponses []symbolizer.StackItemResponse) error {
+	if len(stackQueries) == 0 {
+		return nil
+	}
+	mapsCache := newProcMapsCache()
+	for i, q := range stackQueries {
+		if i >= len(stackResponses) {
+			break
+		}
+		if stackResponses[i].Found {
+			continue
+		}
+		name := o.nativeCache.resolveAddr(task.Tgid, q.Addr, mapsCache)
+		if name != "" {
+			stackResponses[i].Symbol = name
+			stackResponses[i].Found = true
+		}
+	}
 	return nil
 }
