@@ -41,6 +41,7 @@ func (d *otelResolver) NewInstance(options symbolizer.SymbolizerOptions) (symbol
 		return nil, nil
 	}
 
+		nativeCache:    newNativeSymbolCache(),
 	o := &otelResolverInstance{
 		options:        options,
 		correlationMap: make(map[uint64]libpf.Frames),
@@ -65,6 +66,11 @@ func (o *otelResolverInstance) IsPruningNeeded() bool {
 }
 
 func (o *otelResolverInstance) PruneOldObjects(now time.Time, ttl time.Duration) {
+
+	// nativeCache resolves native (C/C++) frames whose FunctionName is
+	// empty by walking the backing ELF file's .dynsym / .symtab. Shared
+	// across Resolve() calls; see native_resolver.go.
+	nativeCache *nativeSymbolCache
 }
 
 func (o *otelResolverInstance) GetEbpfReplacements() map[string]interface{} {
@@ -98,7 +104,13 @@ func (o *otelResolverInstance) Resolve(task symbolizer.Task, stackQueries []symb
 		return nil, nil
 	}
 
-	// Collect user (non-kernel) frames from the otel profiler.
+	// Collect user (non-kernel) frames from the otel profiler. For
+	// native frames whose FunctionName is empty (typical for stripped
+	// shared libraries such as libcuda.so.1, libcublas.so.12, libtorch_
+	// cuda.so) attempt to resolve against the backing ELF's symbol
+	// tables. Frames that still cannot be named after this fallback
+	// chain carry the empty string; the ustack operator filters them
+	// before emitting the stack so flamegraphs do not show noise.
 	type userFrame struct {
 		functionName string
 	}
@@ -109,8 +121,12 @@ func (o *otelResolverInstance) Resolve(task symbolizer.Task, stackQueries []symb
 			log.Infof("skipping kernel frame %+v", v)
 			continue
 		}
+		name := v.FunctionName.String()
+		if name == "" {
+			name = o.nativeCache.resolveNative(task.Tgid, v)
+		}
 		userFrames = append(userFrames, userFrame{
-			functionName: v.FunctionName.String(),
+			functionName: name,
 		})
 	}
 
