@@ -251,6 +251,13 @@ func (o *OperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 				return err
 			}
 
+			// Make the symbols field visible in JSON output.
+			// The parent field and other subfields (addresses, buildid)
+			// remain hidden: they carry internal plumbing data. symbols
+			// is the user-facing resolved output and is the field that
+			// flamegraph views consume via profiles.stack-fields.
+			symbolsField.SetHidden(false, false)
+
 			converter := func(ds datasource.DataSource, data datasource.Data) error {
 				major, _ := majorField[0].Uint32(data)
 				minor, _ := minorField[0].Uint32(data)

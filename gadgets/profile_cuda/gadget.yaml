@@ -16,12 +16,20 @@ datasources:
       profiles.value-field: count
       profiles.type: malloc
       profiles.unit: bytes
+      views.modes.flamegraph: "true"
     fields:
       proc.comm:
         annotations:
           flamegraph.level: 10
           flamegraph.type: single
           profiles.sample-attribute: "true"
+      count:
+        annotations:
+          flamegraph.type: samples
+      ustack_raw.symbols:
+        annotations:
+          flamegraph.level: 20
+          flamegraph.type: stack
   errors:
     annotations:
       description: "CUDA API errors with function identification"
