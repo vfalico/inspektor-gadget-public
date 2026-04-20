@@ -186,12 +186,23 @@ func loadELFSymbols(path string) *elfSymbols {
 	return &elfSymbols{ok: true, syms: syms}
 }
 
+// procfsRoot is the procfs mount point used to inspect target processes.
+// Defaults to "/proc"; overridden by OTEL_PROFILER_HOST_PROCFS so the
+// resolver works when the gadget DaemonSet runs with hostPID:false and
+// the host procfs is bind-mounted at e.g. /host/proc.
+var procfsRoot = func() string {
+	if v := os.Getenv("OTEL_PROFILER_HOST_PROCFS"); v != "" {
+		return v
+	}
+	return "/proc"
+}()
+
 // findMappedPath walks /proc/<tgid>/maps to find a mapping whose
 // backing file has the given basename and covers the given file
 // offset. Returns the host-visible absolute path (via /proc/<tgid>/
 // root/<p>) when the DaemonSet runs with hostPID=true.
 func findMappedPath(tgid uint32, basename string, fileOffset uint64) (string, bool) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", tgid))
+	data, err := os.ReadFile(fmt.Sprintf(procfsRoot + "/%d/maps", tgid))
 	if err != nil {
 		return "", false
 	}
@@ -230,7 +241,7 @@ func findMappedPath(tgid uint32, basename string, fileOffset uint64) (string, bo
 // hostPath prefixes the container-view path with /proc/<tgid>/root so
 // files are read from the target mount namespace. Requires hostPID.
 func hostPath(tgid uint32, containerPath string) string {
-	return fmt.Sprintf("/proc/%d/root%s", tgid, containerPath)
+	return fmt.Sprintf(procfsRoot + "/%d/root%s", tgid, containerPath)
 }
 
 type mapsAddr struct {
