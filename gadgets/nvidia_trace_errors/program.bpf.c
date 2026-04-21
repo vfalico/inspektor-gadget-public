@@ -50,6 +50,16 @@ enum error_source {
 #define API_cuCtxSynchronize     21
 #define API_cuInit               22
 
+/* XID→workload attribution flags (bitmask) */
+#define XID_ATTRIB_PID_FROM_CONTEXT 0x1
+#define XID_ATTRIB_CUDA_RING_MATCH  0x2
+#define XID_ATTRIB_USER_STACK       0x4
+#define XID_ATTRIB_GLOBAL_RING      0x8  /* fell back to cross-PID ring */
+#define XID_ATTRIB_INTERRUPT_CTX    0x10 /* PID captured is a kernel IRQ thread */
+
+/* Ring-match window for XID ↔ recent CUDA call correlation. */
+#define CUDA_RING_MATCH_WINDOW_NS (100ULL * 1000ULL * 1000ULL)
+
 struct event {
 	gadget_timestamp timestamp_raw;
 	struct gadget_process proc;
@@ -73,6 +83,11 @@ struct event {
 	__u64 arg5;
 	__u64 arg6;
 
+	/* XID→workload correlation (zero on CUDA-API events) */
+	__u32 active_cuda_api;      /* API_* id of matched recent call, 0 if none */
+	__u32 xid_attrib_flags;     /* XID_ATTRIB_* bitmask */
+	__s64 active_cuda_delta_ns; /* xid_ts - last_cuda_ts (ns); 0 if no match */
+
 	struct gadget_user_stack ustack_raw;
 };
 
@@ -93,6 +108,45 @@ struct {
 	__type(key, __u64);               /* bpf_get_current_pid_tgid() */
 	__type(value, struct entry_args);
 } entries SEC(".maps");
+
+/*
+ * Per-TID "last CUDA call" record, stamped unconditionally on every
+ * uretprobe. Used to attribute XID events to the most recent CUDA activity
+ * from the same thread when the XID fires in process context.
+ *
+ * LRU_HASH so the map auto-evicts entries from exited threads.
+ */
+struct cuda_last_call {
+	__u32 api_id;
+	__u32 _pad;
+	__u64 ts_ns;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, MAX_ENTRIES);
+	__type(key, __u32);               /* tgid */
+	__type(value, struct cuda_last_call);
+} cuda_last SEC(".maps");
+
+/*
+ * Single "most recent CUDA call across any PID" slot.  Used as the
+ * strategy-C fallback when an XID fires in IRQ/DPC context — it attributes
+ * to the PID that most recently touched the GPU, which is a reasonable
+ * heuristic on single-GPU / single-tenant nodes and is marked with the
+ * XID_ATTRIB_GLOBAL_RING flag so user-space can surface lower confidence.
+ */
+struct cuda_last_any {
+	struct cuda_last_call call;
+	struct gadget_process proc;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct cuda_last_any);
+} cuda_last_any SEC(".maps");
 
 GADGET_TRACER_MAP(events, 1024 * 512);
 GADGET_TRACER(nvidia_errors, events, event);
@@ -121,6 +175,52 @@ handle_return(struct pt_regs *ctx)
 		return 0;
 
 	__s32 ret = (__s32)PT_REGS_RC(ctx);
+
+	/* Always stamp the per-TGID "last CUDA call" record — success or
+	 * failure — so an XID arriving within 100 ms can attribute to the
+	 * right workload even when the CUDA call itself succeeded, and even
+	 * when the XID is reported from the CUDA driver's internal event
+	 * handler thread rather than the one that submitted the API call.
+	 */
+	__u32 tgid_key = (__u32)(tid >> 32);
+	struct cuda_last_call rec = {
+		.api_id = args->api_id,
+		.ts_ns  = bpf_ktime_get_boot_ns(),
+	};
+	bpf_map_update_elem(&cuda_last, &tgid_key, &rec, BPF_ANY);
+
+	/*
+	 * Only update the global-ring slot for APIs that can plausibly submit
+	 * GPU work or release resources (and thus trigger an XID).  This
+	 * skips hot polling APIs (cuStreamQuery, cuEventQuery, cuEventRecord)
+	 * which account for the vast majority of libcuda calls in steady-
+	 * state ML workloads but never cause XIDs directly.
+	 */
+	switch (args->api_id) {
+	case API_cuLaunchKernel:
+	case API_cuMemcpyHtoD_v2:
+	case API_cuMemcpyDtoH_v2:
+	case API_cuCtxSynchronize:
+	case API_cuStreamSynchronize:
+	case API_cuMemFree_v2:
+	case API_cuMemAlloc_v2:
+	case API_cuMemAllocManaged:
+	case API_cuMemAllocPitch_v2:
+	case API_cuCtxCreate_v2:
+	case API_cuModuleLoad:
+	case API_cuModuleLoadData:
+	case API_cuModuleGetFunction:
+	case API_cuEventSynchronize: {
+		__u32 zero = 0;
+		struct cuda_last_any g = { .call = rec };
+		gadget_process_populate(&g.proc);
+		bpf_map_update_elem(&cuda_last_any, &zero, &g, BPF_ANY);
+		break;
+	}
+	default:
+		break;
+	}
+
 	if (ret == CUDA_SUCCESS) {
 		bpf_map_delete_elem(&entries, &tid);
 		return 0;
@@ -155,7 +255,16 @@ handle_return(struct pt_regs *ctx)
  * nv_report_error is exported by the NVIDIA kernel module (open-source build).
  * Signature: void nv_report_error(struct pci_dev *dev, NvU32 error_number,
  *                                 const char *format, va_list ap);
- * We only read the first two args.
+ *
+ * Correlation with the offending workload:
+ *   1. Process context: bpf_get_current_pid_tgid() — reliable when
+ *      nv_report_error is invoked from a user ioctl (XID 13/31/43/45).
+ *      For XIDs raised from IRQ/DPC (48/61/62/63/64/79) it is noise;
+ *      the XID_ATTRIB_PID_FROM_CONTEXT flag lets user-space filter.
+ *   2. Recent CUDA call: if the same TID ran a libcuda API within
+ *      CUDA_RING_MATCH_WINDOW_NS, surface it on the XID event.
+ *   3. User stack: gadget_get_user_stack() is a no-op when current is
+ *      not a user thread, so unconditionally calling it is safe.
  */
 SEC("kprobe/nv_report_error")
 int BPF_KPROBE(trace_nv_report_error, struct pci_dev *dev, __u32 error_number)
@@ -177,6 +286,54 @@ int BPF_KPROBE(trace_nv_report_error, struct pci_dev *dev, __u32 error_number)
 		e->pci_func   = devfn & 0x7;
 		e->pci_domain = 0;
 	}
+
+	__u64 tid   = bpf_get_current_pid_tgid();
+	__u32 pid   = (__u32)(tid >> 32);
+	__u32 flags = 0;
+
+	if (pid != 0)
+		flags |= XID_ATTRIB_PID_FROM_CONTEXT;
+
+	struct cuda_last_call *last = bpf_map_lookup_elem(&cuda_last, &pid);
+	if (last) {
+		__s64 delta = (__s64)(e->timestamp_raw - last->ts_ns);
+		if (delta >= 0 && delta <= (__s64)CUDA_RING_MATCH_WINDOW_NS) {
+			e->active_cuda_api      = last->api_id;
+			e->active_cuda_delta_ns = delta;
+			flags |= XID_ATTRIB_CUDA_RING_MATCH;
+		}
+	}
+	/*
+	 * Strategy-C fallback: if no per-PID hit (common for XID 31/48/79
+	 * which are raised from IRQ/DPC context), use the global "most
+	 * recent CUDA call across any PID" slot.  Widen the window to 2s.
+	 */
+	if (!(flags & XID_ATTRIB_CUDA_RING_MATCH)) {
+		__u32 zero = 0;
+		struct cuda_last_any *g =
+			bpf_map_lookup_elem(&cuda_last_any, &zero);
+		if (g && g->call.ts_ns) {
+			__s64 delta = (__s64)(e->timestamp_raw - g->call.ts_ns);
+			if (delta >= 0 &&
+			    delta <= (__s64)(CUDA_RING_MATCH_WINDOW_NS * 20)) {
+				e->active_cuda_api      = g->call.api_id;
+				e->active_cuda_delta_ns = delta;
+				/* Replace interrupt-ctx proc snapshot with the
+				 * offending workload's captured proc so the
+				 * downstream container enricher can resolve it
+				 * to the right K8s pod. */
+				flags |= XID_ATTRIB_GLOBAL_RING;
+				flags |= XID_ATTRIB_INTERRUPT_CTX;
+				flags &= ~XID_ATTRIB_PID_FROM_CONTEXT;
+				__builtin_memcpy(&e->proc, &g->proc,
+						 sizeof(e->proc));
+			}
+		}
+	}
+
+	gadget_get_user_stack(ctx, &e->ustack_raw);
+	flags |= XID_ATTRIB_USER_STACK;
+	e->xid_attrib_flags = flags;
 
 	gadget_submit_buf(ctx, &events, e, sizeof(*e));
 	return 0;

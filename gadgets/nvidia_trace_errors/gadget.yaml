@@ -152,7 +152,35 @@ datasources:
         annotations: { description: "Raw argument 5", columns.hidden: "true" }
       arg6:
         annotations: { description: "Raw argument 6", columns.hidden: "true" }
+      active_cuda_api:
+        annotations:
+          description: "API_* id of the most recent CUDA call by the offending PID within 100 ms of the XID (raw)"
+          columns.hidden: "true"
+      xid_attrib_flags:
+        annotations:
+          description: "XID→workload attribution bitmask (raw)"
+          columns.hidden: "true"
+      active_cuda_delta_ns:
+        annotations:
+          description: "Time between the active CUDA call and the XID event (ns)"
+          columns.hidden: "true"
+      active_cuda_args:
+        annotations:
+          description: "Arguments of the active CUDA call (raw)"
+          columns.hidden: "true"
+      _xid_pad:
+        annotations:
+          description: "padding"
+          columns.hidden: "true"
+      active_cuda_call:
+        annotations:
+          description: "Active CUDA call correlated with an XID (added by WASM enricher)"
+          columns.width: "28"
+      xid_attribution:
+        annotations:
+          description: "How the XID was attributed to the workload (added by WASM enricher)"
+          columns.width: "24"
       ustack_raw:
         annotations:
-          description: "User-space call stack (CUDA API events only)"
+          description: "User-space call stack (CUDA and XID events)"
           columns.hidden: "true"
