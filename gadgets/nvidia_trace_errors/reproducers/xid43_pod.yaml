@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: xid-repro-43
+  namespace: xid-test
+  labels: {app: xid-repro, xid: "43"}
+spec:
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  activeDeadlineSeconds: 180
+  terminationGracePeriodSeconds: 1
+  containers:
+  - name: repro
+    image: docker.io/nvidia/cuda:12.3.2-devel-ubuntu22.04
+    imagePullPolicy: IfNotPresent
+    command: ["bash","-lc"]
+    args:
+    - |
+      set -euo pipefail
+      nvcc -arch=sm_80 -o /tmp/xid43 /src/xid43_trap.cu
+      /tmp/xid43 || true
+      sleep 3
+    env:
+    - name: NVIDIA_VISIBLE_DEVICES
+      value: "all"
+    - name: NVIDIA_DRIVER_CAPABILITIES
+      value: "compute,utility"
+    volumeMounts:
+    - name: src
+      mountPath: /src
+  volumes:
+  - name: src
+    hostPath:
+      path: /home/azdev/ig-upstream/gadgets/nvidia_trace_errors/reproducers
+      type: Directory
