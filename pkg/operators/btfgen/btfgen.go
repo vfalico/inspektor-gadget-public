@@ -128,6 +128,10 @@ func getBTFFile(r io.Reader, filename string) ([]byte, error) {
 			return nil, fmt.Errorf("reading tar: %w", err)
 		}
 
+		// IG-AUDIT-2026-08: refuse crafted tar names before using hdr.Name.
+		if _, err := oci.SanitizeLayerPath("/tmp/ig-btf", hdr.Name); err != nil {
+			return nil, err
+		}
 		if hdr.Name == filename {
 			b, err := io.ReadAll(tr)
 			if err != nil {

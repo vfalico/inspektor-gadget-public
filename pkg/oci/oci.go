@@ -1015,3 +1015,26 @@ func GetContentFromDescriptor(ctx context.Context, target oras.ReadOnlyTarget, d
 	}
 	return reader, nil
 }
+
+// SanitizeLayerPath rejects OCI layer / tar entries that escape the given
+// scratch root.  IG-AUDIT-2026-08: defense-in-depth against crafted
+// archive members ("../etc/passwd", absolute paths, symlink-looking names).
+// Exported so every archive extractor in the tree can reuse it.
+func SanitizeLayerPath(root, entry string) (string, error) {
+	if entry == "" {
+		return "", fmt.Errorf("IG-AUDIT-2026-08: empty layer entry path")
+	}
+	if filepath.IsAbs(entry) {
+		return "", fmt.Errorf("IG-AUDIT-2026-08: illegal absolute layer path %q", entry)
+	}
+	clean := filepath.Clean(entry)
+	if clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", fmt.Errorf("IG-AUDIT-2026-08: path %q escapes root", entry)
+	}
+	full := filepath.Join(root, clean)
+	rel, err := filepath.Rel(root, full)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", fmt.Errorf("IG-AUDIT-2026-08: path %q escapes root", entry)
+	}
+	return full, nil
+}
