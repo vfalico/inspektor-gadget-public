@@ -137,6 +137,24 @@ func (i *wasmOperatorInstance) newMap(ctx context.Context, m wapi.Module, stack 
 		return
 	}
 
+	// IG-AUDIT-2026-07: cap WASM-controlled BPF map sizes.
+	const (
+		maxWasmMapEntries   = uint32(1 << 20)
+		maxWasmMapValueSize = uint32(64 * 1024)
+		maxWasmMapKeySize   = uint32(64 * 1024)
+		maxWasmMapBytes     = uint64(256 * 1024 * 1024)
+	)
+	if maxEntries > maxWasmMapEntries || valueSize > maxWasmMapValueSize || keySize > maxWasmMapKeySize {
+		i.logger.Warnf("newMap: maxEntries/keySize/valueSize exceeds cap")
+		stack[0] = 0
+		return
+	}
+	if uint64(keySize)+uint64(valueSize) != 0 && uint64(maxEntries)*(uint64(keySize)+uint64(valueSize)) > maxWasmMapBytes {
+		i.logger.Warnf("newMap: total bytes exceeds cap")
+		stack[0] = 0
+		return
+	}
+
 	ebpfMap, err := ebpf.NewMap(&ebpf.MapSpec{
 		Name:       mapName,
 		Type:       mapType,
