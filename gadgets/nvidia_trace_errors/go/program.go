@@ -180,6 +180,13 @@ var (
 	fSuggestion api.Field
 	fContext    api.Field
 	fGPUAddr    api.Field
+
+	// XID→workload correlation (patch 0002)
+	fActiveCUDAAPIRaw api.Field
+	fXIDAttribFlags   api.Field
+	fActiveCUDADeltaNS api.Field
+	fActiveCUDACall api.Field
+	fXIDAttribution api.Field
 )
 
 //go:wasmexport gadgetInit
@@ -218,6 +225,9 @@ func bindRawFields() error {
 		{&fPCIFunc, "pci_func"},
 		{&fArg1, "arg1"}, {&fArg2, "arg2"}, {&fArg3, "arg3"},
 		{&fArg4, "arg4"}, {&fArg5, "arg5"}, {&fArg6, "arg6"},
+		{&fActiveCUDAAPIRaw, "active_cuda_api"},
+		{&fXIDAttribFlags, "xid_attrib_flags"},
+		{&fActiveCUDADeltaNS, "active_cuda_delta_ns"},
 	} {
 		*b.f, err = dsErrors.GetField(b.name)
 		if err != nil {
@@ -243,6 +253,8 @@ func addDerivedFields() error {
 		{&fSuggestion, "suggestion"},
 		{&fContext, "context_info"},
 		{&fGPUAddr, "gpu_pci_addr"},
+		{&fActiveCUDACall, "active_cuda_call"},
+		{&fXIDAttribution, "xid_attribution"},
 	} {
 		*b.f, err = dsErrors.AddField(b.name, api.Kind_String)
 		if err != nil {
@@ -334,9 +346,97 @@ func enrichXID(data api.Data) {
 	fCategory.SetString(data, entry.category)
 	fSeverity.SetString(data, entry.severity)
 	fGPUAddr.SetString(data, addr)
-	fContext.SetString(data, fmt.Sprintf("xid=%d pci=%s", xid, addr))
-	fWhy.SetString(data, fmt.Sprintf("NVIDIA driver reported XID %d (%s) from kernel context on GPU %s.",
-		xid, entry.name, addr))
+	// XID→workload correlation (patch 0002): render the active CUDA API
+	// call, attribution strategy, and augment why/context_info.
+	attribFlags, _ := fXIDAttribFlags.Uint32(data)
+	activeAPI, _ := fActiveCUDAAPIRaw.Uint32(data)
+	activeDelta, _ := fActiveCUDADeltaNS.Int64(data)
+
+	attribParts := []string{}
+	if attribFlags&xidAttribPIDFromContext != 0 {
+		attribParts = append(attribParts, "process_context")
+	}
+	if attribFlags&xidAttribCUDARingMatch != 0 {
+		attribParts = append(attribParts, "cuda_ring_match")
+	}
+	if attribFlags&xidAttribUserStack != 0 {
+		attribParts = append(attribParts, "user_stack")
+	}
+	if attribFlags&xidAttribGlobalRing != 0 {
+		attribParts = append(attribParts, "global_ring")
+	}
+	if attribFlags&xidAttribInterruptCtx != 0 {
+		attribParts = append(attribParts, "interrupt_ctx")
+	}
+	attribStr := "none"
+	if len(attribParts) > 0 {
+		attribStr = joinParts(attribParts, ",")
+	}
+	fXIDAttribution.SetString(data, attribStr)
+
+	activeCall := ""
+	if attribFlags&(xidAttribCUDARingMatch|xidAttribGlobalRing) != 0 {
+		name, ok := apiNames[activeAPI]
+		if !ok {
+			name = fmt.Sprintf("cuda_api_%d", activeAPI)
+		}
+		activeCall = fmt.Sprintf("%s (Δ-%s ago)", name, fmtDuration(activeDelta))
+	}
+	fActiveCUDACall.SetString(data, activeCall)
+
+	pidContext := "(no process context)"
+	if attribFlags&xidAttribPIDFromContext != 0 {
+		pidContext = "in process context"
+	}
+	fContext.SetString(data, fmt.Sprintf("xid=%d pci=%s active_cuda=%s attribution=%s",
+		xid, addr, firstNonEmpty(activeCall, "-"), attribStr))
+	whyBase := fmt.Sprintf("NVIDIA driver reported XID %d (%s) from kernel context on GPU %s %s.",
+		xid, entry.name, addr, pidContext)
+	if activeCall != "" {
+		whyBase += fmt.Sprintf(" Offending workload last invoked %s.", activeCall)
+	}
+	fWhy.SetString(data, whyBase)
+}
+
+// XID→workload correlation bit-flags — mirrors program.bpf.c.
+const (
+	xidAttribPIDFromContext uint32 = 1 << 0
+	xidAttribCUDARingMatch  uint32 = 1 << 1
+	xidAttribUserStack      uint32 = 1 << 2
+	xidAttribGlobalRing     uint32 = 1 << 3
+	xidAttribInterruptCtx   uint32 = 1 << 4
+)
+
+// fmtDuration formats a ns delta as a short human-friendly string.
+func fmtDuration(ns int64) string {
+	if ns < 1000 {
+		return fmt.Sprintf("%dns", ns)
+	}
+	if ns < 1000*1000 {
+		return fmt.Sprintf("%.1fµs", float64(ns)/1000.0)
+	}
+	if ns < 1000*1000*1000 {
+		return fmt.Sprintf("%.1fms", float64(ns)/1000000.0)
+	}
+	return fmt.Sprintf("%.2fs", float64(ns)/1e9)
+}
+
+func joinParts(parts []string, sep string) string {
+	out := ""
+	for i, s := range parts {
+		if i > 0 {
+			out += sep
+		}
+		out += s
+	}
+	return out
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // ─── heuristics ───────────────────────────────────────────────────────────
