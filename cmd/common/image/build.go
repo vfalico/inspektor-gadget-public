@@ -190,6 +190,28 @@ func runPipeline(runner commandRunner, steps []buildStep) error {
 	return nil
 }
 
+
+// validateBuildPath rejects build.yaml field values that could be interpreted
+// as shell metacharacters when concatenated into a `make` argv (see
+// IG-AUDIT-2026-01, incomplete fix of CVE-2026-24905).
+func validateBuildPath(field, v string) error {
+	if v == "" {
+		return nil
+	}
+	for _, c := range v {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '_' || c == '.' || c == '/' || c == '-':
+		default:
+			return fmt.Errorf("invalid path in build.yaml: %s contains illegal character %q", field, c)
+		}
+	}
+	if strings.HasPrefix(v, "-") {
+		return fmt.Errorf("invalid path in build.yaml: %s may not start with '-'", field)
+	}
+	return nil
+}
+
 func runBuild(cmd *cobra.Command, opts *cmdOpts) error {
 	conf := &buildFile{
 		EBPFSource: DEFAULT_EBPF_SOURCE,
@@ -296,6 +318,13 @@ func runBuild(cmd *cobra.Command, opts *cmdOpts) error {
 	}
 
 	if conf.EBPFSource != "" || conf.Wasm != "" {
+	if err := validateBuildPath("ebpfsource", conf.EBPFSource); err != nil {
+		return err
+	}
+	if err := validateBuildPath("wasm", conf.Wasm); err != nil {
+		return err
+	}
+
 		if opts.local {
 			steps, err := buildPipeline(buildOptions{
 				outputDir:         opts.outputDir,
