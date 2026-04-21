@@ -1016,6 +1016,85 @@ func GetContentFromDescriptor(ctx context.Context, target oras.ReadOnlyTarget, d
 	return reader, nil
 }
 
+// redactSensitive scrubs Authorization / X-Registry-Auth / Cookie / Set-Cookie
+// headers and common secret-valued environment variables before log emission.
+// IG-AUDIT-2026-14.
+func redactSensitive(in string) string {
+	out := in
+	// header-style: "Name: value" or "Name=value"
+	heads := []string{"Authorization", "X-Registry-Auth", "Cookie", "Set-Cookie"}
+	for _, h := range heads {
+		for _, sep := range []string{": ", "=", "\t"} {
+			needle := h + sep
+			start := 0
+			for start <= len(out) {
+				rel := indexFold(out[start:], needle)
+				if rel < 0 {
+					break
+				}
+				i := start + rel
+				j := i + len(needle)
+				k := j
+				// scrub up to end of line (newline/carriage return)
+				for k < len(out) && out[k] != '\n' && out[k] != '\r' {
+					k++
+				}
+				out = out[:j] + "<redacted>" + out[k:]
+				start = j + len("<redacted>")
+			}
+		}
+	}
+	// env-style secret variables
+	envs := []string{"AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+		"GITHUB_TOKEN", "GH_TOKEN", "DOCKER_AUTH_CONFIG", "KUBE_TOKEN"}
+	for _, e := range envs {
+		needle := e + "="
+		start := 0
+		for start <= len(out) {
+			rel := indexFold(out[start:], needle)
+			if rel < 0 {
+				break
+			}
+			i := start + rel
+			j := i + len(needle)
+			k := j
+			for k < len(out) && out[k] != '\n' && out[k] != '\r' && out[k] != ' ' {
+				k++
+			}
+			out = out[:j] + "<redacted>" + out[k:]
+			start = j + len("<redacted>")
+		}
+	}
+	return out
+}
+
+func indexFold(s, sub string) int {
+	if len(sub) == 0 {
+		return 0
+	}
+	for i := 0; i+len(sub) <= len(s); i++ {
+		match := true
+		for j := 0; j < len(sub); j++ {
+			a, b := s[i+j], sub[j]
+			if a >= 'A' && a <= 'Z' {
+				a += 32
+			}
+			if b >= 'A' && b <= 'Z' {
+				b += 32
+			}
+			if a != b {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+
 // SanitizeLayerPath rejects OCI layer / tar entries that escape the given
 // scratch root.  IG-AUDIT-2026-08: defense-in-depth against crafted
 // archive members ("../etc/passwd", absolute paths, symlink-looking names).
