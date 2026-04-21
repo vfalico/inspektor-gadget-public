@@ -42,6 +42,7 @@ func (d *otelResolver) NewInstance(options symbolizer.SymbolizerOptions) (symbol
 	}
 
 		nativeCache:    newNativeSymbolCache(),
+		notifiedPIDs:   make(map[uint32]struct{}),
 	o := &otelResolverInstance{
 		options:        options,
 		correlationMap: make(map[uint64]libpf.Frames),
@@ -71,6 +72,11 @@ func (o *otelResolverInstance) PruneOldObjects(now time.Time, ttl time.Duration)
 	// empty by walking the backing ELF file's .dynsym / .symtab. Shared
 	// across Resolve() calls; see native_resolver.go.
 	nativeCache *nativeSymbolCache
+
+	// notifiedPIDs tracks TGIDs for which we have already called
+	// trc.NotifyPID() to proactively trigger processManager
+	// synchronisation. Protected by mu.
+	notifiedPIDs map[uint32]struct{}
 }
 
 func (o *otelResolverInstance) GetEbpfReplacements() map[string]interface{} {
@@ -91,10 +97,25 @@ func (o *otelResolverInstance) Resolve(task symbolizer.Task, stackQueries []symb
 		// common case for fork()-spawned children of multi-process
 		// runtimes (e.g. Python multiprocessing, vLLM's
 		// VLLM::EngineCore workers) whose stacks the otel profiler
-		// did not walk. Fall back to naming the raw kernel-captured
-		// user stack addresses via the backing ELF's symbol tables so
-		// the caller still receives readable frames rather than
-		// hex-only [$NR] placeholders.
+		// did not walk. Proactively notify OTel of this TGID (once
+		// per PID) so its processManager.SynchronizeProcess() runs
+		// and subsequent events on the same PID get correlated — then
+		// fall back to naming the raw kernel-captured user stack
+		// addresses via the backing ELF's symbol tables so THIS
+		// event still receives readable frames rather than hex-only
+		// [$NR] placeholders.
+		if task.Tgid != 0 && o.trc != nil {
+			o.mu.Lock()
+			_, already := o.notifiedPIDs[task.Tgid]
+			if !already {
+				o.notifiedPIDs[task.Tgid] = struct{}{}
+			}
+			o.mu.Unlock()
+			if !already {
+				o.trc.NotifyPID(libpf.PID(task.Tgid))
+				log.Debugf("OtelResolverInstance.Resolve: NotifyPID(%d) for first CorrelationID==0 event", task.Tgid)
+			}
+		}
 		return nil, o.resolveFromRawStack(task, stackQueries, stackResponses)
 	}
 	//if task.CorrelationID == 0 {
