@@ -159,9 +159,12 @@ All these options should be set at the same time to enable TLS connection`,
 			}
 
 			tlsConfig := &tls.Config{
+				// IG-AUDIT-2026-15: enforce TLS 1.3 minimum and modern ciphers.
+				MinVersion:   tls.VersionTLS13,
 				ClientAuth:   tls.RequireAndVerifyClientCert,
 				Certificates: []tls.Certificate{cert},
 				ClientCAs:    ca,
+				SessionTicketsDisabled: true,
 			}
 
 			options = append(options, grpc.Creds(credentials.NewTLS(tlsConfig)))
