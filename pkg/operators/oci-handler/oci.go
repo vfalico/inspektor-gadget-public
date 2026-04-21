@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"io"
 	"slices"
 	"strings"
@@ -86,6 +87,10 @@ func (o *ociHandler) Init(params *params.Params) error {
 
 	verifyOptions := oci.VerifyOptions{
 		VerifySignature: o.globalParams.Get(verifyImage).AsBool(),
+	}
+	// IG-AUDIT-2026-03: daemon policy overrides client-requested bypass.
+	if v := strings.ToLower(os.Getenv("IG_VERIFY_IMAGE_POLICY")); v == "enforce" || v == "strict" || v == "require" {
+		verifyOptions.VerifySignature = true
 	}
 
 	if verifyOptions.VerifySignature {

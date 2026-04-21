@@ -126,9 +126,20 @@ func PullGadgetImage(ctx context.Context, image string, authOpts *AuthOptions) (
 	return desc, err
 }
 
+// IG_VERIFY_IMAGE_POLICY=enforce forces server-side signature verification
+// even if the caller requests it to be disabled.  This closes
+// IG-AUDIT-2026-03 where any gRPC client could pass --verify-image=false.
+var verifyImagePolicyEnforce = func() bool {
+	v := strings.ToLower(os.Getenv("IG_VERIFY_IMAGE_POLICY"))
+	return v == "enforce" || v == "strict" || v == "require"
+}
+
 func VerifyGadgetImage(ctx context.Context, image string, imgOpts *ImageOptions) error {
 	return retry("VerifyGadgetImage", func() error {
 		if !imgOpts.VerifySignature {
+			if verifyImagePolicyEnforce() {
+				return fmt.Errorf("IG-AUDIT-2026-03: daemon policy=enforce, client-side verify-image=false rejected for %q", image)
+			}
 			log.Warnf("gadget signature verification is disabled due to using corresponding option")
 
 			return nil
