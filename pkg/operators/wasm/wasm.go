@@ -195,6 +195,13 @@ func (i *wasmOperatorInstance) addHandle(obj any) uint32 {
 	}
 }
 
+// ErrHandleKindMismatch is returned when a WASM guest passes a handle
+// that exists in the table but whose kind does not match the expected
+// type.  IG-AUDIT-2026-10: we must not silently proceed with a zero
+// value, because that lets a malicious guest probe the handle-kind
+// oracle and then make forward progress against mixed-type APIs.
+var ErrHandleKindMismatch = fmt.Errorf("wasm: handle kind mismatch")
+
 // getHandleTyped returns the handle with the given ID, casted to the given type.
 // It can't be implemented as a generic method because it's not supported by Go yet.
 func getHandle[T any](i *wasmOperatorInstance, handleID uint32) (T, bool) {
@@ -211,7 +218,17 @@ func getHandle[T any](i *wasmOperatorInstance, handleID uint32) (T, bool) {
 
 	t, ok := val.(T)
 	if !ok {
-		i.logger.Warnf("bad handle type for %d", handleID)
+		// IG-AUDIT-2026-10: invalidate the handle after a kind mismatch
+		// so that a guest cannot keep probing the handle table for the
+		// correct type.  The handleLock upgrade is safe because the
+		// branch is cold and only triggered by malformed guests.
+		i.handleLock.RUnlock()
+		i.handleLock.Lock()
+		delete(i.handleMap, handleID)
+		i.handleLock.Unlock()
+		i.handleLock.RLock()
+		i.logger.Errorf("%v: handle=%d expected=%T got=%T (handle invalidated)",
+			ErrHandleKindMismatch, handleID, empty, val)
 		return empty, false
 	}
 
