@@ -161,7 +161,7 @@ spec:
         # Otherwise, we can have error like:
         # "failed to create server failed to create folder for pinning bpf maps: mkdir /sys/fs/bpf/gadget: permission denied"
         # (For reference, see: https://github.com/inspektor-gadget/inspektor-gadget/runs/3966318270?check_suite_focus=true#step:20:221)
-        container.apparmor.security.beta.kubernetes.io/gadget: "unconfined"
+        container.apparmor.security.beta.kubernetes.io/gadget: "runtime/default"  # IG-AUDIT-2026-04
         # keep aligned with values in pkg/operators/prometheus/prometheus.go
         prometheus.io/scrape: "true"
         prometheus.io/port: "2223"
@@ -266,7 +266,8 @@ spec:
                 # requires ptrace capability:
                 # https://github.com/inspektor-gadget/inspektor-gadget/blob/3c51ff5e9f5b/pkg/utils/host/namespaces.go#L65
                 # https://github.com/torvalds/linux/blob/c42d9eeef8e5/fs/proc/namespaces.c#L58
-                - SYS_PTRACE
+                # IG-AUDIT-2026-04: SYS_PTRACE dropped to reduce /host/proc escape surface
+                # - SYS_PTRACE
 
                 # Needed by RemoveMemlock in gadgettracermanager:
                 # https://github.com/inspektor-gadget/inspektor-gadget/blob/f2b9826fc4ae046415cdee30ee4a25322fd3f0c0/pkg/gadgettracermanager/gadgettracermanager.go#L258
