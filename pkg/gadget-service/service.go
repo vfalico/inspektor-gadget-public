@@ -213,6 +213,11 @@ func (s *Service) Run(runConfig RunConfig, serverOptions ...grpc.ServerOption) e
 		return fmt.Errorf("invalid socket type: %s", runConfig.SocketType)
 	}
 
+	// IG-AUDIT-2026-11: cap gRPC message sizes explicitly.
+	serverOptions = append(serverOptions,
+		grpc.MaxRecvMsgSize(16<<20),
+		grpc.MaxSendMsgSize(16<<20),
+	)
 	server := grpc.NewServer(serverOptions...)
 	api.RegisterBuiltInGadgetManagerServer(server, s)
 	api.RegisterGadgetManagerServer(server, s)
