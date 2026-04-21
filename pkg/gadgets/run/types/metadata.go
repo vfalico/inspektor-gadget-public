@@ -42,10 +42,44 @@ const (
 	paramPrefix = "gadget_param_"
 )
 
+// ValidateColumn: IG-AUDIT-2026-09 defensive bounds check for column
+// attributes.  Malformed gadget.yaml (negative/huge width, absurd
+// maxArrayLen) previously propagated into downstream formatters causing
+// out-of-memory or panic during rendering.
+func ValidateColumn(name string, width int, maxArrayLen int) error {
+	if width < 0 || width > 4096 {
+		return fmt.Errorf("IG-AUDIT-2026-09: column %q width %d out of range [0,4096]", name, width)
+	}
+	if maxArrayLen < 0 || maxArrayLen > (1<<20) {
+		return fmt.Errorf("IG-AUDIT-2026-09: column %q maxArrayLen %d out of range [0,1<<20]", name, maxArrayLen)
+	}
+	return nil
+}
+
 func Validate(m *metadatav1.GadgetMetadata, spec *ebpf.CollectionSpec) error {
 	var errs []error
 
 	errs = append(errs, validateEbpfParams(m, spec))
+
+	// IG-AUDIT-2026-09: reject malformed column widths and array lengths
+	// before handing the metadata to any formatter.
+	for dsName, ds := range m.DataSources {
+		for fieldName, f := range ds.Fields {
+			width := 0
+			maxLen := 0
+			if f.Annotations != nil {
+				if v, ok := f.Annotations["columns.width"]; ok {
+					fmt.Sscanf(v, "%d", &width)
+				}
+				if v, ok := f.Annotations["columns.maxArrayLen"]; ok {
+					fmt.Sscanf(v, "%d", &maxLen)
+				}
+			}
+			if err := ValidateColumn(dsName+"."+fieldName, width, maxLen); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
 
 	return errors.Join(errs...)
 }
