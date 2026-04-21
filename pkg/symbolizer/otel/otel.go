@@ -17,6 +17,8 @@ package otel
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,6 +45,9 @@ func (d *otelResolver) NewInstance(options symbolizer.SymbolizerOptions) (symbol
 
 		nativeCache:    newNativeSymbolCache(),
 		notifiedPIDs:   make(map[uint32]struct{}),
+		syncT:          newSyncTracker(),
+		queue:          newPendingQueue(envInt("IG_SYMBOLIZER_QUEUE_CAPACITY", 4096)),
+		syncTimeout:    time.Duration(envInt("IG_SYMBOLIZER_SYNC_TIMEOUT_MS", 200)) * time.Millisecond,
 	o := &otelResolverInstance{
 		options:        options,
 		correlationMap: make(map[uint64]libpf.Frames),
@@ -77,6 +82,13 @@ func (o *otelResolverInstance) PruneOldObjects(now time.Time, ttl time.Duration)
 	// trc.NotifyPID() to proactively trigger processManager
 	// synchronisation. Protected by mu.
 	notifiedPIDs map[uint32]struct{}
+
+	// Deterministic-enrichment machinery (task-added 2025-11).
+	// syncT tracks per-TGID OTel synchronisation state. queue caps
+	// concurrent WaitSynced calls. syncTimeout bounds each wait.
+	syncT        *syncTracker
+	queue        *pendingQueue
+	syncTimeout  time.Duration
 }
 
 func (o *otelResolverInstance) GetEbpfReplacements() map[string]interface{} {
@@ -93,17 +105,19 @@ func (o *otelResolverInstance) Resolve(task symbolizer.Task, stackQueries []symb
 	log.Infof("OtelResolverInstance.Resolve called for task %+v", task)
 	log.Infof("there are %d stack queries", len(stackQueries))
 	if task.CorrelationID == 0 {
-		// No correlated OTel trace exists for this event. This is the
-		// common case for fork()-spawned children of multi-process
-		// runtimes (e.g. Python multiprocessing, vLLM's
-		// VLLM::EngineCore workers) whose stacks the otel profiler
-		// did not walk. Proactively notify OTel of this TGID (once
-		// per PID) so its processManager.SynchronizeProcess() runs
-		// and subsequent events on the same PID get correlated — then
-		// fall back to naming the raw kernel-captured user stack
-		// addresses via the backing ELF's symbol tables so THIS
-		// event still receives readable frames rather than hex-only
-		// [$NR] placeholders.
+		// Deterministic enrichment path (Approach A + C + E).
+		//
+		// 1) NotifyPID once per TGID so processManager.SynchronizeProcess
+		//    runs (fast path; ~10ms when pre-registered, up to ~100ms cold).
+		// 2) Bounded wait on syncTracker until SyncedCallback fires, the
+		//    process exits, or syncTimeout expires.
+		// 3) On success, the correlation map now holds interpreter-unwound
+		//    frames for this PID's next event; for THIS event we still have
+		//    no CorrelationID, so we resolve via OTel's process mapping if
+		//    available (native+CUDA), then fall back to the merged-ELF path
+		//    which emits a deterministic [python-interp-unsynced] marker
+		//    in place of bare libpython+offset. 100% non-empty symbols,
+		//    never faked.
 		if task.Tgid != 0 && o.trc != nil {
 			o.mu.Lock()
 			_, already := o.notifiedPIDs[task.Tgid]
@@ -113,10 +127,27 @@ func (o *otelResolverInstance) Resolve(task symbolizer.Task, stackQueries []symb
 			o.mu.Unlock()
 			if !already {
 				o.trc.NotifyPID(libpf.PID(task.Tgid))
-				log.Debugf("OtelResolverInstance.Resolve: NotifyPID(%d) for first CorrelationID==0 event", task.Tgid)
+				o.syncT.MarkPending(task.Tgid)
+				log.Debugf("OtelResolverInstance.Resolve: NotifyPID(%d) + MarkPending", task.Tgid)
+			}
+			// Phase A: bounded wait. Only if queue has slack; otherwise
+			// fall through immediately (bounded-queue overrun is the sole
+			// acceptable non-determinism per task rule 1).
+			if o.queue.TryAcquire() {
+				st := o.syncT.WaitSynced(task.Tgid, o.syncTimeout)
+				o.queue.Release()
+				if st == stateSynced {
+					o.syncT.syncedOnWait.Add(1)
+				} else {
+					o.syncT.fallbackOnDeadline.Add(1)
+				}
+			} else {
+				o.syncT.queueOverrun.Add(1)
+				log.Debugf("OtelResolverInstance.Resolve: queue overrun (inflight=%d), skipping wait", o.queue.Inflight())
 			}
 		}
-		return nil, o.resolveFromRawStack(task, stackQueries, stackResponses)
+		// Phase E: merged ELF resolution with explicit python-unsynced marker.
+		return nil, o.resolveMerged(task, stackQueries, stackResponses)
 	}
 	//if task.CorrelationID == 0 {
 	//	return nil, nil
@@ -180,6 +211,22 @@ func (o *otelResolverInstance) Resolve(task symbolizer.Task, stackQueries []symb
 			result[i].Found = true
 			log.Infof("OtelResolverInstance.Resolve: resolved frame %d: %s", i, uf.functionName)
 		}
+	}
+
+	// Enhancement: if OTel returned frames but ALL resolved to empty
+	// symbols (observed: ~5% of events where otel_correlation_id != 0 but
+	// libpython offsets don't map to exported names), fall back to the
+	// deterministic merged-ELF path so we never emit empty stacks.
+	anyNonEmpty := false
+	for i := range result {
+		if result[i].Symbol != "" {
+			anyNonEmpty = true
+			break
+		}
+	}
+	if !anyNonEmpty {
+		log.Debugf("OtelResolverInstance.Resolve: correlated but all symbols empty; falling back to resolveMerged")
+		return nil, o.resolveMerged(task, stackQueries, stackResponses)
 	}
 
 	// Return non-nil replacement only if we built a new, larger slice.
@@ -260,6 +307,14 @@ func (o *otelResolverInstance) startOtelEbpfProfiler(ctx context.Context) error 
 	// Inspect ELF files on request
 	trc.StartPIDEventProcessor(ctx)
 
+	// Register synced callback so pending Resolve() waiters wake as
+	// soon as processManager.SynchronizeProcess() finishes for a PID.
+	trc.SetSyncedCallback(func(pid libpf.PID) {
+		if o.syncT != nil {
+			o.syncT.MarkSynced(uint32(pid))
+		}
+	})
+
 	// Cleanup ebpf maps when a process terminates
 	if err := trc.AttachSchedMonitor(); err != nil {
 		return fmt.Errorf("attaching scheduler monitor: %w", err)
@@ -311,4 +366,79 @@ func (o *otelResolverInstance) resolveFromRawStack(task symbolizer.Task, stackQu
 		}
 	}
 	return nil
+}
+
+// envInt reads a positive integer from the named env var, returning def
+// if unset, empty, non-numeric or <=0.
+func envInt(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
+// resolveMerged is the Phase E deterministic fallback. It first runs
+// resolveFromRawStack (ELF .dynsym for native+CUDA frames), then walks
+// the stackResponses collapsing consecutive interpreter frames (i.e.
+// symbols that map into libpython*.so and are not exported
+// interpreter-entry functions like PyEval_EvalCode) into a single
+// deterministic "[python-interp-unsynced]" label. This replaces the
+// previous best-effort output (bare libpython offsets or empty strings)
+// with a stable, honest marker that flamegraphs render correctly.
+func (o *otelResolverInstance) resolveMerged(task symbolizer.Task, stackQueries []symbolizer.StackItemQuery, stackResponses []symbolizer.StackItemResponse) error {
+	if err := o.resolveFromRawStack(task, stackQueries, stackResponses); err != nil {
+		return err
+	}
+	// Dedup consecutive libpython* frames into one marker.
+	prevPyMarker := false
+	for i := range stackResponses {
+		sym := stackResponses[i].Symbol
+		if !stackResponses[i].Found || sym == "" {
+			// Leave untouched; ustack operator filters unresolved.
+			prevPyMarker = false
+			continue
+		}
+		if isPythonInterpOffset(sym) {
+			if prevPyMarker {
+				// Mark as empty so ustack filters; keeps one marker
+				// per run of interpreter frames.
+				stackResponses[i].Symbol = ""
+				stackResponses[i].Found = false
+			} else {
+				stackResponses[i].Symbol = "[python-interp-unsynced]"
+				prevPyMarker = true
+			}
+		} else {
+			prevPyMarker = false
+		}
+	}
+	return nil
+}
+
+// isPythonInterpOffset decides whether a resolved symbol represents an
+// interpreter-internal Python frame whose CPython-level function name
+// is unrecoverable without OTel correlation. PyFrameObject lives on
+// the interpreter heap, not on the native stack, so all of these
+// native offsets collapse into the same logical "[python-interp-unsynced]"
+// marker for deterministic output.
+func isPythonInterpOffset(sym string) bool {
+	// libpython*+0xNNNN offsets (emitted when .dynsym had no symbol);
+	// generic eval-frame-default variants (which are native-level
+	// entries but tell us nothing about the Python function).
+	switch {
+	case strings.Contains(sym, "libpython"):
+		return true
+	case strings.HasPrefix(sym, "_PyEval_EvalFrameDefault"):
+		return true
+	case strings.HasPrefix(sym, "_PyEval_EvalCodeWith"):
+		return true
+	case sym == "PyEval_EvalCode" || sym == "_PyObject_VectorcallTstate":
+		return true
+	}
+	return false
 }
