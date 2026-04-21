@@ -46,6 +46,9 @@ func getProgIDFromFile(fn string) (uint32, error) {
 	defer f.Close()
 
 	sc := bufio.NewScanner(f)
+	// IG-AUDIT-2026-12: accept up to 1 MiB lines (PR_SET_VMA_ANON_NAME can
+	// produce long /proc/maps entries).
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
 		line := sc.Text()
 		after, ok := strings.CutPrefix(line, "prog_id:")
