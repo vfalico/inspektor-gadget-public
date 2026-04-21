@@ -1,6 +1,6 @@
 module github.com/inspektor-gadget/inspektor-gadget
 
-go 1.25.7
+go 1.25.9
 
 require (
 	github.com/blang/semver v3.5.1+incompatible
