@@ -15,6 +15,7 @@
 package kubemanager
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -66,6 +67,17 @@ func copyFile(destination, source string, filemode fs.FileMode) error {
 		destination = filepath.Join(destination, filepath.Base(source))
 	}
 
+	// IG-AUDIT-2026-06: refuse to clobber pre-existing non-IG hooks.
+	if info != nil && !info.IsDir() {
+		existing, rerr := os.ReadFile(destination)
+		if rerr == nil {
+			nh := sha256.Sum256(content)
+			eh := sha256.Sum256(existing)
+			if nh != eh {
+				return fmt.Errorf("refusing to overwrite pre-existing hook %s (hash mismatch)", destination)
+			}
+		}
+	}
 	err = os.WriteFile(destination, content, filemode)
 	if err != nil {
 		return fmt.Errorf("writing %s: %w", destination, err)
