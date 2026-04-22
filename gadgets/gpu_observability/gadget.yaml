@@ -1,0 +1,83 @@
+name: gpu mem max
+description: |
+  Deterministic GPU VRAM high-water-mark tracker.  Combines BPF uprobes on
+  cuMemAlloc_v2/cuMemAllocManaged/cuMemFree_v2 (per-container attribution)
+  with an NVML poller (ground truth + driver-overhead visibility) and emits
+  three datasources: per-event allocs, 10 Hz snapshots for the time-series
+  chart, and a per-container MAX_REPORT / SIGNAL_LOSS summary.
+homepageURL: https://inspektor-gadget.io/
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/gpu_mem_max
+
+params:
+  operator.nvml_mem.poll-interval-ms:
+    key: poll-interval-ms
+    defaultValue: "100"
+    description: NVML polling interval in milliseconds (10 Hz default)
+  operator.nvml_mem.signal-loss-threshold-pct:
+    key: signal-loss-threshold-pct
+    defaultValue: "5.0"
+    description: |
+      Emit SIGNAL_LOSS when |NVML_used - tracked_sum| / NVML_used > this %.
+      Default 5 accounts for A100 driver overhead (~0.4-0.7% of 80GB); lower
+      values will false-trigger on every run.
+  operator.nvml_mem.max-report-every-ms:
+    key: max-report-every-ms
+    defaultValue: "5000"
+    description: Cadence of periodic MAX_REPORT events (ms)
+
+datasources:
+  allocs:
+    annotations:
+      description: Per-event stream of cuMemAlloc_v2 / cuMemFree_v2 calls
+    fields:
+      type:               { annotations: { columns.hidden: "true" } }
+      api_id:             { annotations: { description: "CUDA driver API", columns.width: "18" } }
+      pid:                { annotations: { columns.width: "8" } }
+      size_bytes:         { annotations: { description: "Allocation size", columns.width: "14", columns.alignment: right } }
+      address:            { annotations: { columns.hidden: "true" } }
+      error:              { annotations: { description: "CUresult (0=ok)", columns.width: "6" } }
+      mntns_id:           { annotations: { columns.hidden: "true" } }
+      container:          { annotations: { description: "Container name", columns.width: "24" } }
+      pod:                { annotations: { columns.width: "24" } }
+      namespace_:         { annotations: { description: "Kubernetes namespace", columns.width: "16" } }
+
+  snapshots:
+    annotations:
+      description: 10 Hz NVML memory snapshots, driving the time-series chart
+      chart.type: "timeseries"
+      chart.x-field: "timestamp_ns"
+      chart.y-field: "nvml_total_used"
+      chart.y-unit: "bytes"
+      chart.group-by: "container"
+      chart.overlay-max-field: "max_used_seen"
+      chart.title: "GPU VRAM over time (NVML total used)"
+    fields:
+      timestamp_ns:        { annotations: { description: "Epoch ns" } }
+      gpu_device:          { annotations: { description: "NVML device index", columns.width: "4" } }
+      nvml_total_capacity: { annotations: { description: "Total VRAM",       columns.width: "12", columns.alignment: right } }
+      nvml_total_used:     { annotations: { description: "Currently used",   columns.width: "12", columns.alignment: right } }
+      nvml_total_free:     { annotations: { description: "Currently free",   columns.width: "12", columns.alignment: right } }
+      nvml_reserved:       { annotations: { description: "Driver-reserved", columns.width: "12", columns.alignment: right } }
+      tracked_sum_all:     { annotations: { description: "Σ BPF running_sum",  columns.width: "14", columns.alignment: right } }
+      max_used_seen:       { annotations: { description: "High-water mark",  columns.width: "14", columns.alignment: right } }
+      container:           { annotations: { columns.width: "24" } }
+
+  summary:
+    annotations:
+      description: Per-container MAX_REPORT + global SIGNAL_LOSS diagnostics
+      chart.type: "stats-overlay"
+    fields:
+      type:                { annotations: { description: "MAX_REPORT|SIGNAL_LOSS" } }
+      container:           { annotations: { columns.width: "24" } }
+      pod:                 { annotations: { columns.width: "24" } }
+      namespace_:          { annotations: { columns.width: "16" } }
+      container_max_bytes: { annotations: { description: "Peak bytes seen for container",    columns.width: "14", columns.alignment: right } }
+      container_alloc_count: { annotations: { description: "cuMemAlloc_v2 calls",            columns.width: "10" } }
+      container_free_count:  { annotations: { description: "cuMemFree_v2 calls",             columns.width: "10" } }
+      nvml_total_used:     { annotations: { description: "NVML used at snapshot",            columns.width: "14", columns.alignment: right } }
+      max_used_seen:       { annotations: { description: "NVML high-water",                  columns.width: "14", columns.alignment: right } }
+      tracked_sum_all:     { annotations: { description: "Σ BPF running_sum",                 columns.width: "14", columns.alignment: right } }
+      loss_bytes:          { annotations: { description: "|NVML_used - tracked|",             columns.width: "14", columns.alignment: right } }
+      loss_pct_x100:       { annotations: { description: "Signal-loss % × 100",               columns.width: "10" } }
+      confidence:          { annotations: { description: "2=HIGH, 1=MEDIUM, 0=LOW", columns.width: "8" } }
+      loss_reason:         { annotations: { description: "Diagnostic message",                columns.width: "50" } }
