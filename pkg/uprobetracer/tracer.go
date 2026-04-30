@@ -187,11 +187,40 @@ func (t *Tracer[Event]) attachUprobe(file *os.File) (link.Link, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening %q: %w", attachPath, err)
 	}
+	// Fallback for stripped binaries (e.g. /usr/sbin/sshd): if the symbol is
+	// missing from .symtab/.dynsym, try resolving it from the matching
+	// /usr/lib/debug/.build-id/<id>.debug file shipped by *-dbgsym packages.
+	debugAddr := func() *link.UprobeOptions {
+		addrs, derr := loadDebugSymbols(t.attachFilePath)
+		if derr != nil {
+			t.logger.Debugf("debuglink resolve %q: %v", t.attachFilePath, derr)
+			return nil
+		}
+		off, ok := addrs[t.attachSymbol]
+		if !ok {
+			return nil
+		}
+		t.logger.Debugf("debuglink resolved %s@%s -> 0x%x",
+			t.attachSymbol, t.attachFilePath, off)
+		return &link.UprobeOptions{Address: off}
+	}
 	switch t.progType {
 	case ProgUprobe:
-		return ex.Uprobe(t.attachSymbol, t.prog, nil)
+		l, e := ex.Uprobe(t.attachSymbol, t.prog, nil)
+		if e != nil && filepath.IsAbs(t.attachFilePath) {
+			if opt := debugAddr(); opt != nil {
+				return ex.Uprobe(t.attachSymbol, t.prog, opt)
+			}
+		}
+		return l, e
 	case ProgUretprobe:
-		return ex.Uretprobe(t.attachSymbol, t.prog, nil)
+		l, e := ex.Uretprobe(t.attachSymbol, t.prog, nil)
+		if e != nil && filepath.IsAbs(t.attachFilePath) {
+			if opt := debugAddr(); opt != nil {
+				return ex.Uretprobe(t.attachSymbol, t.prog, opt)
+			}
+		}
+		return l, e
 	case ProgUSDT:
 		attachInfo, err := getUsdtInfo(attachPath, t.attachSymbol)
 		if err != nil {
