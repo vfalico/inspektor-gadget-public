@@ -48,6 +48,20 @@ GADGET_TRACER(packets, packets, packet_event_t);
 const volatile __u16 snaplen = MAX_PKT_LEN;
 GADGET_PARAM(snaplen);
 
+/*
+ * --decrypt-ssl: when true, the SSL/TLS/SSH uprobes defined in
+ * uprobes.bpf.h are attached and emit synthetic plaintext frames into
+ * the SAME `packets` perf event array used by the tc classifier path.
+ * The pcap-ng exporter therefore writes them into the SAME pcap stream
+ * — no second datasource, no userspace mergecap, no sidecar.
+ *
+ * When false (default) the verifier dead-code-eliminates every uprobe
+ * emit path, so the gadget output is byte-identical to upstream
+ * tcpdump (zero regression).
+ */
+const volatile bool decrypt_ssl = false;
+GADGET_PARAM(decrypt_ssl);
+
 GADGET_PF();
 
 static __always_inline int handle(struct __sk_buff *skb, __u8 packet_type)
@@ -101,5 +115,13 @@ int egress_main(struct __sk_buff *skb)
 	bpf_skb_pull_data(skb, 0);
 	return handle(skb, PACKET_TYPE_EGRESS);
 }
+
+/*
+ * Userspace SSL/TLS/SSH uprobes — included AFTER the `packets` map and
+ * `packet_event_t` are defined so the synth-emit code can reuse them
+ * verbatim. Compile-time gated by `decrypt_ssl`; verifier dead-code-
+ * eliminates everything when the flag is false.
+ */
+#include "uprobes.bpf.h"
 
 char _license[] SEC("license") = "GPL";

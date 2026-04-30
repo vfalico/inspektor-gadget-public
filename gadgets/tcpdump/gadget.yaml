@@ -8,6 +8,13 @@ params:
     snaplen:
       key: snaplen
       description: 'Maximum number of bytes to capture from a packet.'
+    decrypt_ssl:
+      key: decrypt-ssl
+      defaultValue: "false"
+      description: 'Inject SSL/TLS and SSH plaintext as synthetic Ethernet/IPv4/TCP
+        frames into the same pcap stream. Marked with eth.src=02:49:47:00:00:01 and
+        TCP option 0xFD "IGDC". When false (default) the verifier dead-code-eliminates
+        every uprobe emit path, so output is byte-identical to upstream tcpdump.'
 datasources:
   packets:
     annotations:
