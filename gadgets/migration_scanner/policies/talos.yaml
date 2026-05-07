@@ -1,0 +1,119 @@
+apiVersion: migration-scanner/v1
+kind: ImmutableOSPolicy
+metadata:
+  name: talos
+  version: "1.9"
+  description: |
+    Talos Linux: squashfs root, A/B partitions, /var only persistent writable
+    area, no shell, no SSH, no syslogd. Containerd-only. Kubernetes-native
+    declarative configuration via talosctl.
+  references:
+    - https://www.talos.dev/v1.9/learn-more/architecture/
+    - https://www.talos.dev/v1.9/reference/kernel/
+
+spec:
+  filesystem:
+    read_only_paths:
+      - /
+      - /usr
+      - /bin
+      - /sbin
+      - /lib
+      - /lib64
+      - /opt
+      - /boot
+      - /etc
+    writable_paths:
+      - /var
+      - /run
+      - /tmp
+      - /system
+    immutable_files: []
+    deny_mmap_write: true
+    follow_symlinks: true
+
+  container_runtime:
+    supported: ["containerd"]
+    unsupported: ["docker", "podman", "cri-o"]
+    socket_paths:
+      blocked:
+        - /var/run/docker.sock
+        - /run/docker.sock
+        - /var/run/crio/crio.sock
+      allowed:
+        - /run/containerd/containerd.sock
+        - /system/run/containerd/containerd.sock
+
+  kernel_modules:
+    available:
+      - overlay
+      - br_netfilter
+      - bridge
+      - veth
+      - vxlan
+      - ip_tables
+      - ip6_tables
+      - iptable_nat
+      - nf_conntrack
+      - nf_nat
+      - nf_tables
+      - ipvs
+      - tun
+      - dm_mod
+      - dm_verity
+      - ext4
+      - xfs
+    unavailable:
+      - aufs
+      - zfs
+      - dummy
+      - wireguard
+      - falco
+
+  logging:
+    supported: ["stdout", "talos-kmsg"]
+    unsupported: ["journald", "syslogd", "rsyslog", "syslog-ng"]
+    blocked_paths:
+      - /dev/log
+      - /var/log/syslog
+      - /var/log/messages
+
+  selinux:
+    mode: disabled
+
+  capabilities:
+    blocked:
+      - CAP_SYS_MODULE
+      - CAP_SYS_RAWIO
+      - CAP_MAC_ADMIN
+      - CAP_SYS_BOOT
+      - CAP_SYS_PTRACE
+    allowed:
+      - CAP_NET_BIND_SERVICE
+      - CAP_CHOWN
+      - CAP_SETUID
+      - CAP_SETGID
+      - CAP_NET_RAW
+      - CAP_DAC_OVERRIDE
+      - CAP_SYS_ADMIN
+
+  binaries:
+    available:
+      - /usr/bin/kubelet
+      - /usr/local/bin/kubelet
+      - /sbin/init
+    unavailable:
+      - /bin/sh
+      - /usr/bin/bash
+      - /usr/bin/sh
+      - /usr/bin/docker
+      - /usr/bin/apt
+      - /usr/bin/yum
+      - /usr/bin/dnf
+      - /usr/bin/curl
+      - /usr/bin/wget
+      - /usr/bin/strace
+      - /usr/bin/python3
+
+  exec_policy:
+    enforce_via_lsm: false

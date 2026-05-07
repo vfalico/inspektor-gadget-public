@@ -1,0 +1,71 @@
+name: migration_scanner
+description: |
+  Predicts compatibility of a Linux host with an immutable container OS
+  (Talos, Flatcar, Bottlerocket). Observes filesystem writes, mmap/link/symlink
+  operations, AF_UNIX socket connects, kernel module loads, host-level execs,
+  and capability checks. Host-only filtering is enforced in eBPF via
+  pid-namespace inode comparison. Classification against a per-OS YAML policy
+  file happens entirely in userspace.
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/migration_scanner
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/migration_scanner
+
+datasources:
+  migration_scanner:
+    fields:
+      timestamp:
+        annotations:
+          columns.width: 20
+      pid:
+        annotations:
+          columns.width: 7
+          description: Process ID
+      comm:
+        annotations:
+          columns.width: 16
+          description: Process name
+      category:
+        annotations:
+          columns.width: 10
+          description: "Event category (1=fs_write, 2=socket, 3=kmod, 4=exec, 5=capability, 6=selinux, 7=fs_mmap, 8=fs_link, 9=fs_symlink)"
+      scope:
+        annotations:
+          columns.width: 8
+          description: "Event scope (0=host, 1=container_hostpath, 2=container_internal)"
+      syscall_nr:
+        annotations:
+          columns.width: 8
+          description: Syscall number
+      flags:
+        annotations:
+          columns.width: 8
+          description: Syscall flags
+      cap:
+        annotations:
+          columns.width: 6
+          description: Linux capability number
+          columns.hidden: true
+      path:
+        annotations:
+          columns.width: 60
+          description: File path or socket path
+      arg:
+        annotations:
+          columns.width: 32
+          description: Additional argument (rename target, module params, etc.)
+
+params:
+  ebpf:
+    host_pidns_ino_const:
+      key: host-pidns-ino
+      description: >
+        Host pid-namespace inode number (read from /proc/1/ns/pid).
+        Stamped into the BPF program at load time so the
+        host-vs-container filter runs at zero cost in the kernel.
+      defaultValue: "0"
+    predict_selinux:
+      key: predict-selinux
+      description: >
+        Enable SELinux-enforcing predictions when current host is
+        permissive (requires BPF-LSM).
+      defaultValue: "0"

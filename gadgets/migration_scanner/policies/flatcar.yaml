@@ -1,0 +1,139 @@
+apiVersion: migration-scanner/v1
+kind: ImmutableOSPolicy
+metadata:
+  name: flatcar
+  version: "4081"
+  description: |
+    Flatcar Container Linux: dm-verity protected /usr only. /etc, /var and
+    /opt are writable. Both docker and containerd are present (Flatcar is
+    the most permissive of the four shipped policies). Modules outside the
+    base set can be added via /opt/modules sysext.
+  references:
+    - https://www.flatcar.org/docs/latest/setup/customization/
+    - https://www.flatcar.org/docs/latest/installing/architecture/
+
+spec:
+  filesystem:
+    read_only_paths:
+      - /usr
+      - /boot
+    writable_paths:
+      - /etc
+      - /var
+      - /tmp
+      - /run
+      - /opt
+      - /home
+      - /root
+    immutable_files: []
+    deny_mmap_write: true
+    follow_symlinks: true
+
+  container_runtime:
+    supported: ["docker", "containerd"]
+    unsupported: []
+    socket_paths:
+      blocked: []
+      allowed:
+        - /var/run/docker.sock
+        - /run/docker.sock
+        - /run/containerd/containerd.sock
+
+  kernel_modules:
+    available:
+      - overlay
+      - br_netfilter
+      - bridge
+      - veth
+      - vxlan
+      - ip_tables
+      - ip6_tables
+      - iptable_nat
+      - iptable_mangle
+      - nf_conntrack
+      - nf_nat
+      - nf_tables
+      - ipvs
+      - dummy
+      - tun
+      - macvlan
+      - 8021q
+      - dm_mod
+      - dm_verity
+      - dm_crypt
+      - ext4
+      - xfs
+      - btrfs
+      - nfs
+      - cifs
+      - loop
+      - nbd
+      - wireguard
+      - openvswitch
+    unavailable:
+      - aufs
+      - zfs
+      - falco
+      - sysdig
+
+  logging:
+    supported: ["journald", "stdout"]
+    unsupported: ["rsyslog", "syslog-ng"]
+    blocked_paths:
+      - /var/log/syslog
+      - /var/log/messages
+
+  selinux:
+    mode: permissive
+
+  capabilities:
+    blocked: []
+    allowed:
+      - CAP_NET_BIND_SERVICE
+      - CAP_CHOWN
+      - CAP_SETUID
+      - CAP_SETGID
+      - CAP_NET_RAW
+      - CAP_DAC_OVERRIDE
+      - CAP_SYS_ADMIN
+      - CAP_SYS_MODULE
+
+  binaries:
+    available:
+      - /usr/bin/bash
+      - /usr/bin/sh
+      - /usr/bin/cat
+      - /usr/bin/cp
+      - /usr/bin/mv
+      - /usr/bin/rm
+      - /usr/bin/ls
+      - /usr/bin/grep
+      - /usr/bin/sed
+      - /usr/bin/awk
+      - /usr/bin/tar
+      - /usr/bin/gzip
+      - /usr/bin/mount
+      - /usr/bin/umount
+      - /usr/bin/ip
+      - /usr/bin/ss
+      - /usr/bin/journalctl
+      - /usr/bin/systemctl
+      - /usr/bin/curl
+      - /usr/bin/wget
+      - /usr/bin/openssl
+      - /usr/bin/ssh
+      - /usr/bin/docker
+      - /usr/bin/containerd
+      - /usr/bin/runc
+      - /usr/bin/crictl
+      - /usr/bin/kubelet
+    unavailable:
+      - /usr/bin/apt
+      - /usr/bin/apt-get
+      - /usr/bin/dpkg
+      - /usr/bin/yum
+      - /usr/bin/dnf
+      - /usr/bin/rpm
+
+  exec_policy:
+    enforce_via_lsm: false

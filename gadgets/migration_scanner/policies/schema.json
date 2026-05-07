@@ -1,0 +1,91 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ImmutableOSPolicy",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "migration-scanner/v1" },
+    "kind":       { "const": "ImmutableOSPolicy" },
+    "metadata": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name":        { "type": "string" },
+        "version":     { "type": "string" },
+        "description": { "type": "string" },
+        "references":  { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "properties": {
+        "filesystem": {
+          "type": "object",
+          "properties": {
+            "read_only_paths": { "type": "array", "items": { "type": "string" } },
+            "writable_paths":  { "type": "array", "items": { "type": "string" } },
+            "immutable_files": { "type": "array", "items": { "type": "string" } },
+            "deny_mmap_write": { "type": "boolean" },
+            "follow_symlinks": { "type": "boolean" }
+          }
+        },
+        "container_runtime": {
+          "type": "object",
+          "properties": {
+            "supported":   { "type": "array", "items": { "type": "string" } },
+            "unsupported": { "type": "array", "items": { "type": "string" } },
+            "socket_paths": {
+              "type": "object",
+              "properties": {
+                "blocked": { "type": "array", "items": { "type": "string" } },
+                "allowed": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          }
+        },
+        "kernel_modules": {
+          "type": "object",
+          "properties": {
+            "available":   { "type": "array", "items": { "type": "string" } },
+            "unavailable": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "logging": {
+          "type": "object",
+          "properties": {
+            "supported":     { "type": "array", "items": { "type": "string" } },
+            "unsupported":   { "type": "array", "items": { "type": "string" } },
+            "blocked_paths": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "selinux": {
+          "type": "object",
+          "properties": {
+            "mode":   { "enum": ["enforcing", "permissive", "disabled"] },
+            "policy": { "type": "string" }
+          }
+        },
+        "capabilities": {
+          "type": "object",
+          "properties": {
+            "blocked": { "type": "array", "items": { "type": "string" } },
+            "allowed": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "binaries": {
+          "type": "object",
+          "properties": {
+            "available":   { "type": "array", "items": { "type": "string" } },
+            "unavailable": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "exec_policy": {
+          "type": "object",
+          "properties": {
+            "enforce_via_lsm": { "type": "boolean" }
+          }
+        }
+      }
+    }
+  }
+}

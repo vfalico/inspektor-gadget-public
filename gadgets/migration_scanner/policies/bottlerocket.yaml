@@ -1,0 +1,120 @@
+apiVersion: migration-scanner/v1
+kind: ImmutableOSPolicy
+metadata:
+  name: bottlerocket
+  version: "1.20"
+  description: |
+    AWS Bottlerocket: dm-verity protected root, API-only host control via
+    apiclient, ephemeral /etc rebuilt at boot, SELinux enforcing with
+    fortified policy. Containerd + host-ctr only.
+  references:
+    - https://bottlerocket.dev/en/os/1.20.x/
+    - https://github.com/bottlerocket-os/bottlerocket
+
+spec:
+  filesystem:
+    read_only_paths:
+      - /usr
+      - /boot
+      - /bin
+      - /sbin
+      - /lib
+      - /lib64
+      - /opt
+    writable_paths:
+      - /var
+      - /run
+      - /tmp
+      - /etc
+    immutable_files:
+      - /etc/os-release
+      - /etc/hostname
+    deny_mmap_write: true
+    follow_symlinks: true
+
+  container_runtime:
+    supported: ["containerd", "host-ctr"]
+    unsupported: ["docker", "podman", "cri-o"]
+    socket_paths:
+      blocked:
+        - /var/run/docker.sock
+        - /run/docker.sock
+      allowed:
+        - /run/containerd/containerd.sock
+        - /run/host-containerd/containerd.sock
+        - /run/api.sock
+
+  kernel_modules:
+    available:
+      - overlay
+      - br_netfilter
+      - bridge
+      - veth
+      - ip_tables
+      - ip6_tables
+      - nf_conntrack
+      - nf_nat
+      - nf_tables
+      - tun
+      - dm_mod
+      - dm_verity
+      - ext4
+      - xfs
+    unavailable:
+      - aufs
+      - zfs
+      - dummy
+      - wireguard
+      - openvswitch
+      - falco
+
+  logging:
+    supported: ["journald", "stdout"]
+    unsupported: ["syslogd", "rsyslog", "syslog-ng"]
+    blocked_paths:
+      - /dev/log
+      - /var/log/syslog
+      - /var/log/messages
+
+  selinux:
+    mode: enforcing
+    policy: fortified
+
+  capabilities:
+    blocked:
+      - CAP_SYS_MODULE
+      - CAP_SYS_RAWIO
+      - CAP_MAC_ADMIN
+      - CAP_SYS_BOOT
+    allowed:
+      - CAP_NET_BIND_SERVICE
+      - CAP_CHOWN
+      - CAP_SETUID
+      - CAP_SETGID
+      - CAP_NET_RAW
+      - CAP_DAC_OVERRIDE
+      - CAP_SYS_ADMIN
+
+  binaries:
+    available:
+      - /usr/bin/apiclient
+      - /usr/sbin/containerd
+      - /usr/sbin/runc
+      - /usr/bin/kubelet
+      - /usr/bin/host-ctr
+    unavailable:
+      - /usr/bin/sh
+      - /usr/bin/bash
+      - /bin/sh
+      - /usr/bin/apt
+      - /usr/bin/yum
+      - /usr/bin/dnf
+      - /usr/bin/rpm
+      - /usr/bin/docker
+      - /usr/bin/curl
+      - /usr/bin/wget
+      - /usr/bin/python3
+      - /usr/bin/strace
+
+  exec_policy:
+    enforce_via_lsm: true

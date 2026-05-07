@@ -33,6 +33,7 @@ GADGETS ?= \
 	deadlock \
 	fdpass \
 	fsnotify \
+	migration_scanner \
 	profile_blockio \
 	profile_cpu \
 	profile_cuda \

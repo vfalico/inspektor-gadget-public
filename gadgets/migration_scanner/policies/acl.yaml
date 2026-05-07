@@ -1,0 +1,115 @@
+apiVersion: migration-scanner/v1
+kind: ImmutableOSPolicy
+metadata:
+  name: azure-container-linux
+  version: "3.0"
+  description: |
+    Read-only /usr (dm-verity), containerd-only runtime, SELinux enforcing,
+    IPE for binary integrity. /etc and /var are tmpfs/persistent split.
+  references:
+    - https://github.com/microsoft/azurelinux
+    - https://learn.microsoft.com/en-us/azure/aks/use-azure-linux
+
+spec:
+  filesystem:
+    read_only_paths:
+      - /usr
+      - /boot
+      - /bin
+      - /sbin
+      - /lib
+      - /lib64
+      - /opt
+    writable_paths:
+      - /etc
+      - /var
+      - /tmp
+      - /run
+      - /home
+      - /root
+    immutable_files:
+      - /etc/os-release
+    deny_mmap_write: true
+    follow_symlinks: true
+
+  container_runtime:
+    supported: ["containerd"]
+    unsupported: ["docker", "podman"]
+    socket_paths:
+      blocked:
+        - /var/run/docker.sock
+        - /run/docker.sock
+      allowed:
+        - /run/containerd/containerd.sock
+
+  kernel_modules:
+    available:
+      - overlay
+      - br_netfilter
+      - bridge
+      - veth
+      - vxlan
+      - ip_tables
+      - ip6_tables
+      - iptable_nat
+      - iptable_mangle
+      - nf_conntrack
+      - nf_nat
+      - nf_tables
+      - ipvs
+      - ipip
+      - tun
+      - dummy
+      - dm_mod
+      - dm_verity
+      - dm_crypt
+      - ext4
+      - xfs
+      - btrfs
+    unavailable:
+      - aufs
+      - zfs
+      - falco
+      - sysdig
+
+  logging:
+    supported: ["journald", "stdout"]
+    unsupported: ["syslogd", "rsyslog", "syslog-ng"]
+    blocked_paths:
+      - /dev/log
+      - /var/log/syslog
+      - /var/log/messages
+
+  selinux:
+    mode: enforcing
+    policy: targeted
+
+  capabilities:
+    blocked:
+      - CAP_SYS_MODULE
+      - CAP_SYS_RAWIO
+      - CAP_SYS_BOOT
+    allowed:
+      - CAP_NET_BIND_SERVICE
+      - CAP_CHOWN
+      - CAP_SETUID
+      - CAP_SETGID
+      - CAP_NET_RAW
+      - CAP_DAC_OVERRIDE
+      - CAP_SYS_ADMIN
+
+  binaries:
+    available:
+      - /usr/bin/containerd
+      - /usr/bin/runc
+      - /usr/bin/kubelet
+      - /usr/bin/crictl
+      - /usr/bin/ctr
+    unavailable:
+      - /usr/bin/docker
+      - /usr/bin/apt
+      - /usr/bin/yum
+      - /usr/bin/dnf
+
+  exec_policy:
+    enforce_via_lsm: false
