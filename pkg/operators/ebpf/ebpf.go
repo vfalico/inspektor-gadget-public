@@ -66,6 +66,7 @@ const (
 	typeSplitter = "___"
 
 	ParamIface       = "iface"
+	ParamSymbols     = "symbols"
 	ParamTraceKernel = "trace-pipe"
 
 	kernelTypesVar = "kernelTypes"
@@ -382,6 +383,9 @@ func (i *ebpfInstance) init(gadgetCtx operators.GadgetContext) error {
 				if err != nil {
 					return fmt.Errorf("creating uprobe tracer: %w", err)
 				}
+				if v := i.paramValues[ParamSymbols]; v != "" {
+					uprobeTracer.SetSymbolsPath(v)
+				}
 				i.uprobeTracers[p.Name] = uprobeTracer
 			}
 		case ebpf.SocketFilter:
@@ -472,6 +476,16 @@ func (i *ebpfInstance) init(gadgetCtx operators.GadgetContext) error {
 			DefaultValue: "false",
 			TypeHint:     api.TypeBool,
 			Tags:         []string{api.TagAdvanced, "group:eBPF"},
+		},
+	}
+
+	i.params[ParamSymbols] = &param{
+		Param: &api.Param{
+			Key:         ParamSymbols,
+			Title:       "Symbols file",
+			Description: "Path to an unstripped binary or .dbg file matching the uprobe target by GNU build-id; required for stripped targets, ignored otherwise.",
+			TypeHint:    api.TypeString,
+			Tags:        []string{api.TagAdvanced, "group:eBPF"},
 		},
 	}
 
