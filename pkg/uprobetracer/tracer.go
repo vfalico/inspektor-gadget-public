@@ -105,8 +105,20 @@ type Tracer[Event any] struct {
 
 	logger logger.Logger
 
+	// symbolsPath: optional host path to an unstripped binary or .dbg
+	// companion for resolving symbols on stripped targets; see ResolveSymbol.
+	symbolsPath string
+
 	closed bool
 	mu     sync.Mutex
+}
+
+// SetSymbolsPath sets the optional symbols-file path; must be called
+// before AttachProg.
+func (t *Tracer[Event]) SetSymbolsPath(path string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.symbolsPath = path
 }
 
 func NewTracer[Event any](logger logger.Logger) (*Tracer[Event], error) {
@@ -187,11 +199,19 @@ func (t *Tracer[Event]) attachUprobe(file *os.File) (link.Link, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening %q: %w", attachPath, err)
 	}
+	var uOpts *link.UprobeOptions
+	if t.symbolsPath != "" && (t.progType == ProgUprobe || t.progType == ProgUretprobe) {
+		off, err := ResolveSymbol(attachPath, t.symbolsPath, t.attachSymbol)
+		if err != nil {
+			return nil, fmt.Errorf("resolving %q via %q: %w", t.attachSymbol, t.symbolsPath, err)
+		}
+		uOpts = &link.UprobeOptions{Address: off}
+	}
 	switch t.progType {
 	case ProgUprobe:
-		return ex.Uprobe(t.attachSymbol, t.prog, nil)
+		return ex.Uprobe(t.attachSymbol, t.prog, uOpts)
 	case ProgUretprobe:
-		return ex.Uretprobe(t.attachSymbol, t.prog, nil)
+		return ex.Uretprobe(t.attachSymbol, t.prog, uOpts)
 	case ProgUSDT:
 		attachInfo, err := getUsdtInfo(attachPath, t.attachSymbol)
 		if err != nil {
