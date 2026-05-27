@@ -5,7 +5,7 @@ category: monitoring-logging
 displayName: "trace malloc"
 createdAt: "2026-03-12T10:37:26Z"
 digest: "2026-03-12T10:37:26Z"
-description: "use uprobe to trace malloc and free in libc.so"
+description: "use uprobe to trace malloc/free in libc and operator new/delete in libstdc++"
 logoURL: "https://inspektor-gadget.io/media/brand-icon.svg"
 license: ""
 homeURL: "https://inspektor-gadget.io/"
