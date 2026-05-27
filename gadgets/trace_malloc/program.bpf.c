@@ -344,4 +344,85 @@ int trace_uretprobe_reallocarray(struct pt_regs *ctx)
 	return gen_alloc_exit(ctx, reallocarray, PT_REGS_RC(ctx));
 }
 
+
+/* C++17 aligned operator new (_ZnwmSt11align_val_t) */
+SEC("uprobe/libstdc++:_ZnwmSt11align_val_t")
+int BPF_UPROBE(trace_uprobe_new_aligned, size_t size)
+{
+	return gen_alloc_enter(size);
+}
+
+SEC("uretprobe/libstdc++:_ZnwmSt11align_val_t")
+int trace_uretprobe_new_aligned(struct pt_regs *ctx)
+{
+	return gen_alloc_exit(ctx, op_new, PT_REGS_RC(ctx));
+}
+
+/* C++17 aligned operator new[] (_ZnamSt11align_val_t) */
+SEC("uprobe/libstdc++:_ZnamSt11align_val_t")
+int BPF_UPROBE(trace_uprobe_new_array_aligned, size_t size)
+{
+	return gen_alloc_enter(size);
+}
+
+SEC("uretprobe/libstdc++:_ZnamSt11align_val_t")
+int trace_uretprobe_new_array_aligned(struct pt_regs *ctx)
+{
+	return gen_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx));
+}
+
+/* nothrow operator new (_ZnwmRKSt9nothrow_t) */
+SEC("uprobe/libstdc++:_ZnwmRKSt9nothrow_t")
+int BPF_UPROBE(trace_uprobe_new_nothrow, size_t size)
+{
+	return gen_alloc_enter(size);
+}
+
+SEC("uretprobe/libstdc++:_ZnwmRKSt9nothrow_t")
+int trace_uretprobe_new_nothrow(struct pt_regs *ctx)
+{
+	return gen_alloc_exit(ctx, op_new, PT_REGS_RC(ctx));
+}
+
+/* nothrow operator new[] (_ZnamRKSt9nothrow_t) */
+SEC("uprobe/libstdc++:_ZnamRKSt9nothrow_t")
+int BPF_UPROBE(trace_uprobe_new_array_nothrow, size_t size)
+{
+	return gen_alloc_enter(size);
+}
+
+SEC("uretprobe/libstdc++:_ZnamRKSt9nothrow_t")
+int trace_uretprobe_new_array_nothrow(struct pt_regs *ctx)
+{
+	return gen_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx));
+}
+
+/* sized operator delete (_ZdlPvm) */
+SEC("uprobe/libstdc++:_ZdlPvm")
+int BPF_UPROBE(trace_uprobe_delete_sized, void *address, size_t size)
+{
+	return gen_free_enter(ctx, op_delete, (u64)address);
+}
+
+/* sized operator delete[] (_ZdaPvm) */
+SEC("uprobe/libstdc++:_ZdaPvm")
+int BPF_UPROBE(trace_uprobe_delete_array_sized, void *address, size_t size)
+{
+	return gen_free_enter(ctx, op_delete_array, (u64)address);
+}
+
+/* aligned operator delete (_ZdlPvSt11align_val_t) */
+SEC("uprobe/libstdc++:_ZdlPvSt11align_val_t")
+int BPF_UPROBE(trace_uprobe_delete_aligned, void *address)
+{
+	return gen_free_enter(ctx, op_delete, (u64)address);
+}
+
+/* aligned operator delete[] (_ZdaPvSt11align_val_t) */
+SEC("uprobe/libstdc++:_ZdaPvSt11align_val_t")
+int BPF_UPROBE(trace_uprobe_delete_array_aligned, void *address)
+{
+	return gen_free_enter(ctx, op_delete_array, (u64)address);
+}
+
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
