@@ -587,4 +587,44 @@ int trace_cxx_uretprobe__ZnwmRKSt9nothrow_t(struct pt_regs *ctx) { return gen_cx
 SEC("uretprobe/libc++:_ZnwmSt11align_val_t")
 int trace_cxx_uretprobe__ZnwmSt11align_val_t(struct pt_regs *ctx) { return gen_cxx_alloc_exit(ctx, op_new, PT_REGS_RC(ctx)); }
 
+
+
+/* libc++abi.so.1 attachments - Clang/LLVM operator implementations live here */
+SEC("uprobe/libc++abi:_ZdaPv")
+int BPF_UPROBE(trace_abi_uprobe__ZdaPv, void *address) { return gen_free_enter(ctx, op_delete, (u64)address); }
+SEC("uprobe/libc++abi:_ZdaPvSt11align_val_t")
+int BPF_UPROBE(trace_abi_uprobe__ZdaPvSt11align_val_t, void *address) { return gen_free_enter(ctx, op_delete, (u64)address); }
+SEC("uprobe/libc++abi:_ZdaPvm")
+int BPF_UPROBE(trace_abi_uprobe__ZdaPvm, void *address) { return gen_free_enter(ctx, op_delete, (u64)address); }
+SEC("uprobe/libc++abi:_ZdlPv")
+int BPF_UPROBE(trace_abi_uprobe__ZdlPv, void *address) { return gen_free_enter(ctx, op_delete, (u64)address); }
+SEC("uprobe/libc++abi:_ZdlPvSt11align_val_t")
+int BPF_UPROBE(trace_abi_uprobe__ZdlPvSt11align_val_t, void *address) { return gen_free_enter(ctx, op_delete, (u64)address); }
+SEC("uprobe/libc++abi:_ZdlPvm")
+int BPF_UPROBE(trace_abi_uprobe__ZdlPvm, void *address) { return gen_free_enter(ctx, op_delete, (u64)address); }
+SEC("uprobe/libc++abi:_Znam")
+int BPF_UPROBE(trace_abi_uprobe__Znam, size_t size) { return gen_cxx_array_alloc_enter(size); }
+SEC("uprobe/libc++abi:_ZnamRKSt9nothrow_t")
+int BPF_UPROBE(trace_abi_uprobe__ZnamRKSt9nothrow_t, size_t size) { return gen_cxx_array_alloc_enter(size); }
+SEC("uprobe/libc++abi:_ZnamSt11align_val_t")
+int BPF_UPROBE(trace_abi_uprobe__ZnamSt11align_val_t, size_t size) { return gen_cxx_array_alloc_enter(size); }
+SEC("uprobe/libc++abi:_Znwm")
+int BPF_UPROBE(trace_abi_uprobe__Znwm, size_t size) { return gen_cxx_alloc_enter(size); }
+SEC("uprobe/libc++abi:_ZnwmRKSt9nothrow_t")
+int BPF_UPROBE(trace_abi_uprobe__ZnwmRKSt9nothrow_t, size_t size) { return gen_cxx_alloc_enter(size); }
+SEC("uprobe/libc++abi:_ZnwmSt11align_val_t")
+int BPF_UPROBE(trace_abi_uprobe__ZnwmSt11align_val_t, size_t size) { return gen_cxx_alloc_enter(size); }
+SEC("uretprobe/libc++abi:_Znam")
+int trace_abi_uretprobe__Znam(struct pt_regs *ctx) { return gen_cxx_array_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx)); }
+SEC("uretprobe/libc++abi:_ZnamRKSt9nothrow_t")
+int trace_abi_uretprobe__ZnamRKSt9nothrow_t(struct pt_regs *ctx) { return gen_cxx_array_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx)); }
+SEC("uretprobe/libc++abi:_ZnamSt11align_val_t")
+int trace_abi_uretprobe__ZnamSt11align_val_t(struct pt_regs *ctx) { return gen_cxx_array_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx)); }
+SEC("uretprobe/libc++abi:_Znwm")
+int trace_abi_uretprobe__Znwm(struct pt_regs *ctx) { return gen_cxx_alloc_exit(ctx, op_new, PT_REGS_RC(ctx)); }
+SEC("uretprobe/libc++abi:_ZnwmRKSt9nothrow_t")
+int trace_abi_uretprobe__ZnwmRKSt9nothrow_t(struct pt_regs *ctx) { return gen_cxx_alloc_exit(ctx, op_new, PT_REGS_RC(ctx)); }
+SEC("uretprobe/libc++abi:_ZnwmSt11align_val_t")
+int trace_abi_uretprobe__ZnwmSt11align_val_t(struct pt_regs *ctx) { return gen_cxx_alloc_exit(ctx, op_new, PT_REGS_RC(ctx)); }
+
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
