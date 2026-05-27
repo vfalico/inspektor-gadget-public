@@ -58,6 +58,29 @@ struct {
 	__type(key, u32); // tid
 	__type(value, u64);
 } sizes SEC(".maps");
+/* Per-thread size stash for C++ operator new probes; kept separate from the
+ * libc `sizes` map so that an inner libc malloc call (which libstdc++'s
+ * _Znwm implementation makes) cannot overwrite the outer C++ value before
+ * the operator's uretprobe consumes it. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_ENTRIES);
+	__type(key, u32); // tid
+	__type(value, u64);
+} cxx_sizes SEC(".maps");
+
+/* Separate per-thread size stash for C++ array-new (_Znam family). libstdc++
+ * implements _Znam by internally calling _Znwm, so a single cxx_sizes map
+ * would be overwritten by the inner _Znwm uprobe before the outer _Znam
+ * uretprobe could read it (root cause of op_new_array=0 events). Keep a
+ * dedicated map for the array path. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_ENTRIES);
+	__type(key, u32); // tid
+	__type(value, u64);
+} cxx_array_sizes SEC(".maps");
+
 
 /* used by posix_memalign */
 struct {
@@ -79,6 +102,8 @@ int trace_sched_process_exit(void *ctx)
 
 	tid = (u32)bpf_get_current_pid_tgid();
 	bpf_map_delete_elem(&sizes, &tid);
+	bpf_map_delete_elem(&cxx_sizes, &tid);
+	bpf_map_delete_elem(&cxx_array_sizes, &tid);
 	bpf_map_delete_elem(&memptrs, &tid);
 	return 0;
 }
@@ -157,6 +182,87 @@ static __always_inline int gen_free_enter(struct pt_regs *ctx,
 
 	gadget_submit_buf(ctx, &events, event, sizeof(*event));
 
+	return 0;
+}
+
+
+static __always_inline int gen_cxx_alloc_enter(size_t size)
+{
+	u32 tid = (u32)bpf_get_current_pid_tgid();
+	bpf_map_update_elem(&cxx_sizes, &tid, &size, BPF_ANY);
+	return 0;
+}
+
+static __always_inline int gen_cxx_alloc_exit(struct pt_regs *ctx,
+					      enum memop operation, u64 addr)
+{
+	struct event *event;
+	u32 tid;
+	u64 *size_ptr;
+	u64 size;
+
+	if (gadget_should_discard_data_current())
+		return 0;
+
+	tid = (u32)bpf_get_current_pid_tgid();
+	size_ptr = bpf_map_lookup_elem(&cxx_sizes, &tid);
+	if (!size_ptr)
+		return 0;
+	size = *size_ptr;
+	bpf_map_delete_elem(&cxx_sizes, &tid);
+
+	event = gadget_reserve_buf(&events, sizeof(*event));
+	if (!event)
+		return 0;
+
+	event->timestamp_raw = bpf_ktime_get_boot_ns();
+	event->operation_raw = operation;
+	event->addr = addr;
+	event->size = size;
+	gadget_process_populate(&event->proc);
+	if (capture_stacks)
+		gadget_get_user_stack(ctx, &event->ustack);
+	gadget_submit_buf(ctx, &events, event, sizeof(*event));
+	return 0;
+}
+
+static __always_inline int gen_cxx_array_alloc_enter(size_t size)
+{
+	u32 tid = (u32)bpf_get_current_pid_tgid();
+	bpf_map_update_elem(&cxx_array_sizes, &tid, &size, BPF_ANY);
+	return 0;
+}
+
+static __always_inline int gen_cxx_array_alloc_exit(struct pt_regs *ctx,
+						    enum memop operation, u64 addr)
+{
+	struct event *event;
+	u32 tid;
+	u64 *size_ptr;
+	u64 size;
+
+	if (gadget_should_discard_data_current())
+		return 0;
+
+	tid = (u32)bpf_get_current_pid_tgid();
+	size_ptr = bpf_map_lookup_elem(&cxx_array_sizes, &tid);
+	if (!size_ptr)
+		return 0;
+	size = *size_ptr;
+	bpf_map_delete_elem(&cxx_array_sizes, &tid);
+
+	event = gadget_reserve_buf(&events, sizeof(*event));
+	if (!event)
+		return 0;
+
+	event->timestamp_raw = bpf_ktime_get_boot_ns();
+	event->operation_raw = operation;
+	event->addr = addr;
+	event->size = size;
+	gadget_process_populate(&event->proc);
+	if (capture_stacks)
+		gadget_get_user_stack(ctx, &event->ustack);
+	gadget_submit_buf(ctx, &events, event, sizeof(*event));
 	return 0;
 }
 
@@ -294,26 +400,26 @@ PROBE_RET_VAL_FOR_ALLOC(pvalloc)
 SEC("uprobe/libstdc++:_Znwm")
 int BPF_UPROBE(trace_uprobe_new, size_t size)
 {
-	return gen_alloc_enter(size);
+	return gen_cxx_alloc_enter(size);
 }
 
 SEC("uretprobe/libstdc++:_Znwm")
 int trace_uretprobe_new(struct pt_regs *ctx)
 {
-	return gen_alloc_exit(ctx, op_new, PT_REGS_RC(ctx));
+	return gen_cxx_alloc_exit(ctx, op_new, PT_REGS_RC(ctx));
 }
 
 /* C++ operator new[] (_Znam) */
 SEC("uprobe/libstdc++:_Znam")
 int BPF_UPROBE(trace_uprobe_new_array, size_t size)
 {
-	return gen_alloc_enter(size);
+	return gen_cxx_array_alloc_enter(size);
 }
 
 SEC("uretprobe/libstdc++:_Znam")
 int trace_uretprobe_new_array(struct pt_regs *ctx)
 {
-	return gen_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx));
+	return gen_cxx_array_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx));
 }
 
 /* C++ operator delete (_ZdlPv) */
@@ -349,52 +455,52 @@ int trace_uretprobe_reallocarray(struct pt_regs *ctx)
 SEC("uprobe/libstdc++:_ZnwmSt11align_val_t")
 int BPF_UPROBE(trace_uprobe_new_aligned, size_t size)
 {
-	return gen_alloc_enter(size);
+	return gen_cxx_alloc_enter(size);
 }
 
 SEC("uretprobe/libstdc++:_ZnwmSt11align_val_t")
 int trace_uretprobe_new_aligned(struct pt_regs *ctx)
 {
-	return gen_alloc_exit(ctx, op_new, PT_REGS_RC(ctx));
+	return gen_cxx_alloc_exit(ctx, op_new, PT_REGS_RC(ctx));
 }
 
 /* C++17 aligned operator new[] (_ZnamSt11align_val_t) */
 SEC("uprobe/libstdc++:_ZnamSt11align_val_t")
 int BPF_UPROBE(trace_uprobe_new_array_aligned, size_t size)
 {
-	return gen_alloc_enter(size);
+	return gen_cxx_array_alloc_enter(size);
 }
 
 SEC("uretprobe/libstdc++:_ZnamSt11align_val_t")
 int trace_uretprobe_new_array_aligned(struct pt_regs *ctx)
 {
-	return gen_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx));
+	return gen_cxx_array_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx));
 }
 
 /* nothrow operator new (_ZnwmRKSt9nothrow_t) */
 SEC("uprobe/libstdc++:_ZnwmRKSt9nothrow_t")
 int BPF_UPROBE(trace_uprobe_new_nothrow, size_t size)
 {
-	return gen_alloc_enter(size);
+	return gen_cxx_alloc_enter(size);
 }
 
 SEC("uretprobe/libstdc++:_ZnwmRKSt9nothrow_t")
 int trace_uretprobe_new_nothrow(struct pt_regs *ctx)
 {
-	return gen_alloc_exit(ctx, op_new, PT_REGS_RC(ctx));
+	return gen_cxx_alloc_exit(ctx, op_new, PT_REGS_RC(ctx));
 }
 
 /* nothrow operator new[] (_ZnamRKSt9nothrow_t) */
 SEC("uprobe/libstdc++:_ZnamRKSt9nothrow_t")
 int BPF_UPROBE(trace_uprobe_new_array_nothrow, size_t size)
 {
-	return gen_alloc_enter(size);
+	return gen_cxx_array_alloc_enter(size);
 }
 
 SEC("uretprobe/libstdc++:_ZnamRKSt9nothrow_t")
 int trace_uretprobe_new_array_nothrow(struct pt_regs *ctx)
 {
-	return gen_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx));
+	return gen_cxx_array_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx));
 }
 
 /* sized operator delete (_ZdlPvm) */
@@ -446,39 +552,39 @@ SEC("uprobe/libc++:_ZdlPvm")
 int BPF_UPROBE(trace_cxx_uprobe__ZdlPvm, void *address) { return gen_free_enter(ctx, op_delete, (u64)address); }
 
 SEC("uprobe/libc++:_Znam")
-int BPF_UPROBE(trace_cxx_uprobe__Znam, size_t size) { return gen_alloc_enter(size); }
+int BPF_UPROBE(trace_cxx_uprobe__Znam, size_t size) { return gen_cxx_array_alloc_enter(size); }
 
 SEC("uprobe/libc++:_ZnamRKSt9nothrow_t")
-int BPF_UPROBE(trace_cxx_uprobe__ZnamRKSt9nothrow_t, size_t size) { return gen_alloc_enter(size); }
+int BPF_UPROBE(trace_cxx_uprobe__ZnamRKSt9nothrow_t, size_t size) { return gen_cxx_array_alloc_enter(size); }
 
 SEC("uprobe/libc++:_ZnamSt11align_val_t")
-int BPF_UPROBE(trace_cxx_uprobe__ZnamSt11align_val_t, size_t size) { return gen_alloc_enter(size); }
+int BPF_UPROBE(trace_cxx_uprobe__ZnamSt11align_val_t, size_t size) { return gen_cxx_array_alloc_enter(size); }
 
 SEC("uprobe/libc++:_Znwm")
-int BPF_UPROBE(trace_cxx_uprobe__Znwm, size_t size) { return gen_alloc_enter(size); }
+int BPF_UPROBE(trace_cxx_uprobe__Znwm, size_t size) { return gen_cxx_alloc_enter(size); }
 
 SEC("uprobe/libc++:_ZnwmRKSt9nothrow_t")
-int BPF_UPROBE(trace_cxx_uprobe__ZnwmRKSt9nothrow_t, size_t size) { return gen_alloc_enter(size); }
+int BPF_UPROBE(trace_cxx_uprobe__ZnwmRKSt9nothrow_t, size_t size) { return gen_cxx_alloc_enter(size); }
 
 SEC("uprobe/libc++:_ZnwmSt11align_val_t")
-int BPF_UPROBE(trace_cxx_uprobe__ZnwmSt11align_val_t, size_t size) { return gen_alloc_enter(size); }
+int BPF_UPROBE(trace_cxx_uprobe__ZnwmSt11align_val_t, size_t size) { return gen_cxx_alloc_enter(size); }
 
 SEC("uretprobe/libc++:_Znam")
-int trace_cxx_uretprobe__Znam(struct pt_regs *ctx) { return gen_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx)); }
+int trace_cxx_uretprobe__Znam(struct pt_regs *ctx) { return gen_cxx_array_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx)); }
 
 SEC("uretprobe/libc++:_ZnamRKSt9nothrow_t")
-int trace_cxx_uretprobe__ZnamRKSt9nothrow_t(struct pt_regs *ctx) { return gen_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx)); }
+int trace_cxx_uretprobe__ZnamRKSt9nothrow_t(struct pt_regs *ctx) { return gen_cxx_array_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx)); }
 
 SEC("uretprobe/libc++:_ZnamSt11align_val_t")
-int trace_cxx_uretprobe__ZnamSt11align_val_t(struct pt_regs *ctx) { return gen_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx)); }
+int trace_cxx_uretprobe__ZnamSt11align_val_t(struct pt_regs *ctx) { return gen_cxx_array_alloc_exit(ctx, op_new_array, PT_REGS_RC(ctx)); }
 
 SEC("uretprobe/libc++:_Znwm")
-int trace_cxx_uretprobe__Znwm(struct pt_regs *ctx) { return gen_alloc_exit(ctx, op_new, PT_REGS_RC(ctx)); }
+int trace_cxx_uretprobe__Znwm(struct pt_regs *ctx) { return gen_cxx_alloc_exit(ctx, op_new, PT_REGS_RC(ctx)); }
 
 SEC("uretprobe/libc++:_ZnwmRKSt9nothrow_t")
-int trace_cxx_uretprobe__ZnwmRKSt9nothrow_t(struct pt_regs *ctx) { return gen_alloc_exit(ctx, op_new, PT_REGS_RC(ctx)); }
+int trace_cxx_uretprobe__ZnwmRKSt9nothrow_t(struct pt_regs *ctx) { return gen_cxx_alloc_exit(ctx, op_new, PT_REGS_RC(ctx)); }
 
 SEC("uretprobe/libc++:_ZnwmSt11align_val_t")
-int trace_cxx_uretprobe__ZnwmSt11align_val_t(struct pt_regs *ctx) { return gen_alloc_exit(ctx, op_new, PT_REGS_RC(ctx)); }
+int trace_cxx_uretprobe__ZnwmSt11align_val_t(struct pt_regs *ctx) { return gen_cxx_alloc_exit(ctx, op_new, PT_REGS_RC(ctx)); }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
