@@ -19,6 +19,19 @@ const (
 
 	PerfBufferPages = 64
 
+	// PerfWakeupEvents batches perf-buffer wakeups so the single epoll consumer
+	// is not woken on every sample. Critical on high-core-count nodes lacking
+	// BPF ring buffer (kernel < 5.8, e.g. Ubuntu 20.04 / 5.4 FIPS), where IG
+	// falls back to the legacy per-CPU perf buffer. 0 = legacy per-event wakeup.
+	// Overridable at runtime with IG_PERF_WAKEUP_EVENTS.
+	PerfWakeupEvents = 64
+
+	// PerfFlushIntervalMs bounds the extra latency introduced by PerfWakeupEvents
+	// batching: a background timer flushes partially-filled per-CPU perf buffers
+	// at this cadence so low-rate buffers do not stall until they fill. 0 disables
+	// the timer (pure batching). Overridable with IG_PERF_FLUSH_INTERVAL_MS.
+	PerfFlushIntervalMs = 200
+
 	// Constant used to enable filtering by mount namespace inode id in eBPF.
 	// Keep in syn with variable defined in include/gadget/mntns_filter.h.
 	FilterByMntNsName = "gadget_filter_by_mntns"

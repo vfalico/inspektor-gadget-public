@@ -181,6 +181,30 @@ func (t *Tracer) receiveEvents(gadgetCtx operators.GadgetContext, wg *sync.WaitG
 		}
 	case ebpf.PerfEventArray:
 		var rec perf.Record
+		// With WakeupEvents batching the kernel will not wake us until N events
+		// accumulate per CPU buffer; on low-rate buffers an event can sit until
+		// the buffer fills. A bounded flush timer caps that added latency by
+		// periodically unblocking the reader. The goroutine stops when this
+		// function returns (reader closed) via flushDone.
+		if interval := gadgets.PerfFlushInterval(); interval > 0 {
+			flushDone := make(chan struct{})
+			defer close(flushDone)
+			go func() {
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-flushDone:
+						return
+					case <-ticker.C:
+						if err := t.perfReader.Flush(); err != nil {
+							// reader closed or flush unsupported; stop quietly
+							return
+						}
+					}
+				}
+			}()
+		}
 		readCb = func() ([]byte, uint64, error) {
 			err := t.perfReader.ReadInto(&rec)
 			return rec.RawSample, rec.LostSamples, err
@@ -195,6 +219,11 @@ func (t *Tracer) receiveEvents(gadgetCtx operators.GadgetContext, wg *sync.WaitG
 		if err != nil {
 			if errors.Is(err, os.ErrClosed) {
 				return err
+			}
+			if errors.Is(err, perf.ErrFlushed) {
+				// Bounded flush timer unblocked the reader to drain a
+				// partially-filled per-CPU buffer; not an error, keep reading.
+				continue
 			}
 			gadgetCtx.Logger().Warnf("error reading event: %v", err)
 			continue
@@ -302,7 +331,19 @@ func (i *ebpfInstance) runTracer(gadgetCtx operators.GadgetContext, tracer *Trac
 		tracer.logger = i.logger
 	case ebpf.PerfEventArray:
 		i.logger.Debugf("creating perf reader for map %q", tracer.mapName)
-		tracer.perfReader, err = perf.NewReader(m, gadgets.PerfBufferPages*os.Getpagesize())
+		// On kernels without BPF ring buffer (e.g. Ubuntu 20.04 / 5.4 FIPS), IG
+		// falls back to the legacy per-CPU perf buffer. The default perf.NewReader
+		// builds the reader with WakeupEvents=0, so the kernel wakes the single
+		// epoll consumer on EVERY sample. On high-core-count nodes that is an
+		// O(nCPU) wakeup + context-switch storm that saturates a CPU and starves
+		// the kubelet (PLEG/health-check deadline misses -> ContainerCreating
+		// stalls). Batch wakeups and make the per-CPU buffer size configurable.
+		bufferPages := gadgets.PerfBufferPagesFromEnv()
+		wakeupEvents := gadgets.PerfWakeupEventsFromEnv()
+		i.logger.Debugf("perf reader for map %q: bufferPages=%d wakeupEvents=%d",
+			tracer.mapName, bufferPages, wakeupEvents)
+		tracer.perfReader, err = perf.NewReaderWithOptions(m, bufferPages*os.Getpagesize(),
+			perf.ReaderOptions{WakeupEvents: wakeupEvents})
 	default:
 		return fmt.Errorf("unknown type for tracer map %q", tracer.mapName)
 	}
