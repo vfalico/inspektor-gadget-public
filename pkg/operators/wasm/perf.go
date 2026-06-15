@@ -24,6 +24,8 @@ import (
 	"github.com/cilium/ebpf/perf"
 	"github.com/tetratelabs/wazero"
 	wapi "github.com/tetratelabs/wazero/api"
+
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
 )
 
 func (i *wasmOperatorInstance) addPerfFuncs(env wazero.HostModuleBuilder) {
@@ -86,7 +88,20 @@ func (i *wasmOperatorInstance) newPerfReader(ctx context.Context, m wapi.Module,
 		return
 	}
 
-	perfReader, err := perf.NewReaderWithOptions(perfMap, size, perf.ReaderOptions{Overwritable: isOverwritable})
+	// Batch perf-buffer wakeups on the wasm operator path too: without this the
+	// guest-driven perf reader wakes the host consumer on every sample, the same
+	// O(nCPU) wakeup storm that wedges image-based gadgets on kernel<5.8 perf
+	// fallback (e.g. 5.4 FIPS). Overwritable readers are drained on demand via
+	// SetDeadline below, so wakeup batching only applies to the non-overwritable
+	// (streaming) case.
+	wakeupEvents := 0
+	if !isOverwritable {
+		wakeupEvents = gadgets.PerfWakeupEventsFromEnv()
+	}
+	perfReader, err := perf.NewReaderWithOptions(perfMap, size, perf.ReaderOptions{
+		Overwritable: isOverwritable,
+		WakeupEvents: wakeupEvents,
+	})
 	if err != nil {
 		i.logger.Warnf("newPerfReader: creating perf reader: %v", err)
 		stack[0] = 0
