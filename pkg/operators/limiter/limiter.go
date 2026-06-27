@@ -123,11 +123,30 @@ func (l *limiterOperatorInstance) PreStart(gadgetCtx operators.GadgetContext) er
 			}
 			maxEntries = val
 		} else if val, ok := l.limitsPerDs[ds.Name()]; ok {
-			if ds.Type() != datasource.TypeArray {
-				return fmt.Errorf("%s can only be used on array data sources", ParamMaxEntries)
-			}
+			// max-entries.<ds>=-1 DISABLES the cap for this data source.
+			// Disabling is always a harmless no-op, so honour it BEFORE the
+			// array-type guard — otherwise a caller trying to LIFT the cap on a
+			// streaming/snapshot source would hit the graceful-skip warning about
+			// an "ignored" cap when they actually asked for (and already get) the
+			// uncapped stream they explicitly requested.
 			if val == -1 {
 				gadgetCtx.Logger().Debugf("limiter: disabled for data source %q", ds.Name())
+				continue
+			}
+			if ds.Type() != datasource.TypeArray {
+				// A positive max-entries/limiter is meaningless on a non-array data
+				// source. Degrade gracefully: WARN and skip applying the cap to this
+				// data source instead of hard-failing the whole gadget run — the
+				// caller still gets its rows. The message distinguishes the two
+				// non-array cases and points streaming callers at the server-side
+				// ranking they already have.
+				gadgetCtx.Logger().Warnf("%s ignored for data source %q: applies "+
+					"only to array (rankable) sources, and %q is not one. If %q is "+
+					"a high-volume STREAMING source, the server already emits a "+
+					"<topGroups key=...> block ranking the dominant keys over the "+
+					"full pre-truncation set — read that instead of requesting "+
+					"top-N. If it is a single-row snapshot there is nothing to rank.",
+					ParamMaxEntries, ds.Name(), ds.Name(), ds.Name())
 				continue
 			}
 			maxEntries = val
