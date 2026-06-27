@@ -17,7 +17,9 @@ package filter
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
+	"strings"
 
 	"golang.org/x/exp/constraints"
 
@@ -338,6 +340,26 @@ func (f *filterOperatorInstance) addFilter(gadgetCtx operators.GadgetContext, ds
 
 	field := ds.GetField(fieldName)
 	if field == nil {
+		// Bare-leaf alias resolution. Several streaming gadgets nest
+		// process identity under "proc" (proc.comm, proc.pid, proc.tid), so a
+		// filter written as `comm==X` misses the dotted fieldMap key and the
+		// gadget aborts with -32603 "field not found". Resolve a bare leaf name
+		// to its dotted FullName so `comm==X` transparently means
+		// `proc.comm==X` (mirrors the alias support already shipped server-side
+		// for group_by). Observed live in practice.
+		if alias := resolveLeafField(ds, fieldName); alias != nil {
+			field = alias
+		}
+	}
+	if field == nil {
+		// Still unresolved (truly absent, or an ambiguous leaf shared by two
+		// nested paths): enumerate the datasource's real field names so the
+		// agent self-corrects in ONE retry instead of blind-guessing.
+		names := availableFieldNames(ds)
+		if len(names) > 0 {
+			return fmt.Errorf("field %q not found in datasource %s; available filterable fields: %s",
+				fieldName, ds.Name(), strings.Join(names, ", "))
+		}
 		return fmt.Errorf("field %q not found in datasource %s", fieldName, ds.Name())
 	}
 
@@ -348,6 +370,61 @@ func (f *filterOperatorInstance) addFilter(gadgetCtx operators.GadgetContext, ds
 
 	f.ffns[ds] = append(f.ffns[ds], ff)
 	return nil
+}
+
+// resolveLeafField resolves a bare field name (e.g. "comm") to the datasource
+// field whose LEAF name (last dotted segment) matches, returned by its canonical
+// dotted FullName (e.g. "proc.comm"). Exact full-name hits are already handled
+// by ds.GetField; this only adds leaf-name aliasing for the common case where a
+// gadget nests process identity under "proc". Uniqueness is required: if two
+// fields share a leaf (proc.comm vs proc.parent.comm) the match is ambiguous and
+// we return nil so the caller emits the enumerated-fields error and the agent
+// picks the dotted name explicitly. Userspace-only.
+func resolveLeafField(ds datasource.DataSource, bare string) datasource.FieldAccessor {
+	var match datasource.FieldAccessor
+	n := 0
+	for _, a := range ds.Accessors(false) {
+		if strings.EqualFold(a.Name(), bare) {
+			match = a
+			n++
+		}
+	}
+	if n != 1 {
+		return nil
+	}
+	if full := ds.GetField(match.FullName()); full != nil {
+		return full
+	}
+	return match
+}
+
+// availableFieldNames returns the datasource's field FullNames (dotted, sorted,
+// de-duplicated, capped) for filter-field-not-found diagnostics. Dotted names
+// are shown (not bare leaves) precisely because the agent already tried the bare
+// name; seeing "proc.comm" tells it the real key in one step.
+func availableFieldNames(ds datasource.DataSource) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, a := range ds.Accessors(false) {
+		n := a.FullName()
+		if n == "" {
+			n = a.Name()
+		}
+		if n == "" {
+			continue
+		}
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	const maxNames = 40
+	if len(out) > maxNames {
+		out = append(out[:maxNames:maxNames], "...")
+	}
+	return out
 }
 
 func getFilterFunc(f datasource.FieldAccessor, op comparisonType, negate bool, stringVal string) (
