@@ -218,23 +218,59 @@ func (s *sortOperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 		}
 
 		if ds.Type() != datasource.TypeArray {
-			return fmt.Errorf("sort can only be used on array data sources")
+			// sort is meaningless on a non-array data source. Degrade
+			// gracefully: WARN and skip ordering this data source instead of
+			// hard-failing the whole gadget run. The message distinguishes the
+			// two non-array cases and points streaming callers at the
+			// server-side ranking they already have.
+			gadgetCtx.Logger().Warnf("sort ignored for data source %q: applies "+
+				"only to array (rankable) sources, and %q is not one. If %q is a "+
+				"high-volume STREAMING source, the server already emits a "+
+				"<topGroups key=...> block with the dominant keys over the full "+
+				"pre-truncation set — read that instead. If it is a single-row "+
+				"snapshot there is nothing to order.", ds.Name(), ds.Name(), ds.Name())
+			continue
 		}
 
 		var sortFuncs []func(i, j datasource.Data) bool
+		skipDS := false
 		for _, fieldName := range sortFields {
+			rawField := fieldName
 			fieldName, negate := strings.CutPrefix(fieldName, "-")
 
 			field := ds.GetField(fieldName)
 			if field == nil {
-				return fmt.Errorf("field %s not found", fieldName)
+				// A GLOBAL (non-ds-specific) sort rule is applied to EVERY data
+				// source, so a key that lives in one capability's source (e.g.
+				// runq_ns in mep_runq) naturally will not exist in the others.
+				// Missing field is therefore NOT fatal: WARN and leave THIS data
+				// source unsorted instead of hard-failing the whole gadget run —
+				// the caller still gets every source's rows (just unordered where
+				// the key is absent). A ds-specific rule that names a real ds but
+				// a missing field is the caller's targeting mistake, yet killing
+				// all OTHER sources' output over it is still the wrong trade, so
+				// we warn and skip there too (the warning still names the typo).
+				gadgetCtx.Logger().Warnf("sort key %q not found in data source "+
+					"%q; leaving %q unsorted (the field belongs to a different "+
+					"capability's data source). Other data sources are "+
+					"unaffected and still returned.", rawField, ds.Name(), ds.Name())
+				skipDS = true
+				break
 			}
 
 			cmp := getCompareFunc(field, negate)
 			if cmp == nil {
-				return fmt.Errorf("field %s cannot be used for sorting", fieldName)
+				// Field exists but is not an orderable scalar. Same trade: warn
+				// and leave this source unsorted rather than abort the run.
+				gadgetCtx.Logger().Warnf("sort key %q in data source %q is not an "+
+					"orderable type; leaving %q unsorted.", rawField, ds.Name(), ds.Name())
+				skipDS = true
+				break
 			}
 			sortFuncs = append(sortFuncs, cmp)
+		}
+		if skipDS {
+			continue
 		}
 
 		slices.Reverse(sortFuncs)

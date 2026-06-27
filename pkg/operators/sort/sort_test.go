@@ -245,3 +245,35 @@ func TestGetFieldsByDsFieldSorting(t *testing.T) {
 	fieldsByDs := s.getFieldsByDs()
 	assert.EqualValues(t, map[string][]string{"foo": {"string", "number"}}, fieldsByDs)
 }
+
+// TestSortOnSingleRowSnapshotWarnsAndContinues asserts the owner
+// directive: a sort request against a non-array (single-row snapshot) data
+// source must DEGRADE GRACEFULLY — the sort operator logs a warning and skips
+// ordering that data source, instead of hard-failing the whole gadget run with
+// a -32603 "sort is not supported on snapshot" error.
+func TestSortOnSingleRowSnapshotWarnsAndContinues(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	producer := simple.New("producer",
+		simple.OnInit(func(gadgetCtx operators.GadgetContext) error {
+			// single-row snapshot data source (NOT TypeArray)
+			ds, err := gadgetCtx.RegisterDataSource(datasource.TypeSingle, "snap")
+			require.NoError(t, err)
+			_, err = ds.AddField("val", api.Kind_Uint64)
+			require.NoError(t, err)
+			return nil
+		}),
+		simple.OnStop(func(gadgetCtx operators.GadgetContext) error { return nil }),
+	)
+
+	gadgetCtx := gadgetcontext.New(ctx, "",
+		gadgetcontext.WithDataOperators(&sortOperator{}, producer))
+
+	// request a sort on the snapshot's field — meaningless, must NOT error
+	paramValues := api.ParamValues{
+		"operator.sort." + ParamSortBy: "snap:val",
+	}
+	err := gadgetCtx.Run(paramValues)
+	assert.NoError(t, err, "sort on a single-row snapshot must warn-and-continue, not error with -32603")
+}
