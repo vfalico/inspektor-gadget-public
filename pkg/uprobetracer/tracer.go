@@ -109,6 +109,16 @@ type Tracer[Event any] struct {
 	mu     sync.Mutex
 }
 
+// isHostAttachPid identifies the host pseudo-container produced by the
+// localmanager --host parameter (host-uprobe recipe). In that mode the
+// uprobe target must be resolved in the host mount namespace; this is what lets
+// attach_uprobe/cuda_memtrace observe ordinary host processes. Event attribution
+// is still filtered in BPF by proc.pid (mcp_ebpf_proxy's filter_pid map), so this
+// broad host attach does not leak ambient host rows when --pid is supplied.
+func isHostAttachPid(containerPid uint32) bool {
+	return containerPid == 1
+}
+
 func NewTracer[Event any](logger logger.Logger) (*Tracer[Event], error) {
 	t := &Tracer[Event]{
 		containerPid2Inodes:  make(map[uint32][]uint64),
@@ -158,7 +168,9 @@ func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo 
 	t.prog = prog
 
 	// attach to pending containers, then release the pending list
+	t.logger.Infof("uprobetracer attaching program %q to %d pending container/host pid(s) for %s:%s", progName, len(t.pendingContainerPids), t.attachFilePath, t.attachSymbol)
 	for pid := range t.pendingContainerPids {
+		t.logger.Infof("uprobetracer pending attach target pid=%d for program %q", pid, progName)
 		t.attach(pid)
 	}
 	t.pendingContainerPids = nil
@@ -210,6 +222,9 @@ func (t *Tracer[Event]) attachUprobe(file *os.File) (link.Link, error) {
 // try attaching to a container, will update `containerPid2Inodes`
 func (t *Tracer[Event]) attach(containerPid uint32) {
 	var attachedRealInodes []uint64
+	if isHostAttachPid(containerPid) {
+		t.logger.Debugf("attaching host uprobe %q via localmanager --host pseudo-container (pid=%d, target=%s:%s)", t.progName, containerPid, t.attachFilePath, t.attachSymbol)
+	}
 	unsecuredAttachFilePaths, err := t.searchForLibrary(containerPid)
 	if err != nil {
 		t.logger.Debugf("attaching to container %d: %s", containerPid, err.Error())
@@ -220,14 +235,24 @@ func (t *Tracer[Event]) attach(containerPid uint32) {
 	}
 
 	for _, filePath := range unsecuredAttachFilePaths {
-		// Thankfully, OpenInContainer returns a fd opened without `O_PATH`.
-		// This is necessary because `ReadRealInodeFromFd` needs the
-		// `private_data` field in kernel "struct file", to access the
-		// underlying inode through overlayFS. Using `O_PATH` flag will cause
-		// the `private_data` field to be zero.
-		file, err := secureopen.OpenInContainer(containerPid, filePath)
+		// Host-mode localmanager uses pid=1 as a pseudo-container. Do not route
+		// that through OpenInContainer(1, ...): on host-process uprobes we must open
+		// the host path directly, keep a real readable fd alive, and let cilium/ebpf
+		// attach against /proc/self/fd/<fd>. This is the host-uprobe recipe.
+		var file *os.File
+		var err error
+		if isHostAttachPid(containerPid) {
+			file, err = os.Open(filePath)
+		} else {
+			// Thankfully, OpenInContainer returns a fd opened without `O_PATH`.
+			// This is necessary because `ReadRealInodeFromFd` needs the
+			// `private_data` field in kernel "struct file", to access the
+			// underlying inode through overlayFS. Using `O_PATH` flag will cause
+			// the `private_data` field to be zero.
+			file, err = secureopen.OpenInContainer(containerPid, filePath)
+		}
 		if err != nil {
-			t.logger.Debugf("opening file '%q' for uprobe: %s", filePath, err.Error())
+			t.logger.Warnf("opening file %q for uprobe in container/host pid %d: %s", filePath, containerPid, err.Error())
 			continue
 		}
 		realInodePtr, err := kfilefields.ReadRealInodeFromFd(int(file.Fd()))
@@ -237,15 +262,32 @@ func (t *Tracer[Event]) attach(containerPid uint32) {
 			continue
 		}
 
-		t.logger.Debugf("attaching uprobe %q to container %d: %q", t.progName, containerPid, filePath)
+		if isHostAttachPid(containerPid) {
+			t.logger.Debugf("attaching uprobe %q to host pid namespace: %q", t.progName, filePath)
+		} else {
+			t.logger.Debugf("attaching uprobe %q to container %d: %q", t.progName, containerPid, filePath)
+		}
 		attachedRealInodes = append(attachedRealInodes, realInodePtr)
 
 		inode, exists := t.inodeRefCount[realInodePtr]
 		if !exists {
 			progLink, err := t.attachUprobe(file)
 			if err != nil {
-				t.logger.Debugf("failed to attach uprobe %q: %s", t.progName, err.Error())
+				// Host-process uprobes are a hard gate for the host-uprobe path. A failed
+				// link must be visible at normal log level and must not be cached as
+				// a successful inode ref; otherwise the control plane reports
+				// "attaching" while no uprobe link exists and positive smokes produce
+				// zero target rows.
+				t.logger.Warnf("failed to attach uprobe %q to %q:%s in container/host pid %d: %s", t.progName, filePath, t.attachSymbol, containerPid, err.Error())
+				file.Close()
+				continue
 			}
+			if progLink == nil {
+				t.logger.Warnf("failed to attach uprobe %q to %q:%s in container/host pid %d: attach returned nil link", t.progName, filePath, t.attachSymbol, containerPid)
+				file.Close()
+				continue
+			}
+			t.logger.Infof("attached uprobe %q to %q:%s in container/host pid %d", t.progName, filePath, t.attachSymbol, containerPid)
 			t.inodeRefCount[realInodePtr] = &inodeKeeper{1, file, progLink}
 		} else {
 			inode.counter++
