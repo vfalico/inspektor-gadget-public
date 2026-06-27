@@ -30,21 +30,42 @@ import (
 )
 
 const (
-	kprobePrefix    = "kprobe/"
-	kretprobePrefix = "kretprobe/"
-	iterPrefix      = "iter/"
-	fentryPrefix    = "fentry/"
-	fexitPrefix     = "fexit/"
-	perfEventPrefix = "perf_event/"
-	tpBtfPrefix     = "tp_btf/"
-	uprobePrefix    = "uprobe/"
-	uretprobePrefix = "uretprobe/"
-	usdtPrefix      = "usdt/"
+	kprobePrefix      = "kprobe/"
+	kretprobePrefix   = "kretprobe/"
+	iterPrefix        = "iter/"
+	fentryPrefix      = "fentry/"
+	fexitPrefix       = "fexit/"
+	perfEventPrefix   = "perf_event/"
+	tpBtfPrefix       = "tp_btf/"
+	uprobePrefix      = "uprobe/"
+	uretprobePrefix   = "uretprobe/"
+	usdtPrefix        = "usdt/"
+	ksyscallPrefix    = "ksyscall/"
+	kretsyscallPrefix = "kretsyscall/"
 )
 
 const (
 	disabledProgram = "gadget_program_disabled"
 )
+
+// syscallSymPrefix returns the arch-specific kernel symbol prefix for syscall
+// entry wrappers (e.g. "__x64_sys_" on amd64), matching libbpf's
+// arch_specific_syscall_pfx(). Used to resolve ksyscall/kretsyscall section
+// targets into the concrete kallsyms symbol to kprobe.
+func syscallSymPrefix() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "__x64_sys_"
+	case "arm64":
+		return "__arm64_sys_"
+	case "386":
+		return "__ia32_sys_"
+	case "s390x":
+		return "__s390x_sys_"
+	default:
+		return ""
+	}
+}
 
 func (i *ebpfInstance) attachProgram(gadgetCtx operators.GadgetContext, p *ebpf.ProgramSpec, prog *ebpf.Program) (link.Link, error) {
 	attachTo := p.AttachTo
@@ -80,6 +101,14 @@ func (i *ebpfInstance) attachProgram(gadgetCtx operators.GadgetContext, p *ebpf.
 			case "usdt":
 				return nil, uprobeTracer.AttachProg(p.Name, uprobetracer.ProgUSDT, attachTo, prog)
 			}
+		case strings.HasPrefix(p.SectionName, ksyscallPrefix):
+			sym := syscallSymPrefix() + attachTo
+			i.logger.Debugf("Attaching ksyscall %q to %q (resolved kallsyms %q)", p.Name, attachTo, sym)
+			return link.Kprobe(sym, prog, nil)
+		case strings.HasPrefix(p.SectionName, kretsyscallPrefix):
+			sym := syscallSymPrefix() + attachTo
+			i.logger.Debugf("Attaching kretsyscall %q to %q (resolved kallsyms %q)", p.Name, attachTo, sym)
+			return link.Kretprobe(sym, prog, nil)
 		}
 		return nil, fmt.Errorf("unsupported section name %q for program %q", p.SectionName, p.Name)
 	case ebpf.TracePoint:
