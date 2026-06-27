@@ -50,6 +50,17 @@ const (
 	ConnectionModeKubernetesProxy
 )
 
+// defaultMaxCallRecvMsgSize raises the gRPC client's per-call receive limit well above the
+// library default of 4 MiB. Some read-only gadget responses are legitimately large and
+// bounded only by the kernel they describe -- e.g. mcp_ebpf_proxy's list_attachable
+// capability streams the full kallsyms table (~300k symbols, tens of MiB on a stock kernel),
+// and gadget info for large collections can also exceed 4 MiB. Without this the client aborts
+// such a response with 'received message larger than max (N vs. 4194304)'. 256 MiB keeps a
+// hard bound (so a runaway server cannot OOM the client) while comfortably covering real
+// kernels. The MCP transport saves any large tool result to a file for out-of-band
+// processing, so a multi-MiB response is usable rather than context-flooding.
+const defaultMaxCallRecvMsgSize = 256 << 20 // 256 MiB
+
 const (
 	ParamNode              = "node"
 	ParamRemoteAddress     = "remote-address"
@@ -376,6 +387,9 @@ func (r *Runtime) dialContext(dialCtx context.Context, target target, timeout ti
 		grpc.WithBlock(),
 		//nolint:staticcheck
 		grpc.WithReturnConnectionError(),
+		// Accept large read-only responses (e.g. list_attachable's full kallsyms
+		// enumeration) instead of failing with ResourceExhausted at the 4 MiB default.
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaultMaxCallRecvMsgSize)),
 	}
 
 	tlsKey := r.globalParams.Get(ParamTLSKey).String()
