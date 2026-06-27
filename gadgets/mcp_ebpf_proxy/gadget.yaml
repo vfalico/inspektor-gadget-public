@@ -1,0 +1,1129 @@
+name: mcp ebpf proxy
+description: |
+  Single multi-capability, read-only kernel+GPU observation gadget that exposes
+  generic eBPF tracing to AI agents through ig-mcp-server as ONE MCP tool. The
+  agent enumerates the capabilities below, picks `capability`, reads the output
+  field meanings, and on a wrong/absent request gets an error that points to the
+  next step. CORE generic capabilities:
+    - attach          : kprobe/kretprobe on ANY kernel function chosen at run
+                        time (no rebuild); first five args + return value. On
+                        "symbol not found" -> call list_attachable first.
+    - attach_uprobe   : uprobe/uretprobe on ANY userspace <lib-or-path>:<symbol>
+                        (e.g. libc:malloc, libcuda.so.1:cuMemAlloc_v2).
+    - trace_syscall   : raw_syscalls sys_enter/sys_exit for a syscall name + pid
+                        (six args + retval). OUTPUT syscall = DECODED syscall
+                        NAME (not the raw number); duration_ns = per-call
+                        wall time on the sys_exit. For socket detail use net_trace.
+    - list_attachable : enumerate kprobe-able kernel symbols (iter/ksym) to
+                        DISCOVER what to attach to before `attach`.
+  ENRICHED swiss-army families (decoded per-subsystem columns, no attach target
+  needed — this is THE EXPANSION):
+  HIGH-VOLUME OUTPUT ENVELOPE (streaming families emit many records): when a
+  result exceeds the window it is cut on a RECORD boundary and wrapped with
+  <isTruncated>true</isTruncated>, a <droppedRecords>N</droppedRecords> /
+  total/kept counter, a narrow-your-filter hint, AND a server-side
+  <topGroups key=... > block listing the top-N dominant keys (lock addr /
+  decoded syscall / fname / comm) by count over the FULL pre-truncation set
+  — so the dominant contributor is visible WITHOUT client-side parsing of a
+  clipped sample (sort/limit operators do not apply to streaming sources).
+    - cuda_memtrace   : CUDA driver+runtime alloc/free; size+ptr per event to
+                        reconcile pairs and flag leaks (is_runtime separates
+                        libcuda vs libcudart so you can DEDUPE double-counts).
+    - cuda_memsnapshot: STANDING per-PID GPU memory residency via NVML (snapshot,
+                        NOT alloc/free deltas) — shows VRAM each PID still HOLDS across the
+                        whole window even when alloc/free traffic is quiet.
+    - cuda_smutil     : STANDING per-PID GPU COMPUTE (SM) utilization via NVML
+                        (snapshot %); the recent_sm_util / reserved_unused_bytes idle-VRAM fields are
+                        on cuda_memsnapshot (mep_memsnap), not here. Orthogonal to cuda_memsnapshot's VRAM
+                        gauge — shows whether each PID is actually DRIVING the
+                        SMs or merely holding memory while idle (smUtil/memUtil).
+    - cuda_profile    : GPU launch/sync/memcpy + grid/block dims, stream, size.
+    - lock_trace      : userspace pthread mutex/cond wait — blocked-time + lock.
+                        OUTPUT holder_tid = the TID currently HOLDING the
+                        contended lock (the convoy owner the waiter is
+                        blocked behind; 0 if uncontended/unknown); addr =
+                        the lock/futex word; duration_ns = blocked time.
+    - heap_profile    : libc malloc/calloc/realloc/free churn + leak (PLUS kernel brk/anon-mmap growth so HOST-process leaks are visible) (size,ptr).
+    - net_trace       : TCP connect/retransmit/sendmsg with decoded daddr/dport
+                        and retval (ECONNREFUSED etc.) — use INSTEAD of raw
+                        trace_syscall when you need connection-level detail.
+    - fs_trace        : Filesystem. vfs_read/vfs_write/vfs_open (operation, requested/transferred byte count, result) AND failing opens via do_filp_open (the fs-layer open that runs before vfs_open and returns -errno when path resolution fails). Emits op, byte count, return code/errno, and the requested file path (OUTPUT fname) for vfs_read/write/open and failing opens. Path-resolution failures such as ENOENT on a missing file appear here because they never reach vfs_open. ALSO emits the RELEASE side via filp_close (fs_op=close): pair open vs close per PID to compute an fd open-minus-close BALANCE — the fd-leak signal (opens that accumulate with no matching close). Use fs_op=close to isolate releases.
+    - mm_trace        : page-fault + direct-reclaim with duration (mem pressure).
+    - irq_trace       : softirq service time per vector.
+    - block_io        : per-request block-device latency (dev, sector, is_write).
+    - runq_lat        : scheduler run-queue latency per task (CPU starvation).
+  Read-only: observes arguments, registers, tracepoint context and the kallsyms
+  iterator only; never modifies kernel state. A machine-readable catalog with
+  full param/field/error-next-step semantics ships alongside as
+  capability_catalog.json.
+  OBSERVABILITY BOUNDARY (route here on a miss instead of looping capabilities):
+  this gadget is a READ-ONLY kernel+GPU kprobe/uprobe/NVML surface. Some facts
+  are NOT kernel- or driver-observable and no capability will ever return them.
+  When the question is one of the following, STOP picking capabilities and tell
+  the user to scrape the application's own /metrics (Prometheus) or admin API:
+    - engine-internal gauges: vLLM num_requests_waiting / num_preemptions_total,
+      KV-cache usage; Triton/TGI queue depth (scrape the model server /metrics).
+    - database wait events: Postgres pg_stat_activity.wait_event, RocksDB L0 /
+      pending-compaction counters (query the DB; not a syscall/kprobe fact).
+    - in-kernel RING fields not exported via a hookable fn: io_uring CQ
+      koverflow counter (read it from the app via io_uring_setup flags / its
+      own stats; fs_trace can only show the io_uring_enter SUBMIT call).
+    - PMU / NUMA hardware counters: per-node numastat hit/miss, cache-miss /
+      IPC (use perf stat / numastat; PMU is out of this gadget's read surface).
+  For everything kernel/driver/GPU-resident, the capabilities above DO apply —
+  this boundary note only prevents dead-end loops on app-internal telemetry.
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/mcp_ebpf_proxy
+sourceURL: 'https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/mcp_ebpf_proxy'
+datasources:
+  blk_events:
+    fields:
+      bytes:
+        annotations:
+          value.unit: "bytes"
+          columns.width: "12"
+          description: Request size in bytes
+      dev:
+        annotations:
+          columns.hex: "true"
+          description: Device (major<<20|minor)
+      is_write:
+        annotations:
+          columns.width: "6"
+          description: 1 = write, 0 = read
+      latency_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          columns.width: "14"
+          description: Issue (block_io_start) -> done (block_io_done) latency in ns
+          formatters.duration.target: latency
+      req_op:
+        annotations:
+          columns.width: "10"
+          description: '[ENRICH] block request op (0=READ 1=WRITE 2=FLUSH 3=DISCARD
+            9=WRITE_ZEROES) — explains a 0-byte high-latency request (FLUSH/barrier
+            carries no payload, so bytes==0 is expected, not missing data)'
+      queue_depth:
+        annotations:
+          value.unit: "count"
+          value.semantics: "instantaneous_snapshot"
+          columns.width: "6"
+          description: '[ENRICH] in-flight block requests (device queue depth) this
+            I/O observed at issue. A rising queue_depth alongside rising latency_ns
+            is the block-device saturation signal: the device is the bottleneck, not the
+            caller. queue_depth~1 with high latency_ns means slow media, not depth.'
+      sector:
+        annotations:
+          value.unit: "count"
+          columns.hidden: "true"
+          columns.width: "12"
+          description: Starting sector
+  cuda_events:
+    fields:
+      is_runtime:
+        annotations:
+          columns.width: "10"
+          description: 0 = libcuda driver API (cuMem*), 1 = libcudart runtime API
+            (cuda*)
+      op:
+        annotations:
+          columns.width: "10"
+          description: 'CUDA memory operation: alloc, free or alloc_fail'
+      ptr:
+        annotations:
+          value.unit: "address"
+          columns.hex: "true"
+          description: Device/host pointer returned by the allocator (0 on alloc_fail)
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          columns.hex: "true"
+          description: CUDA return code (0 == CUDA_SUCCESS)
+      size:
+        annotations:
+          value.unit: "bytes"
+          columns.width: "14"
+          description: Allocation size in bytes (alloc); size of the freed block if
+            known (free)
+  cuprof_events:
+    fields:
+      bx:
+        annotations:
+          columns.width: "8"
+          description: Block dim X (launch)
+      by:
+        annotations:
+          columns.hidden: "true"
+          columns.width: "8"
+          description: Block dim Y (launch)
+      bytes:
+        annotations:
+          value.unit: "bytes"
+          columns.width: "14"
+          description: Transfer size in bytes (memcpy_h2d/d2h)
+      bz:
+        annotations:
+          columns.hidden: "true"
+          columns.width: "8"
+          description: Block dim Z (launch)
+      duration_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          columns.width: "14"
+          description: Wall-clock of the call in ns (sync); 0 otherwise
+          formatters.duration.target: duration
+      gpu_op:
+        annotations:
+          columns.width: "12"
+          description: 'GPU op: launch (kernel launch), sync (stream/ctx synchronize),
+            memcpy_h2d, memcpy_d2h'
+      gx:
+        annotations:
+          columns.width: "8"
+          description: Grid dim X (launch)
+      gy:
+        annotations:
+          columns.hidden: "true"
+          columns.width: "8"
+          description: Grid dim Y (launch)
+      gz:
+        annotations:
+          columns.hidden: "true"
+          columns.width: "8"
+          description: Grid dim Z (launch)
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          columns.hex: "true"
+          description: CUDA return code (0 == CUDA_SUCCESS)
+  fs_events:
+    fields:
+      count:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "per_call_transfer_size"
+          columns.width: "14"
+          description: Requested bytes (read/write); 0 for open
+      fname:
+        annotations:
+          columns.width: "40"
+          description: Leaf filename of the target (e.g. "app.conf") for read/write/open,
+            or the requested path for a failing open — answers WHICH file the I/O
+            hit (empty only if the dentry was unavailable)
+      fs_op:
+        annotations:
+          columns.width: "10"
+          description: 'FS op: read (vfs_read), write (vfs_write), open (vfs_open),
+            close (filp_close — the RELEASE side; pair with open for fd-leak balance),
+            filp_open (do_filp_open failing open), io_submit (libaio io_submit(2)),
+            io_uring_enter (io_uring_enter(2) async submit — count=ops submitted; the
+            async-I/O path that never appears as a read()/write() syscall)'
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          columns.width: "14"
+          description: Bytes transferred (read/write) OR open result (0 ok / -errno)
+  heap_events:
+    fields:
+      heap_op:
+        annotations:
+          columns.width: "10"
+          description: 'Heap op: malloc/calloc/realloc/free (libc uprobes — containerized
+            targets), or heap_brk_grow/heap_mmap_anon (kernel syscall tracepoints
+            — capture HOST-process heap growth where the libc uprobes are blind; size=bytes
+            grown), or heap_mmap_anon/heap_mmap_file (kernel mmap(2): anonymous vs
+            file-backed mapping of size bytes — file-backed mmap is the page-cache /
+            address-space growth path)'
+      old_ptr:
+        annotations:
+          value.unit: "address"
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: 'realloc: the pointer being resized; 0 otherwise'
+      ptr:
+        annotations:
+          value.unit: "address"
+          columns.hex: "true"
+          description: Returned ptr (alloc) or freed ptr (free)
+      size:
+        annotations:
+          value.unit: "bytes"
+          columns.width: "14"
+          description: Requested bytes (alloc family); 0 for free
+  irq_events:
+    fields:
+      duration_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          columns.width: "14"
+          description: Softirq entry->exit service time in ns
+          formatters.duration.target: service_time
+      vec:
+        annotations:
+          value.unit: "count"
+          columns.width: "10"
+          description: Softirq vector (0=HI 1=TIMER 2=NET_TX 3=NET_RX 4=BLOCK 6=TASKLET
+            7=SCHED 9=RCU)
+  lock_events:
+    fields:
+      addr:
+        annotations:
+          value.unit: "address"
+          columns.hex: "true"
+          description: Mutex/cond object pointer (groups waits by lock)
+      duration_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          columns.width: "14"
+          description: Time the thread was BLOCKED in the call (ns) — the contention
+            cost
+          formatters.duration.target: duration
+      holder_tid:
+        annotations:
+          columns.width: "10"
+          description: 'TID that HELD this lock when the waiter blocked — the contention
+            culprit to investigate (0 = uncontended/unknown). Correct for default
+            PTHREAD_MUTEX_NORMAL: derived by watching lock/unlock calls, not glibc
+            internals'
+      lock_op:
+        annotations:
+          columns.width: "12"
+          description: 'Lock op: mutex_wait (pthread_mutex_lock) or cond_wait (pthread_cond_(timed)wait)'
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          columns.hex: "true"
+          description: pthread return (0 == success)
+  memsnap_events:
+    fields:
+      dev_free:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "instantaneous_snapshot"
+          columns.width: "16"
+          description: Device free VRAM bytes right now (device rows only)
+      dev_total:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "instantaneous_snapshot"
+          columns.width: "16"
+          description: Device total VRAM bytes (device rows only)
+      dev_used:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "instantaneous_snapshot"
+          columns.width: "16"
+          description: Device used VRAM bytes right now (device rows only) — if dev_used
+            is high but no single PID has a large active working set, the GPU is over-reserved
+      gpu_pid:
+        annotations:
+          columns.width: "10"
+          description: PID that currently HOLDS GPU memory (from the NVML running-process
+            table); 0 for device rows
+      memsnap_op:
+        annotations:
+          columns.width: "10"
+          description: 'Row kind: proc = per-PID standing GPU residency; device =
+            device-wide total/free/used gauge'
+      recent_sm_util:
+        annotations:
+          value.unit: "percent"
+          value.semantics: "interval_averaged_5s"
+          columns.width: "12"
+          description: Most-recent GPU SM (compute) % for this holding PID, joined
+            in-kernel from the NVML per-process utilization table (0 = this PID did
+            no GPU compute in the last 5s even though it still holds used_gpu_mem)
+      reserved_unused_bytes:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "instantaneous_snapshot"
+          columns.width: "18"
+          description: 'DERIVED per-PID enrichment: bytes of GPU memory this PID holds
+            while its recent SM compute is ~0% — i.e. an idle, over-allocated reservation
+            occupying VRAM without doing compute work. 0 when the PID is actively
+            computing. Sum this across PIDs to quantify reclaimable over-allocation
+            when the device is full but utilization is low'
+      used_gpu_mem:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "instantaneous_snapshot"
+          columns.width: "16"
+          description: Bytes this PID currently RESERVES on the GPU right now (standing
+            snapshot, not a delta) — compare against its active working set (reservation
+            vs. what is actually used)
+  mep_coverage:
+    annotations:
+      description: 'attach-confirmation / coverage feedback: one row emitted
+        per run for the enriched/GPU capabilities, describing what was actually
+        attached so an empty result can be read as attached-but-idle rather than
+        attach-failed.'
+    fields:
+      capability:
+        annotations:
+          description: The selected capability this coverage record describes.
+      attached_targets:
+        annotations:
+          description: Comma-joined list of eBPF program attach targets actually
+            programmed for the selected capability.
+      attached_count:
+        annotations:
+          value.unit: "count"
+          description: Number of eBPF programs enabled for the selected capability.
+      pid_filter:
+        annotations:
+          description: Resolved process-id filter (0 == all pids / system-wide).
+      note:
+        annotations:
+          description: Interpretation hint — distinguishes attached-but-no-events
+            from attach-failed, and documents the NVML per-PID structural-empty
+            case for the cuda_memsnapshot/cuda_smutil capabilities.
+
+  mep:
+    fields:
+      arg0:
+        annotations:
+          columns.hex: "true"
+          description: First argument (PT_REGS_PARM1) at kprobe entry
+      arg1:
+        annotations:
+          columns.hex: "true"
+          description: Second argument (PT_REGS_PARM2) at kprobe entry
+      arg2:
+        annotations:
+          columns.hex: "true"
+          description: Third argument (PT_REGS_PARM3) at kprobe entry
+      arg3:
+        annotations:
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: Fourth argument (PT_REGS_PARM4) at kprobe entry
+      arg4:
+        annotations:
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: Fifth argument (PT_REGS_PARM5) at kprobe entry
+      func:
+        annotations:
+          columns.width: "24"
+          description: 'Kernel function the probe was attached to for system-wide/cgroup-level
+            hooks (e.g. CFS scheduler fns) proc.* names the INCIDENTALLY-running task,
+            not a single owning cgroup/container, so runtime.containerName may be
+            empty by design — the raw cfs_rq/arg pointers are the ground truth; do
+            not infer container identity from the running task.'
+      phase:
+        annotations:
+          columns.width: "6"
+          description: enter (kprobe) or ret (kretprobe)
+      phase_raw:
+        annotations:
+          description: 'Raw integer backing the enter/ret phase column (0=enter kprobe, 1=ret kretprobe).'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          columns.hex: "true"
+          description: Return value (kretprobe)
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_blk:
+    fields:
+      bytes:
+        annotations:
+          value.unit: "bytes"
+          description: 'Request size in bytes'
+      dev:
+        annotations:
+          description: 'Device (major<<20|minor)'
+      is_write:
+        annotations:
+          description: '1 = write, 0 = read'
+      latency_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          description: 'Issue (block_io_start) -> done (block_io_done) latency in ns'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      req_op:
+        annotations:
+          description: '[ENRICH] block request op (0=READ 1=WRITE 2=FLUSH 3=DISCARD 9=WRITE_ZEROES) — explains a 0-byte high-latency request (FLUSH/barrier carries no payload, so bytes==0 is expected, not missing data)'
+      queue_depth:
+        annotations:
+          value.unit: "count"
+          value.semantics: "instantaneous_snapshot"
+          description: '[ENRICH] in-flight block requests (device queue depth) this I/O observed at issue; rising queue_depth with rising latency_ns is the device-saturation signal (bottleneck is the device, not the caller).'
+      sector:
+        annotations:
+          value.unit: "count"
+          description: 'Starting sector'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_cuda:
+    fields:
+      is_runtime:
+        annotations:
+          description: '0 = libcuda driver API (cuMem*), 1 = libcudart runtime API (cuda*)'
+      op_raw:
+        annotations:
+          description: 'Raw integer enum backing the decoded column of the same name; prefer the decoded twin field.'
+      pad:
+        annotations:
+          description: 'Struct alignment padding; no semantic value, ignore.'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      ptr:
+        annotations:
+          value.unit: "address"
+          description: 'Device/host pointer returned by the allocator (0 on alloc_fail)'
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          description: 'CUDA return code (0 == CUDA_SUCCESS)'
+      size:
+        annotations:
+          value.unit: "bytes"
+          description: 'Allocation size in bytes (alloc); size of the freed block if known (free)'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_cuprof:
+    fields:
+      bx:
+        annotations:
+          description: 'Block dim X (launch)'
+      by:
+        annotations:
+          description: 'Block dim Y (launch)'
+      bytes:
+        annotations:
+          value.unit: "bytes"
+          description: 'Transfer size in bytes (memcpy_h2d/d2h)'
+      bz:
+        annotations:
+          description: 'Block dim Z (launch)'
+      duration_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          description: 'Wall-clock of the call in ns (sync); 0 otherwise'
+      gpu_op_raw:
+        annotations:
+          description: 'Raw integer enum backing the decoded column of the same name; prefer the decoded twin field.'
+      gx:
+        annotations:
+          description: 'Grid dim X (launch)'
+      gy:
+        annotations:
+          description: 'Grid dim Y (launch)'
+      gz:
+        annotations:
+          description: 'Grid dim Z (launch)'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          description: 'CUDA return code (0 == CUDA_SUCCESS)'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_fs:
+    fields:
+      count:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "per_call_transfer_size"
+          description: 'Requested bytes (read/write); 0 for open'
+      fname:
+        annotations:
+          description: 'Leaf filename of the target (e.g. "app.conf") for read/write/open, or the requested path for a failing open — answers WHICH file the I/O hit (empty only if the dentry was unavailable)'
+      fs_op_raw:
+        annotations:
+          description: 'Raw integer enum backing the decoded column of the same name; prefer the decoded twin field.'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          description: 'Bytes transferred (read/write) OR open result (0 ok / -errno)'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_heap:
+    fields:
+      heap_op_raw:
+        annotations:
+          description: 'Raw integer enum backing the decoded column of the same name; prefer the decoded twin field.'
+      old_ptr:
+        annotations:
+          value.unit: "address"
+          description: 'realloc: the pointer being resized; 0 otherwise'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      ptr:
+        annotations:
+          value.unit: "address"
+          description: 'Returned ptr (alloc) or freed ptr (free)'
+      size:
+        annotations:
+          value.unit: "bytes"
+          description: 'Requested bytes (alloc family); 0 for free'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_irq:
+    fields:
+      duration_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          description: 'Softirq entry->exit service time in ns'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+      vec:
+        annotations:
+          value.unit: "count"
+          description: 'Softirq vector (0=HI 1=TIMER 2=NET_TX 3=NET_RX 4=BLOCK 6=TASKLET 7=SCHED 9=RCU)'
+  mep_lock:
+    fields:
+      addr:
+        annotations:
+          value.unit: "address"
+          description: 'Mutex/cond object pointer (groups waits by lock)'
+      duration_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          description: 'Time the thread was BLOCKED in the call (ns) — the contention cost'
+      holder_tid:
+        annotations:
+          description: '''TID that HELD this lock when the waiter blocked — the contention culprit to investigate (0 = uncontended/unknown). Correct for default'
+      lock_op_raw:
+        annotations:
+          description: 'Raw integer enum backing the decoded column of the same name; prefer the decoded twin field.'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          description: 'pthread return (0 == success)'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_memsnap:
+    fields:
+      dev_free:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "instantaneous_snapshot"
+          description: 'Device free VRAM bytes right now (device rows only)'
+      dev_total:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "instantaneous_snapshot"
+          description: 'Device total VRAM bytes (device rows only)'
+      dev_used:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "instantaneous_snapshot"
+          description: 'Device used VRAM bytes right now (device rows only) — if dev_used is high but no single PID has a large active working set, the GPU is over-reserved'
+      gpu_pid:
+        annotations:
+          description: 'PID that currently HOLDS GPU memory (from the NVML running-process table); 0 for device rows'
+      memsnap_op_raw:
+        annotations:
+          description: 'Raw integer enum backing the decoded column of the same name; prefer the decoded twin field.'
+      pad:
+        annotations:
+          description: 'Struct alignment padding; no semantic value, ignore.'
+      pad2:
+        annotations:
+          description: 'Struct alignment padding; no semantic value, ignore.'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      recent_sm_util:
+        annotations:
+          value.unit: "percent"
+          value.semantics: "interval_averaged_5s"
+          description: 'Most-recent GPU SM (compute) % for this holding PID, joined in-kernel from the NVML per-process utilization table (0 = this PID did no GPU compute in the last 5s even though it still holds used_gpu_mem)'
+      reserved_unused_bytes:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "instantaneous_snapshot"
+          description: 'DERIVED per-PID enrichment: bytes of GPU memory this PID holds while its recent SM compute is ~0% — i.e. an idle, over-allocated reservation occupying VRAM without doing compute work. 0 when the PID is actively computing. Sum this across PIDs to quantify reclaimable over-allocation when the device is full but utilization is low'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+      used_gpu_mem:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "instantaneous_snapshot"
+          description: 'Bytes this PID currently RESERVES on the GPU right now (standing snapshot, not a delta) — compare against its active working set (reservation vs. what is actually used)'
+  mep_mm:
+    fields:
+      duration_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          description: 'Direct-reclaim wall-clock in ns (reclaim); 0 for fault'
+      mm_op_raw:
+        annotations:
+          description: 'Raw integer enum backing the decoded column of the same name; prefer the decoded twin field.'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          description: 'reclaim: nr pages reclaimed; fault: 0'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_net:
+    fields:
+      bytes:
+        annotations:
+          value.unit: "bytes"
+          description: 'Bytes queued for send (sendmsg); 0 otherwise'
+      connect_latency_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          description: '[ENRICH] tcp_v4_connect entry->return latency in ns (connect op only; 0 otherwise) — measures slow outbound connect / connect-to-established time'
+      daddr:
+        annotations:
+          description: 'Destination IPv4 (network order)'
+      dport:
+        annotations:
+          description: 'Destination TCP port (host order)'
+      net_op_raw:
+        annotations:
+          description: 'Raw integer enum backing the decoded column of the same name; prefer the decoded twin field.'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      retrans_out:
+        annotations:
+          value.unit: "count"
+          value.semantics: "cumulative"
+          description: '[ENRICH] cumulative retransmits for this connection (icsk_retransmits); climbs under a blackhole/loss storm vs 0-1 for a one-off'
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          description: 'connect result at tcp_v4_connect return: 0 = SYN sent OK, negative errno = SYNCHRONOUS failure (e.g. -99 EADDRNOTAVAIL, -101 ENETUNREACH, -113 EHOSTUNREACH). Async refusal/timeout (post-SYN RST/ETIMEDOUT) is NOT here — it surfaces as a retransmit row + tcp_state, so retval==0 alone does not prove the connection established.'
+      saddr:
+        annotations:
+          description: 'Source IPv4 (network order)'
+      sport:
+        annotations:
+          description: 'Source TCP port (host order)'
+      tcp_state:
+        annotations:
+          description: '[ENRICH] TCP state: on connect = state at tcp_v4_connect return; on retransmit = state at loss (1=ESTABLISHED mid-stream, 2=SYN_SENT connect-time blackhole)'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_runq:
+    fields:
+      cpu:
+        annotations:
+          value.unit: "count"
+          description: 'CPU the task was scheduled onto'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      runq_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          description: 'Run-queue latency: enqueue (ttwu_do_activate) -> on-cpu (sched_switch) in ns'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_smutil:
+    fields:
+      mem_util:
+        annotations:
+          value.unit: "percent"
+          value.semantics: "interval_averaged_5s"
+          description: 'Percent of GPU framebuffer-bandwidth this PID is actively using right now (0-100)'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      sm_util:
+        annotations:
+          value.unit: "percent"
+          value.semantics: "interval_averaged_5s"
+          description: 'Percent of GPU SM (compute) capacity this PID is actively using right now (0-100). Pair with cuda_memsnapshot.used_gpu_mem: a PID with large used_gpu_mem but sm_util near 0 holds VRAM without doing compute work. NOTE: the idle-VRAM cross-product fields recent_sm_util / reserved_unused_bytes live on the cuda_memsnapshot datasource (mep_memsnap), NOT on mep_smutil — filter/group_by those THERE.'
+      smu_pid:
+        annotations:
+          description: 'PID whose GPU compute utilization this row reports (from the NVML per-process utilization table)'
+      smutil_op_raw:
+        annotations:
+          description: 'Raw integer enum backing the decoded column of the same name; prefer the decoded twin field.'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_sys:
+    fields:
+      arg0:
+        annotations:
+          columns.hex: "true"
+          description: First syscall argument (sys_enter)
+      arg1:
+        annotations:
+          columns.hex: "true"
+          description: Second syscall argument (sys_enter)
+      arg2:
+        annotations:
+          columns.hex: "true"
+          description: Third syscall argument (sys_enter)
+      arg3:
+        annotations:
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: Fourth syscall argument (sys_enter)
+      arg4:
+        annotations:
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: Fifth syscall argument (sys_enter)
+      arg5:
+        annotations:
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: Sixth syscall argument (sys_enter)
+      duration_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          columns.width: "14"
+          description: 'per-call enter->ret wall-clock in ns (ret rows; 0 on
+            enter). Removes manual enter/ret pairing for fsync/read latency.'
+          formatters.duration.target: duration
+      phase:
+        annotations:
+          columns.width: "6"
+          description: enter (sys_enter) or ret (sys_exit)
+      phase_raw:
+        annotations:
+          description: 'Raw integer backing the enter/ret phase column (0=enter kprobe, 1=ret kretprobe).'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns) captured at the probe.'
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          columns.hex: "true"
+          description: Syscall return value (sys_exit)
+      syscall:
+        annotations:
+          columns.width: "18"
+          description: Decoded syscall name (e.g. SYS_OPENAT), auto-derived from syscall_nr_raw
+            by IG's syscall formatter.
+      syscall_nr_raw:
+        annotations:
+          columns.hidden: "true"
+          description: Syscall number (raw). The decoded name is in the `syscall`
+            field (SYS_<NAME>); this raw number is hidden by default.
+          formatters.syscall.target: syscall
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mm_events:
+    fields:
+      duration_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          columns.width: "14"
+          description: Direct-reclaim wall-clock in ns (reclaim); 0 for fault
+          formatters.duration.target: duration
+      mm_op:
+        annotations:
+          columns.width: "10"
+          description: 'MM op: fault (handle_mm_fault) or reclaim (try_to_free_pages
+            direct reclaim)'
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          columns.width: "12"
+          description: 'reclaim: nr pages reclaimed; fault: 0'
+  net_events:
+    fields:
+      bytes:
+        annotations:
+          value.unit: "bytes"
+          columns.width: "12"
+          description: Bytes queued for send (sendmsg); 0 otherwise
+      connect_latency_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          columns.width: "14"
+          description: '[ENRICH] tcp_v4_connect entry->return latency in ns (connect
+            op only; 0 otherwise) — measures slow outbound connect / connect-to-established
+            time'
+          formatters.duration.target: connect_latency
+      daddr:
+        annotations:
+          columns.hex: "true"
+          description: Destination IPv4 (network order)
+      dport:
+        annotations:
+          columns.width: "8"
+          description: Destination TCP port (host order)
+      net_op:
+        annotations:
+          columns.width: "12"
+          description: 'Net op: connect (tcp_v4_connect), retransmit (tcp_retransmit_skb),
+            sendmsg (tcp_sendmsg), udp_send (udp_sendmsg), udp_recv (udp_recvmsg)'
+      retrans_out:
+        annotations:
+          value.unit: "count"
+          value.semantics: "cumulative"
+          columns.width: "11"
+          description: '[ENRICH] cumulative retransmits for this connection (icsk_retransmits);
+            climbs under a blackhole/loss storm vs 0-1 for a one-off'
+      retval:
+        annotations:
+          value.unit: "errno_or_retcode"
+          columns.hex: "true"
+          description: 'connect result at tcp_v4_connect return: 0 = SYN sent OK,
+            negative errno = SYNCHRONOUS failure (e.g. -99 EADDRNOTAVAIL, -101 ENETUNREACH,
+            -113 EHOSTUNREACH). Async refusal/timeout (post-SYN RST/ETIMEDOUT) is NOT here —
+            it surfaces as a retransmit row + tcp_state, so retval==0 alone does not prove the
+            connection established.'
+      saddr:
+        annotations:
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: Source IPv4 (network order)
+      sport:
+        annotations:
+          columns.hidden: "true"
+          columns.width: "8"
+          description: Source TCP port (host order)
+      tcp_state:
+        annotations:
+          columns.width: "9"
+          description: '[ENRICH] TCP state: on connect = state at tcp_v4_connect return;
+            on retransmit = state at loss (1=ESTABLISHED mid-stream, 2=SYN_SENT connect-time
+            blackhole)'
+  runq_events:
+    fields:
+      cpu:
+        annotations:
+          value.unit: "count"
+          columns.width: "6"
+          description: CPU the task was scheduled onto
+      runq_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          columns.width: "14"
+          description: 'Run-queue latency: enqueue (ttwu_do_activate) -> on-cpu (sched_switch)
+            in ns'
+          formatters.duration.target: runq_latency
+  smutil_events:
+    fields:
+      mem_util:
+        annotations:
+          value.unit: "percent"
+          value.semantics: "interval_averaged_5s"
+          columns.width: "8"
+          description: Percent of GPU framebuffer-bandwidth this PID is actively using
+            right now (0-100)
+      sm_util:
+        annotations:
+          value.unit: "percent"
+          value.semantics: "interval_averaged_5s"
+          columns.width: "8"
+          description: 'Percent of GPU SM (compute) capacity this PID is actively
+            using right now (0-100). Pair with cuda_memsnapshot.used_gpu_mem: a PID
+            with large used_gpu_mem but sm_util near 0 holds VRAM without doing compute
+            work'
+      smu_pid:
+        annotations:
+          columns.width: "10"
+          description: PID whose GPU compute utilization this row reports (from the
+            NVML per-process utilization table)
+      smutil_op:
+        annotations:
+          columns.width: "10"
+          description: 'Row kind: proc = per-PID standing GPU compute-utilization
+            sample'
+  symbols:
+    fields:
+      addr:
+        annotations:
+          value.unit: "address"
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: Kernel symbol address
+      module:
+        annotations:
+          columns.width: "20"
+          description: Owning kernel module (empty for vmlinux/built-in)
+      name:
+        annotations:
+          columns.width: "40"
+          description: Symbol name (an attachable kernel function when type is t/T)
+      type:
+        annotations:
+          columns.width: "4"
+          description: kallsyms type char (t/T text, d/D data, ...)
+params:
+  ebpf:
+    ksym_filter:
+      key: filter
+      defaultValue: ""
+      description: '[list_attachable] Only return symbols whose name starts with this
+        prefix, e.g. tcp_ or vfs_. Empty = all symbols.'
+    ksym_max:
+      key: max
+      defaultValue: "0"
+      description: '[list_attachable] Cap the number of symbols returned (0 = unlimited).
+        kallsyms has ~300k entries; a bound keeps the response small for an agent.
+        Combine with filter/type to narrow which symbols are returned.'
+    ksym_type:
+      key: type
+      defaultValue: ""
+      description: '[list_attachable] Only return symbols of this kallsyms type char,
+        e.g. t/T for text (functions). Empty = all types. Case-insensitive.'
+  wasm:
+    capability:
+      key: capability
+      defaultValue: attach
+      description: 'Which capability to run. CORE: attach (kprobe/kretprobe on a kernel
+        function), attach_uprobe (uprobe/uretprobe on a userspace <lib>:<symbol>),
+        trace_syscall (raw_syscalls for a pid), cuda_memtrace (CUDA GPU alloc/free
+        leak tracing), cuda_memsnapshot (STANDING per-PID GPU memory residency via
+        NVML snapshot — how much VRAM each PID holds even when alloc/free is quiet),
+        cuda_smutil (STANDING per-PID GPU COMPUTE/SM utilization % via NVML snapshot
+        — whether each PID is actually using the SMs or just holding memory while
+        idle), list_attachable (enumerate kallsyms). ENRICHED swiss-army families
+        (decoded per-subsystem columns, no attach target needed): cuda_profile (GPU
+        launch/sync/copy activity; supports cuda_op=copy|h2d|d2h to isolate the PCIe
+        host<->device transfer rows — which carry the byte volume proving a copy/PCIe
+        bottleneck — from the high-rate cuLaunchKernel flood), lock_trace (userspace
+        mutex/cond wait), heap_profile (libc malloc/free churn+leak), net_trace (TCP
+        connect/retransmit/sendmsg), fs_trace (VFS read/write/open; per-call file
+        path, bytes, latency, and syscall return code/errno; supports fs_op=fault|filp_open
+        to isolate FAILING opens such as openat->ENOENT from read/write noise), mm_trace
+        (page-fault + direct reclaim), irq_trace (softirq service time), block_io
+        (per-request block latency), runq_lat (scheduler run-queue latency). NOTE on the NVML per-PID capabilities (cuda_memsnapshot/cuda_smutil): per-process GPU accounting (nvmlDeviceGetComputeRunningProcesses / GetProcessUtilization) needs an active CUDA context and sufficient permission, and is frequently STRUCTURALLY EMPTY inside a containerized pod — gpu_pid=0 / used_gpu_mem=0 for proc rows is EXPECTED there and is NOT an error or an attach failure. When proc rows are empty, read the device-wide rows (dev_total/dev_used/dev_free) as the authoritative VRAM signal instead of re-querying. A one-row mep_coverage record is emitted each run listing the attached targets + matched pid filter so attached-but-idle is distinguishable from attach-failed.'
+      possibleValues:
+      - attach
+      - attach_uprobe
+      - trace_syscall
+      - cuda_memtrace
+      - cuda_memsnapshot
+      - cuda_smutil
+      - list_attachable
+      - cuda_profile
+      - lock_trace
+      - heap_profile
+      - net_trace
+      - fs_trace
+      - mm_trace
+      - irq_trace
+      - block_io
+      - runq_lat
+    cuda_op:
+      key: cuda_op
+      defaultValue: ""
+      description: '[cuda_profile ONLY] Server-side op-class filter applied IN-KERNEL
+        (filter_cuda_op map) so the low-frequency PCIe transfer rows are not truncated
+        out of the result by the high-rate cuLaunchKernel stream. Empty/all = every
+        GPU op. launch = only kernel launches. sync = only stream/ctx synchronize.
+        copy = only host<->device memcpy rows (cuMemcpyHtoD + cuMemcpyDtoH) — the
+        ones carrying the byte volume that proves a PCIe COPY bottleneck. h2d / d2h
+        = only that single transfer direction. Use cuda_op=copy (or h2d) when a workload
+        looks GPU-stalled on data movement (large host<->device transfers, unpinned
+        memory) and the cuLaunchKernel flood would otherwise bury the few memcpy rows
+        that carry the transferred bytes.'
+      possibleValues:
+      - all
+      - launch
+      - sync
+      - copy
+      - h2d
+      - d2h
+    fs_op:
+      key: fs_op
+      defaultValue: ""
+      description: '[fs_trace ONLY] Server-side op-class filter applied IN-KERNEL
+        (filter_fs_op map) so low-frequency diagnostic rows are not truncated out
+        of the result by the high-volume vfs_read/vfs_write stream. Empty/all = every
+        op. read|write|open = only that VFS op. filp_open = only failing do_filp_open
+        events (the path-resolution layer that sees openat()->ENOENT before vfs_open).
+        fault = ANY fs op whose return value is an error (retval<0) — the fastest
+        way to surface a failing-open storm (e.g. a service repeatedly opening a MISSING
+        config file) without wading through gigabytes of successful read/write traffic.
+        close = only filp_close releases (the RELEASE side; pair with open for an open-minus-close fd-leak balance). The tracer''s own ig / ig-mcp-server I/O is ALWAYS excluded regardless of
+        this setting.'
+      possibleValues:
+      - all
+      - read
+      - write
+      - open
+      - filp_open
+      - fault
+      - close
+    function:
+      key: function
+      defaultValue: ""
+      description: '[attach] Kernel function symbol to attach to at run time, e.g.
+        do_unlinkat or tcp_v4_connect. Validated against /proc/kallsyms before load.'
+    mode:
+      key: mode
+      defaultValue: kprobe_kretprobe
+      description: '[attach] Probe kind: kprobe, kretprobe or kprobe_kretprobe. [attach_uprobe]
+        Probe kind: uprobe, uretprobe or uprobe_uretprobe (default uprobe_uretprobe
+        when capability=attach_uprobe).'
+    pid:
+      key: pid
+      defaultValue: ""
+      description: '[trace_syscall + enriched families] Restrict tracing to this PID.
+        Empty = all processes. Gated IN-KERNEL via the shared filter_pid map: trace_syscall
+        + the process-context families (cuda_memtrace, cuda_profile, lock_trace, heap_profile,
+        net_trace, fs_trace, mm_trace) only emit events for the matching tgid. System-wide
+        families (irq_trace, block_io, runq_lat) fire in softirq/scheduler context
+        where the running task is not the subject, so a pid filter does NOT apply
+        to them (use proc.pid in the output to post-filter if needed). use
+        the `pid` param here (BPF filter_pid map) to scope trace_syscall — do NOT
+        use operator.oci.wasm.pid, which only targets uprobe ATTACH and will return
+        an empty trace_syscall set.'
+    syscall:
+      key: syscall
+      defaultValue: ""
+      description: '[trace_syscall] Syscall name to trace, e.g. openat, execve, kill.
+        Empty = trace every syscall. Resolved to a number via the kernel syscall table.'
+    target:
+      key: target
+      defaultValue: ""
+      description: '[attach_uprobe] Userspace attach target as <lib-or-path>:<symbol>.
+        The left side is an absolute .so path or a library base-name resolved via
+        the target process ld.so.cache (e.g. libc, libssl, /usr/lib/x86_64-linux-gnu/libcuda.so.1);
+        the right side is an exported symbol (e.g. malloc, SSL_read, cuMemAlloc_v2).
+        Resolved by IG''s uprobetracer at attach time.'
