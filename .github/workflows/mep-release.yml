@@ -88,6 +88,8 @@ jobs:
       # needs clang (program.bpf.c) + llvm-strip; go is provided by setup-go.
       - name: Install BPF build tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang llvm
+      - name: Install gadget BPF headers
+        run: sudo make install-headers
       - name: Build host ig
         run: make ig
       - name: Login to GHCR
