@@ -1,0 +1,104 @@
+name: MEP release (ig binary + gadget image)
+
+# Publishes the artifacts needed to run mcp_ebpf_proxy (MEP) on a box WITHOUT a
+# build toolchain:
+#   * static, patched `ig` per arch -> GitHub Release assets (curl-able)
+#   * the `mcp_ebpf_proxy` gadget OCI image (multi-arch) -> GHCR
+#
+# Trigger by pushing a tag like `mep-2026.07.01` (or manually via the Actions
+# tab). The gadget image is auto-pulled on the target by the daemon because the
+# ig-mcp-server mep patch defaults the OCI pull policy to "missing".
+
+on:
+  push:
+    tags:
+      - 'mep-*'
+  workflow_dispatch:
+    inputs:
+      gadget_image:
+        description: 'GHCR ref to push the mcp_ebpf_proxy gadget image to'
+        required: false
+        default: 'ghcr.io/vfalico/gadgets/mcp_ebpf_proxy:mep'
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: 1.26.4
+  GADGET_IMAGE_DEFAULT: ghcr.io/vfalico/gadgets/mcp_ebpf_proxy:mep
+
+jobs:
+  build-ig:
+    name: Build static ig (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # attach the tarball to the release
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ amd64, arm64 ]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      # `make ig-linux-<arch>` builds the static binary inside the ig.Dockerfile
+      # via buildx (cross-arch through QEMU) and extracts it — no Go on the runner.
+      - name: Build ig-linux-${{ matrix.arch }}
+        run: make ig-linux-${{ matrix.arch }}
+      - name: Package tarball
+        run: |
+          install -Dm0755 "ig-linux-${{ matrix.arch }}" "dist/ig"
+          tar -C dist -czf "ig-mep-linux-${{ matrix.arch }}.tar.gz" ig
+          sha256sum "ig-mep-linux-${{ matrix.arch }}.tar.gz" > "ig-mep-linux-${{ matrix.arch }}.tar.gz.sha256"
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ig-mep-linux-${{ matrix.arch }}
+          path: |
+            ig-mep-linux-${{ matrix.arch }}.tar.gz
+            ig-mep-linux-${{ matrix.arch }}.tar.gz.sha256
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2.4.1
+        with:
+          files: |
+            ig-mep-linux-${{ matrix.arch }}.tar.gz
+            ig-mep-linux-${{ matrix.arch }}.tar.gz.sha256
+
+  push-gadget:
+    name: Build & push mcp_ebpf_proxy gadget image to GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # push to ghcr.io/<owner>/...
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # Build the patched ig on the host; the gadget's BPF/wasm are compiled
+      # inside the default builder container (docker), so no clang on the runner.
+      - name: Build host ig
+        run: make ig
+      - name: Login to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # `ig image build` compiles BOTH amd64 and arm64 BPF objects by default,
+      # producing a single multi-arch gadget image — one build, one push.
+      - name: Build & push gadget image
+        env:
+          GADGET_IMAGE: ${{ github.event.inputs.gadget_image || env.GADGET_IMAGE_DEFAULT }}
+        run: |
+          ./ig image build -t "$GADGET_IMAGE" gadgets/mcp_ebpf_proxy
+          ./ig image push "$GADGET_IMAGE"
