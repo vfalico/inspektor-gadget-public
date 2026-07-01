@@ -87,7 +87,7 @@ jobs:
       # resolves on the host, not inside the isolated builder container. --local
       # needs clang (program.bpf.c) + llvm-strip; go is provided by setup-go.
       - name: Install BPF build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang llvm
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev
       - name: Install gadget BPF headers
         run: sudo make install-headers
       - name: Build host ig
