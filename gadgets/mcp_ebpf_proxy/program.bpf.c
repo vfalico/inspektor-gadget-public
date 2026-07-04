@@ -2145,6 +2145,22 @@ struct {
 	__type(value, struct net_rollup_val);
 } net_rollup_map SEC(".maps");
 
+// [absence_assert] absence_lw_map: a DEDICATED persistent mirror of the per-flow write
+// history, keyed identically to net_rollup_map. Written by net_rollup_update,
+// read ONLY by the mep_absence iter/tcp walk. It is intentionally NOT wrapped in
+// a GADGET_MAPITER: per_key_rollup's net_rollup MAPITER is fetched on its own cycle, so a
+// co-resident iter/tcp snapshot can observe net_rollup_map at a point where the
+// per_key_rollup datasource lifecycle has not (re)published this flow. A dedicated map
+// that only ever accumulates (never emptied by a MAPITER fetch) gives the
+// absence verdict a stable, monotonic write-history to read regardless of
+// whether per_key_rollup is co-selected.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct net_rollup_key);
+	__type(value, struct net_rollup_val);
+} absence_lw_map SEC(".maps");
+
 // GADGET_MAPITER -> IG periodically fetches net_rollup_map into the `net_rollup`
 // datasource, flattening key+value struct members into columns.
 GADGET_MAPITER(net_rollup, net_rollup_map);
@@ -2200,6 +2216,8 @@ static __always_inline void net_rollup_update(struct net_event *e)
 	__u8 st = e->tcp_state;
 	if (st == 8 || st == 4 || st == 5 || st == 9 || st == 11)
 		__sync_fetch_and_add(&v->closing_evts, 1);
+	// [absence_assert] persist the just-updated write history for the absence walk
+	bpf_map_update_elem(&absence_lw_map, &k, v, BPF_ANY);
 }
 
 // Bump the inbound-RST counter for a flow. Called from the item-12 tcp_reset
@@ -3822,6 +3840,8 @@ struct absence_entry {
 	__u64 observed_max_gap_ns;	// largest inter-write gap ever seen (net_rollup gap_max)
 	__u64 write_count;		// writes/net events folded into this flow (net_rollup count)
 	__u64 closing_evts;		// writes during teardown -- write-after-peer-FIN shape
+	__u8  dbg_abs_hit;		// DIAG: reader key hit absence_lw_map?
+	__u8  dbg_nr_hit;		// DIAG: reader key hit net_rollup_map?
 };
 
 GADGET_ITER(mep_absence, absence_entry, mep_absence);
@@ -3854,7 +3874,10 @@ int mep_absence(struct bpf_iter__tcp *ctx)
 	struct net_rollup_key k = {};
 	k.daddr = e.daddr; k.saddr = e.saddr;
 	k.dport = e.dport; k.sport = e.sport;
-	struct net_rollup_val *v = bpf_map_lookup_elem(&net_rollup_map, &k);
+	struct net_rollup_val *v = bpf_map_lookup_elem(&absence_lw_map, &k);
+	struct net_rollup_val *vn = bpf_map_lookup_elem(&net_rollup_map, &k); // DIAG
+	e.dbg_abs_hit = v  ? 1 : 0;  // DIAG
+	e.dbg_nr_hit  = vn ? 1 : 0;  // DIAG
 
 	if (!v || v->count == 0) {
 		e.verdict = ABSENCE_NO_HISTORY;
