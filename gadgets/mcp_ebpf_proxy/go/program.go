@@ -49,6 +49,7 @@ const (
 	// attach_uprobe: generic retargetable userspace uprobe/uretprobe.
 	progUprobe    = "mep_uprobe"
 	progUretprobe = "mep_uretprobe"
+	progSocksnap  = "mep_socksnap"
 )
 
 // cudaPrograms are the fixed CUDA alloc/free uprobes for the cuda_memtrace
@@ -176,7 +177,7 @@ var enrichedFamilies = [][]string{
 // every program in the object; any not enabled by the chosen capability is
 // disabled with the sentinel.
 var allPrograms = append([]string{
-	progKprobe, progKretprobe, progSysEnter, progSysExit, progKsym, progDeath,
+	progKprobe, progKretprobe, progSysEnter, progSysExit, progKsym, progDeath, progSocksnap,
 	progUprobe, progUretprobe,
 }, cudaPrograms...)
 
@@ -457,6 +458,8 @@ func gadgetPreStart() int32 {
 		return preStartAttachUprobe()
 	case "trace_syscall":
 		return preStartTraceSyscall()
+	case "sock_snapshot":
+		return preStartSockSnapshot()
 	case "cuda_memtrace":
 		return preStartCudaMemtrace()
 	case "cuda_memsnapshot":
@@ -887,6 +890,14 @@ func putFilter(mapName string, value uint64) int32 {
 }
 
 // -------------------------------------------------------- list_attachable ----
+
+func preStartSockSnapshot() int32 {
+	// iter/tcp: keep the SEC-default attach target (no kprobe/tp sentinel),
+	// disable every other program. Mirrors preStartListAttachable (iter/ksym).
+	enableExact(map[string]string{progSocksnap: ""})
+	api.Infof("mcp_ebpf_proxy[sock_snapshot]: snapshotting live TCP sockets (ss-in-eBPF)")
+	return 0
+}
 
 func preStartListAttachable() int32 {
 	// The `filter` (name prefix) and `type` (kallsyms type char) selectors are

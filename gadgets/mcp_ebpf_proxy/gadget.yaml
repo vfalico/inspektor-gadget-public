@@ -943,6 +943,65 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column.'
+  mep_socksnap:
+    fields:
+      saddr:
+        annotations:
+          columns.hex: "true"
+          description: 'Local IPv4 (network order).'
+      daddr:
+        annotations:
+          columns.hex: "true"
+          description: 'Remote IPv4 (network order).'
+      sport:
+        annotations:
+          description: 'Local port (host order).'
+      dport:
+        annotations:
+          description: 'Remote port (host order).'
+      family:
+        annotations:
+          description: 'Address family (2=AF_INET, 10=AF_INET6).'
+      state:
+        annotations:
+          description: '[sock_snapshot] Current TCP state at snapshot time (1=ESTABLISHED,2=SYN_SENT,6=TIME_WAIT,7=CLOSE,10=LISTEN,12=NEW_SYN_RECV,...). Point-in-time walk of every live TCP socket, NOT an event.'
+      netns_id:
+        annotations:
+          template: ns
+          description: 'Network namespace inode id of the socket.'
+      sock_kind:
+        annotations:
+          columns.width: "9"
+          description: '[sock_snapshot] 1=full tcp_sock (all detail fields valid), 2=TIME_WAIT mini-sock (detail zeroed), 3=NEW_SYN_RECV request sock / half-open (detail zeroed).'
+      srtt_us:
+        annotations:
+          description: '[sock_snapshot] Smoothed round-trip time (raw, usec>>3). Full sockets only.'
+      rto:
+        annotations:
+          description: '[sock_snapshot] Retransmission timeout (icsk_rto, raw). Full sockets only.'
+      retransmits:
+        annotations:
+          columns.width: "11"
+          description: '[sock_snapshot] Current retransmit backoff count (icsk_retransmits). >0 = this socket is actively retransmitting (peer not ACKing) -- the ss unacked/backoff signal. Full sockets only.'
+      snd_cwnd:
+        annotations:
+          description: '[sock_snapshot] Congestion window in segments. Full sockets only.'
+      sndq_bytes:
+        annotations:
+          columns.width: "10"
+          description: '[sock_snapshot] Bytes currently queued in the send buffer (sk_wmem_queued). Large & growing on an ESTABLISHED socket = app wrote data the peer is not ACKing (or a stalled receiver). Full sockets only.'
+      unacked_bytes:
+        annotations:
+          columns.width: "13"
+          description: '[sock_snapshot] write_seq - snd_una: bytes sent but not yet ACKed (in flight). Full sockets only.'
+      rcvq_bytes:
+        annotations:
+          columns.width: "10"
+          description: '[sock_snapshot] rcv_nxt - copied_seq: bytes received into the socket but not yet read by the app. Large = app not draining reads. Full sockets only.'
+      last_snd_ts:
+        annotations:
+          columns.hidden: "true"
+          description: '[sock_snapshot] tp->lsndtime (raw) -- last data-send timestamp, for idle-duration reasoning. Full sockets only.'
   mep_sys:
     fields:
       arg0:
@@ -1308,7 +1367,7 @@ params:
         path, bytes, latency, and syscall return code/errno; supports fs_op=fault|filp_open
         to isolate FAILING opens such as openat->ENOENT from read/write noise), mm_trace
         (page-fault + direct reclaim), irq_trace (softirq service time), block_io
-        (per-request block latency), runq_lat (scheduler run-queue latency), sock_state (TCP connection-lifecycle tracer via sock/inet_sock_set_state: emits old->new state + 4-tuple on EVERY transition, so SYN_SENT->CLOSE with no ESTABLISHED = refused and ESTABLISHED->CLOSE_WAIT = peer sent FIN first; PLUS affirmative inbound/outbound RST via tcp_reset (reset_dir=1 received) and tcp_v4_send_reset (reset_dir=2 sent), where sk_null=1 flags a kernel RST for a socket that no longer exists (stale/deleted endpoint); datasource mep_sockstate, no attach target). NOTE on the NVML per-PID capabilities (cuda_memsnapshot/cuda_smutil): per-process GPU accounting (nvmlDeviceGetComputeRunningProcesses / GetProcessUtilization) needs an active CUDA context and sufficient permission, and is frequently STRUCTURALLY EMPTY inside a containerized pod — gpu_pid=0 / used_gpu_mem=0 for proc rows is EXPECTED there and is NOT an error or an attach failure. When proc rows are empty, read the device-wide rows (dev_total/dev_used/dev_free) as the authoritative VRAM signal instead of re-querying. A one-row mep_coverage record is emitted each run listing the attached targets + matched pid filter so attached-but-idle is distinguishable from attach-failed.'
+        (per-request block latency), runq_lat (scheduler run-queue latency), sock_state (TCP connection-lifecycle tracer via sock/inet_sock_set_state: emits old->new state + 4-tuple on EVERY transition, so SYN_SENT->CLOSE with no ESTABLISHED = refused and ESTABLISHED->CLOSE_WAIT = peer sent FIN first; PLUS affirmative inbound/outbound RST via tcp_reset (reset_dir=1 received) and tcp_v4_send_reset (reset_dir=2 sent), where sk_null=1 flags a kernel RST for a socket that no longer exists (stale/deleted endpoint); datasource mep_sockstate, no attach target). sock_snapshot (point-in-time walk of EVERY live TCP socket via the in-kernel iter/tcp iterator: current state + srtt/rto + retransmit-backoff + send/recv queue depths + in-flight bytes, i.e. ss(8)-in-eBPF; datasource mep_socksnap, no attach target) complements the event families with "what does this connection look like RIGHT NOW" -- e.g. an ESTABLISHED socket with a large & growing sndq_bytes and retransmits>0 is a peer that stopped ACKing. NOTE on the NVML per-PID capabilities (cuda_memsnapshot/cuda_smutil): per-process GPU accounting (nvmlDeviceGetComputeRunningProcesses / GetProcessUtilization) needs an active CUDA context and sufficient permission, and is frequently STRUCTURALLY EMPTY inside a containerized pod — gpu_pid=0 / used_gpu_mem=0 for proc rows is EXPECTED there and is NOT an error or an attach failure. When proc rows are empty, read the device-wide rows (dev_total/dev_used/dev_free) as the authoritative VRAM signal instead of re-querying. A one-row mep_coverage record is emitted each run listing the attached targets + matched pid filter so attached-but-idle is distinguishable from attach-failed.'
       possibleValues:
       - attach
       - attach_uprobe
@@ -1327,6 +1386,7 @@ params:
       - block_io
       - runq_lat
       - sock_state
+      - sock_snapshot
     cuda_op:
       key: cuda_op
       defaultValue: ""

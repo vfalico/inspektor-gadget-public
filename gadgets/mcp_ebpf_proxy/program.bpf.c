@@ -1195,6 +1195,91 @@ int mep_ksym(struct bpf_iter__ksym *ctx)
 	return 0;
 }
 
+// ============================ [sock_snapshot] sock_snapshot ============================
+// Point-in-time per-socket TCP snapshot (ss(8)-in-eBPF) via the in-kernel TCP
+// iterator (SEC iter/tcp). The kprobe/tracepoint families see EVENTS as they
+// fire; this instead walks EVERY live TCP socket on demand and emits its
+// CURRENT state + timers + queue depths, answering questions no event stream
+// can: "ESTABLISHED but 64 KB stuck in the send-Q and rising" (peer not ACKing
+// / app write-blocked) vs "0 bytes queued, idle 30 s" (healthy-idle). The
+// 4-tuple/state/family come straight off struct sock_common (shared by full,
+// TIME_WAIT and request socks) so per_conn_identity (per_conn_identity) holds for every row
+// uniformly. ss-detail (srtt/rto/retransmits/cwnd/queues) is read ONLY off a
+// full struct tcp_sock*; mini-socks (TIME_WAIT / NEW_SYN_RECV) carry none, so
+// touching tcp_sock detail on them would be a memory-safety bug -- they emit the
+// 4-tuple + state with detail zeroed and sock_kind marking which kind it was.
+struct socksnap_entry {
+	__u32 saddr;		// local IPv4 (network order, like mep_sockstate.saddr)
+	__u32 daddr;		// remote IPv4 (network order)
+	__u16 sport;		// local port (host order)
+	__u16 dport;		// remote port (host order)
+	__u16 family;		// AF_INET(2) / AF_INET6(10)
+	__u16 state;		// current TCP state (1=ESTABLISHED..12=NEW_SYN_RECV)
+	__u32 netns_id;		// network namespace inode id
+	__u8  sock_kind;	// 1=full tcp_sock, 2=TIME_WAIT, 3=request(SYN_RECV half-open)
+	__u32 srtt_us;		// [full] smoothed RTT (tp->srtt_us, raw usec>>3)
+	__u32 rto;		// [full] icsk_rto -- retransmission timeout (raw)
+	__u32 retransmits;	// [full] icsk_retransmits -- current backoff count (>0 = stuck retransmitting)
+	__u32 snd_cwnd;		// [full] congestion window (segments)
+	__u32 sndq_bytes;	// [full] sk_wmem_queued -- bytes in the send queue right now
+	__u32 unacked_bytes;	// [full] write_seq - snd_una -- sent-but-unACKed (in flight)
+	__u32 rcvq_bytes;	// [full] rcv_nxt - copied_seq -- received-but-unread by the app
+	__u64 last_snd_ts;	// [full] tp->lsndtime -- for "idle for N" reasoning
+};
+
+GADGET_ITER(mep_socksnap, socksnap_entry, mep_socksnap);
+
+SEC("iter/tcp")
+int mep_socksnap(struct bpf_iter__tcp *ctx)
+{
+	struct sock_common *skc = ctx->sk_common;
+	struct seq_file *seq = ctx->meta->seq;
+	struct socksnap_entry e = {};
+	__u32 netns = 0;
+
+	if (skc == NULL)
+		return 0;
+
+	// 4-tuple + state + family off sock_common -- valid for full, TIME_WAIT
+	// and request socks alike (per_conn_identity, per_conn_identity, threaded here too).
+	e.saddr  = BPF_CORE_READ(skc, skc_rcv_saddr);
+	e.daddr  = BPF_CORE_READ(skc, skc_daddr);
+	e.sport  = BPF_CORE_READ(skc, skc_num);			// already host order
+	e.dport  = bpf_ntohs(BPF_CORE_READ(skc, skc_dport));	// net -> host
+	e.family = BPF_CORE_READ(skc, skc_family);
+	e.state  = BPF_CORE_READ(skc, skc_state);
+	BPF_CORE_READ_INTO(&netns, skc, skc_net.net, ns.inum);
+	e.netns_id = netns;
+
+	// Only full sockets carry a struct tcp_sock with the ss-detail fields.
+	struct tcp_sock *tp = bpf_skc_to_tcp_sock(skc);
+	if (tp) {
+		__u32 write_seq, snd_una, rcv_nxt, copied_seq;
+		e.sock_kind   = 1;
+		e.srtt_us     = BPF_CORE_READ(tp, srtt_us);
+		e.snd_cwnd    = BPF_CORE_READ(tp, snd_cwnd);
+		e.last_snd_ts = BPF_CORE_READ(tp, lsndtime);
+		e.rto         = BPF_CORE_READ(tp, inet_conn.icsk_rto);
+		e.retransmits = BPF_CORE_READ(tp, inet_conn.icsk_retransmits);
+		e.sndq_bytes  = BPF_CORE_READ(tp, inet_conn.icsk_inet.sk.sk_wmem_queued);
+		write_seq  = BPF_CORE_READ(tp, write_seq);
+		snd_una    = BPF_CORE_READ(tp, snd_una);
+		rcv_nxt    = BPF_CORE_READ(tp, rcv_nxt);
+		copied_seq = BPF_CORE_READ(tp, copied_seq);
+		e.unacked_bytes = write_seq - snd_una;
+		e.rcvq_bytes    = rcv_nxt - copied_seq;
+	} else if (bpf_skc_to_tcp_timewait_sock(skc)) {
+		e.sock_kind = 2;	// TIME_WAIT -- detail stays zeroed
+	} else if (bpf_skc_to_tcp_request_sock(skc)) {
+		e.sock_kind = 3;	// NEW_SYN_RECV half-open -- detail stays zeroed
+	}
+
+	bpf_seq_write(seq, &e, sizeof(e));
+	return 0;
+}
+// ========================== [end sock_snapshot] sock_snapshot =========================
+
+
 
 // ===========================================================================
 // capability: cuda_profile -- CUDA GPU *activity* profiling via uprobes on the
