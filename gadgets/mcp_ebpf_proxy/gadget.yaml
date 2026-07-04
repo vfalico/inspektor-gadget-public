@@ -844,6 +844,55 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_sockpair:
+    fields:
+      down_saddr:
+        annotations:
+          columns.hex: "true"
+          description: '[sockpair_correlate] Downstream (accepted) local IPv4 — proxy-side of the client<->proxy leg.'
+      down_daddr:
+        annotations:
+          columns.hex: "true"
+          description: '[sockpair_correlate] Downstream remote IPv4 — the CLIENT address.'
+      down_sport:
+        annotations:
+          description: '[sockpair_correlate] Downstream local (proxy listen) port.'
+      down_dport:
+        annotations:
+          description: '[sockpair_correlate] Downstream remote (client) port.'
+      up_saddr:
+        annotations:
+          columns.hex: "true"
+          description: '[sockpair_correlate] Upstream local IPv4 — proxy-side of the proxy<->backend leg.'
+      up_daddr:
+        annotations:
+          columns.hex: "true"
+          description: '[sockpair_correlate] Upstream remote IPv4 — the BACKEND the proxy dialed for this client.'
+      up_sport:
+        annotations:
+          description: '[sockpair_correlate] Upstream local (ephemeral) port.'
+      up_dport:
+        annotations:
+          description: '[sockpair_correlate] Upstream remote (backend) port.'
+      up_retval:
+        annotations:
+          description: '[sockpair_correlate] Upstream connect() result: 0=established, <0=-errno (e.g. -111 ECONNREFUSED = proxy could NOT reach the backend for this client — the sockpair_correlate headline signal).'
+      down_state:
+        annotations:
+          description: '[sockpair_correlate] Downstream TCP state at correlation.'
+      up_state:
+        annotations:
+          description: '[sockpair_correlate] Upstream TCP state at correlation.'
+      accept_to_connect_ns:
+        annotations:
+          description: '[sockpair_correlate] Nanoseconds from downstream accept to upstream connect on the same worker tid — the proxy per-request upstream-dial latency.'
+      proc:
+        annotations:
+          description: '[sockpair_correlate] Worker process/thread servicing BOTH legs (Envoy per-worker event loop); tid ties the two sockets together.'
+      timestamp_raw:
+        annotations:
+          columns.hidden: "true"
+          description: 'Correlation time (upstream connect return), raw ktime ns.'
   mep_sockstate:
     fields:
       ss_op:

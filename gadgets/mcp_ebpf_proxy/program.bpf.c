@@ -1884,6 +1884,52 @@ struct net_event {
 GADGET_TRACER_MAP(net_events, 1024 * 256);
 GADGET_TRACER(mep_net, net_events, net_event);
 
+// ============================================================================
+// [sockpair_correlate] sockpair_correlate — link a proxy's DOWNSTREAM (accepted) socket to
+// the UPSTREAM socket it opens on the SAME worker thread. Envoy/HAProxy service
+// both legs from one event-loop tid, so we correlate per-tid: the accepted
+// child sock (inet_csk_accept return) is stashed by tid, and the next
+// tcp_v4_connect return on that tid emits a sockpair row {down 4-tuple, up
+// 4-tuple}. Lives entirely in the net_trace capability (no cross-cap dep).
+struct sockpair_event {
+	gadget_timestamp timestamp_raw;
+	struct gadget_process proc;
+	__u32 down_saddr, down_daddr;	// downstream (client<->proxy) 4-tuple
+	__u16 down_sport, down_dport;
+	__u32 up_saddr, up_daddr;	// upstream (proxy<->backend) 4-tuple
+	__u16 up_sport, up_dport;
+	__s64 up_retval;	// upstream connect result (0=ok, <0=-errno)
+	__u8  down_state, up_state;
+	gadget_duration accept_to_connect_ns;	// accept -> upstream-connect gap
+};
+GADGET_TRACER_MAP(sockpairs, 1024 * 64);
+GADGET_TRACER(mep_sockpair, sockpairs, sockpair_event);
+
+struct mep_pending_accept { struct mep_sockid down; __u64 ts; };
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u32);		// tid
+	__type(value, struct mep_pending_accept);
+} sockpair_pending SEC(".maps");
+
+// inet_csk_accept returns the newly-accepted child struct sock* (the
+// downstream connection). Stash its 4-tuple keyed by the accepting tid.
+SEC("kretprobe/inet_csk_accept")
+int BPF_KRETPROBE(mep_sockpair_accept, struct sock *child)
+{
+	if (!child || !mep_proc_wanted())
+		return 0;
+	struct mep_sockid id;
+	mep_decode_sk(child, &id);
+	if (id.sk_family != AF_INET)	// v4 correlation
+		return 0;
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct mep_pending_accept p = { .down = id, .ts = bpf_ktime_get_boot_ns() };
+	bpf_map_update_elem(&sockpair_pending, &tid, &p, BPF_ANY);
+	return 0;
+}
+
 // [k8s_pod_meta] Publish the REMOTE peer of a net event as a
 // struct gadget_l4endpoint_t so IG's in-tree KubeIPResolver operator (which
 // keys on this exact BTF type) resolves daddr -> podName/namespace/UID +
@@ -2105,6 +2151,29 @@ int BPF_KRETPROBE(mep_net_connect_ret, int ret)
 	net_rollup_update(e);
 	mep_fill_net_ep(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
+	// [sockpair_correlate] if this worker recently accepted a downstream conn, pair it with
+	// this upstream connect (same tid = same proxy worker servicing both legs).
+	{
+		struct mep_pending_accept *pa = bpf_map_lookup_elem(&sockpair_pending, &tid);
+		if (pa) {
+			struct sockpair_event *sp = gadget_reserve_buf(&sockpairs, sizeof(*sp));
+			if (sp) {
+				sp->timestamp_raw = bpf_ktime_get_boot_ns();
+				gadget_process_populate(&sp->proc);
+				sp->down_saddr = pa->down.saddr; sp->down_daddr = pa->down.daddr;
+				sp->down_sport = pa->down.sport; sp->down_dport = pa->down.dport;
+				sp->down_state = pa->down.sk_state;
+				struct mep_sockid uid; mep_decode_sk(sk, &uid);
+				sp->up_saddr = uid.saddr; sp->up_daddr = uid.daddr;
+				sp->up_sport = uid.sport; sp->up_dport = uid.dport;
+				sp->up_state = uid.sk_state; sp->up_retval = ret;
+				sp->accept_to_connect_ns = (sp->timestamp_raw > pa->ts) ?
+					(sp->timestamp_raw - pa->ts) : 0;
+				gadget_submit_buf(ctx, &sockpairs, sp, sizeof(*sp));
+			}
+			bpf_map_delete_elem(&sockpair_pending, &tid);
+		}
+	}
 	return 0;
 }
 

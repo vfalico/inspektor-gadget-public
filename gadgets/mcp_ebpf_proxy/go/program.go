@@ -123,6 +123,7 @@ var heapProfilePrograms = []string{
 var netTracePrograms = []string{
 	"mep_net_connect", "mep_net_connect_ret",
 	"mep_net_retransmit", "mep_net_sendmsg",
+	"mep_sockpair_accept",
 }
 
 // sock_state: TCP connection-lifecycle visibility (sock_state).
