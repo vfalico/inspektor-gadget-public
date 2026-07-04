@@ -428,6 +428,15 @@ datasources:
       sk_family:
         annotations:
           description: '[per_conn_identity attach] Address family of arg0-as-sock (2=AF_INET,10=AF_INET6). 0 => arg0(PARM1) was NOT a struct sock* (regular kprobe target) — ignore the 4-tuple/state fields in that case.'
+      stack_used:
+        annotations:
+          columns.width: "9"
+          description: '[stack_watermark] Bytes of user stack consumed since the outermost uprobe entry of this tid call chain (0 at the outermost frame; climbs with recursion/nesting depth). Watch it march toward the 8MiB thread-stack rlimit to catch runaway recursion (runaway recursion) before SIGSEGV. 0 on kprobe/syscall/net rows.'
+      stack_alarm:
+        annotations:
+          columns.width: "5"
+          value.oneof: '0,1'
+          description: '[stack_watermark] 1 on the one-shot row where stack_used first crossed the stack_watermark_bytes param for this call chain (fires at most once per tid chain). 0 otherwise. Set stack_watermark_bytes (e.g. 6291456 for 6MiB) to arm it.'
       call_depth:
         annotations:
           columns.width: "5"

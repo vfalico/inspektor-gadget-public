@@ -115,6 +115,16 @@ struct event {
 	// the matching value on the paired return. Automates the
 	// entry-vs-return hand-diff (unbalanced depth == a return that never fired).
 	__u32 call_depth;
+	// [stack_watermark] bytes of user stack consumed since the OUTERMOST uprobe
+	// entry of this tid's current call chain (0 at the outermost frame; grows as
+	// recursion/nesting deepens). = entry_sp - PT_REGS_SP(ctx). Lets an MCP client
+	// watch a recursive path march toward the 8MiB thread-stack rlimit (runaway recursion,
+	// stack-exhaustion shape) without hand-diffing frame pointers. 0 on non-uprobe rows.
+	__u64 stack_used;
+	// [stack_watermark] 1 on the ONE-SHOT row where stack_used first crossed the
+	// stack_watermark_bytes threshold for this call chain (else 0). Fires at most
+	// once per tid call chain so a deep recursion does not spam an alarm per frame.
+	__u8  stack_alarm;
 };
 
 GADGET_TRACER_MAP(events, 1024 * 256);
@@ -134,6 +144,7 @@ static __always_inline struct event *mep_new(enum mep_phase phase)
 	e->saddr = e->daddr = 0; e->sport = e->dport = 0;
 	e->sk_state = e->sk_family = 0;
 	e->call_depth = 0;
+	e->stack_used = 0; e->stack_alarm = 0;
 	return e;
 }
 
@@ -578,13 +589,20 @@ int mep_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 // count (enter++ / return--), which gives automatic enter<->return pairing and
 // a per-tid recursion-depth signal. entry_sp is reserved for stack_watermark
 // (stack_watermark) and initialised here so the two items share one map.
-struct mep_uctx { __u32 depth; __u64 entry_sp; };
+struct mep_uctx { __u32 depth; __u64 entry_sp; __u8 alarmed; };
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
 	__type(key, __u32);
 	__type(value, struct mep_uctx);
 } mep_uctx_map SEC(".maps");
+
+// [stack_watermark] one-shot alarm threshold in BYTES of stack consumed since
+// the outermost uprobe entry. 0 (default) disables the alarm (stack_used is
+// still emitted on every uprobe row). A typical 8MiB thread stack overflows
+// around 8*1024*1024; set e.g. 6291456 (6MiB) to fire before the guard page.
+const volatile __u32 stack_watermark_bytes = 0;
+GADGET_PARAM(stack_watermark_bytes);
 
 SEC("uprobe/__mep_uprobe_dummy")
 int BPF_UPROBE(mep_uprobe)
@@ -605,16 +623,39 @@ int BPF_UPROBE(mep_uprobe)
 	e->arg3 = (__u64)PT_REGS_PARM4(ctx);
 	e->arg4 = (__u64)PT_REGS_PARM5(ctx);
 	// [uprobe_pairing] bump this tid's in-flight depth and stamp it.
+	// [stack_watermark] on the OUTERMOST entry, stamp entry_sp = current user SP
+	// as the call chain's stack base; on deeper hits emit stack_used = base - sp
+	// and fire a one-shot alarm the first time it crosses stack_watermark_bytes.
 	{
 		__u32 tid = (__u32)bpf_get_current_pid_tgid();
+		__u64 sp = PT_REGS_SP(ctx);
 		struct mep_uctx *u = bpf_map_lookup_elem(&mep_uctx_map, &tid);
-		if (!u) {
-			struct mep_uctx nu = { .depth = 1, .entry_sp = 0 };
+		// [stack_watermark] Detect the OUTERMOST frame by stack GEOMETRY, not by
+		// the uretprobe unwind count. On x86-64 the stack grows DOWN, so a deeper
+		// frame always has a strictly lower SP than its caller. If we have no
+		// context OR the current SP has risen back to/above the stored chain base
+		// (u->entry_sp), the previous chain has fully unwound and this is a fresh
+		// outermost call -- even if some uretprobes were MISSED (which would
+		// otherwise leave mep_uctx->depth drifting upward across chains, the
+		// call_depth=21162 bug). Re-anchor: reset depth=1 and re-stamp entry_sp to
+		// this SP so call_depth is bounded per chain and stack_used is measured
+		// from the true current base, never a stale one.
+		if (!u || sp >= u->entry_sp) {
+			struct mep_uctx nu = { .depth = 1, .entry_sp = sp, .alarmed = 0 };
 			bpf_map_update_elem(&mep_uctx_map, &tid, &nu, BPF_ANY);
 			e->call_depth = 1;
+			e->stack_used = 0;
 		} else {
+			/* sp < u->entry_sp guaranteed by the branch above */
 			u->depth += 1;
 			e->call_depth = u->depth;
+			__u64 used = u->entry_sp - sp;
+			e->stack_used = used;
+			if (stack_watermark_bytes && !u->alarmed &&
+			    used > (__u64)stack_watermark_bytes) {
+				u->alarmed = 1;
+				e->stack_alarm = 1;
+			}
 		}
 	}
 	gadget_submit_buf(ctx, &events, e, sizeof(*e));
