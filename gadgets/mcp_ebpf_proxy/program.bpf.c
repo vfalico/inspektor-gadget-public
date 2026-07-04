@@ -110,6 +110,11 @@ struct event {
 	__u32 saddr, daddr;
 	__u16 sport, dport;
 	__u8  sk_state, sk_family;
+	// [uprobe_pairing] in-flight recursion depth for this tid at THIS uprobe
+	// hit: 1 on the outermost entry, 2 on a self-recursive re-entry,... and
+	// the matching value on the paired return. Automates the
+	// entry-vs-return hand-diff (unbalanced depth == a return that never fired).
+	__u32 call_depth;
 };
 
 GADGET_TRACER_MAP(events, 1024 * 256);
@@ -128,6 +133,7 @@ static __always_inline struct event *mep_new(enum mep_phase phase)
 	e->retval = 0;
 	e->saddr = e->daddr = 0; e->sport = e->dport = 0;
 	e->sk_state = e->sk_family = 0;
+	e->call_depth = 0;
 	return e;
 }
 
@@ -568,6 +574,18 @@ int mep_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 // READ-ONLY: only reads the probed function's argument registers + return.
 // ===========================================================================
 
+// [uprobe_pairing] per-tid uprobe call bookkeeping. depth is the live in-flight
+// count (enter++ / return--), which gives automatic enter<->return pairing and
+// a per-tid recursion-depth signal. entry_sp is reserved for stack_watermark
+// (stack_watermark) and initialised here so the two items share one map.
+struct mep_uctx { __u32 depth; __u64 entry_sp; };
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u32);
+	__type(value, struct mep_uctx);
+} mep_uctx_map SEC(".maps");
+
 SEC("uprobe/__mep_uprobe_dummy")
 int BPF_UPROBE(mep_uprobe)
 {
@@ -586,6 +604,19 @@ int BPF_UPROBE(mep_uprobe)
 	e->arg2 = (__u64)PT_REGS_PARM3(ctx);
 	e->arg3 = (__u64)PT_REGS_PARM4(ctx);
 	e->arg4 = (__u64)PT_REGS_PARM5(ctx);
+	// [uprobe_pairing] bump this tid's in-flight depth and stamp it.
+	{
+		__u32 tid = (__u32)bpf_get_current_pid_tgid();
+		struct mep_uctx *u = bpf_map_lookup_elem(&mep_uctx_map, &tid);
+		if (!u) {
+			struct mep_uctx nu = { .depth = 1, .entry_sp = 0 };
+			bpf_map_update_elem(&mep_uctx_map, &tid, &nu, BPF_ANY);
+			e->call_depth = 1;
+		} else {
+			u->depth += 1;
+			e->call_depth = u->depth;
+		}
+	}
 	gadget_submit_buf(ctx, &events, e, sizeof(*e));
 	return 0;
 }
@@ -600,6 +631,18 @@ int BPF_URETPROBE(mep_uretprobe, long retval)
 	if (!e)
 		return 0;
 	e->retval = (__s64)retval;
+	// [uprobe_pairing] pair this return to the entry depth, then unwind.
+	{
+		__u32 tid = (__u32)bpf_get_current_pid_tgid();
+		struct mep_uctx *u = bpf_map_lookup_elem(&mep_uctx_map, &tid);
+		if (u) {
+			e->call_depth = u->depth;	// depth of the frame we are LEAVING
+			if (u->depth <= 1)
+				bpf_map_delete_elem(&mep_uctx_map, &tid);
+			else
+				u->depth -= 1;
+		}
+	}
 	gadget_submit_buf(ctx, &events, e, sizeof(*e));
 	return 0;
 }

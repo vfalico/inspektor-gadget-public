@@ -428,6 +428,10 @@ datasources:
       sk_family:
         annotations:
           description: '[per_conn_identity attach] Address family of arg0-as-sock (2=AF_INET,10=AF_INET6). 0 => arg0(PARM1) was NOT a struct sock* (regular kprobe target) — ignore the 4-tuple/state fields in that case.'
+      call_depth:
+        annotations:
+          columns.width: "5"
+          description: '[uprobe_pairing] Live in-flight recursion depth for this tid at this uprobe hit: 1 on the outermost entry, 2 on a self-recursive re-entry, and so on; the matching value is stamped on the paired uretprobe row so enter/return auto-pair. An unbalanced depth (a ret whose depth has no matching enter, or an enter with no ret) is a call that never returned / a return that never fired. 0 for kprobe/syscall/net rows.'
       func:
         annotations:
           columns.width: "24"
