@@ -156,6 +156,16 @@ var irqTracePrograms = []string{
 	"mep_irq_entry", "mep_irq_exit",
 }
 
+// epoll_timer epoll_timer — event-loop causal chain (timerfd/hrtimer arm+fire,
+// epoll_ctl interest incl EPOLLRDHUP, epoll_wait enter/exit nready).
+var epollTimerPrograms = []string{
+	"mep_timer_timerfd",
+	"mep_timer_epoll_ctl",
+	"mep_timer_epoll_pwait_enter", "mep_timer_epoll_wait_enter",
+	"mep_timer_epoll_pwait_exit", "mep_timer_epoll_wait_exit",
+	"mep_timer_hrtimer_start", "mep_timer_hrtimer_expire",
+}
+
 // block_io: block layer (per-request dev/sector/bytes/rw + issue->done latency).
 var blockIoPrograms = []string{
 	"mep_blk_start", "mep_blk_done",
@@ -497,6 +507,8 @@ func gadgetPreStart() int32 {
 		return preStartFixed("block_io", blockIoPrograms)
 	case "runq_lat":
 		return preStartFixed("runq_lat", runqLatPrograms)
+	case "epoll_timer":
+		return preStartFixed("epoll_timer", epollTimerPrograms)
 	case "list_attachable":
 		return preStartListAttachable()
 	default:

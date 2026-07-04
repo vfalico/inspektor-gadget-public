@@ -3567,4 +3567,221 @@ int BPF_URETPROBE(mep_smutil_ret, long ret)
 	return 0;
 }
 
+// ===========================================================================
+// [epoll_timer] epoll_timer — event-loop causal-chain visibility. Surfaces the
+// timerfd/hrtimer arm+fire lifecycle, epoll_ctl registration (incl EPOLLRDHUP
+// peer-close interest) and epoll_wait enter/exit (nready==0 == timeout: the
+// "app woke on nothing" vs "kernel never armed the timer" discriminator).
+// Targets event-loop stalls: SSE/keepalive misses and timer-arm races.
+// ===========================================================================
+enum mep_timer_kind {
+	timer_timerfd_set   = 1,	// app armed/disarmed a timerfd (sys_enter_timerfd_settime)
+	timer_epoll_ctl_add = 2,	// EPOLL_CTL_ADD — registered fd interest
+	timer_epoll_ctl_mod = 3,	// EPOLL_CTL_MOD
+	timer_epoll_ctl_del = 4,	// EPOLL_CTL_DEL
+	timer_epoll_wait    = 5,	// entered epoll_wait (blocking the loop)
+	timer_epoll_ret     = 6,	// epoll_wait returned (nready; 0 == TIMEOUT)
+	timer_hrtimer_arm   = 7,	// kernel armed an hrtimer for this proc
+	timer_hrtimer_fire  = 8,	// kernel fired that hrtimer (softirq, ptr-correlated)
+};
+
+struct timer_event {
+	gadget_timestamp timestamp_raw;
+	struct gadget_process proc;
+	enum mep_timer_kind kind_raw;
+	__s32 fd;			// epoll/timer fd (epfd for wait/ctl, tfd for timerfd); -1 hrtimer
+	__s32 nready;			// epoll_wait return: #ready fds; 0 == TIMEOUT; -1 on enter row
+	__u32 ev_mask;			// epoll interest mask (EPOLLRDHUP=0x2000 => peer-close aware)
+	__u32 op;			// EPOLL_CTL op / timerfd flags / epoll_wait timeout(ms)
+	__u64 expires_ns;		// hrtimer deadline / fire ktime / timerfd it_value (0==disarm)
+	__u64 timer_ptr;		// hrtimer address (arm<->fire correlation key)
+};
+GADGET_TRACER_MAP(timer_events, 128 * 1024);
+GADGET_TRACER(mep_timer, timer_events, timer_event);
+
+// hrtimers armed by a wanted process, keyed by hrtimer address, so the
+// softirq-context expire tracepoint (running in the WRONG task context) can
+// still attribute the fire to the arming process AND bound emission to only
+// the target's timers instead of the whole system.
+struct mep_timer_owner {
+	__u32 tgid;
+	__u64 arm_ts;
+	char  comm[16];
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u64);			// hrtimer ptr
+	__type(value, struct mep_timer_owner);
+} mep_timer_armed SEC(".maps");
+
+SEC("tracepoint/syscalls/sys_enter_timerfd_settime")
+int mep_timer_timerfd(struct trace_event_raw_sys_enter *ctx)
+{
+	if (!mep_proc_wanted())
+		return 0;
+	struct timer_event *e = gadget_reserve_buf(&timer_events, sizeof(*e));
+	if (!e)
+		return 0;
+	e->timestamp_raw = bpf_ktime_get_boot_ns();
+	gadget_process_populate(&e->proc);
+	e->kind_raw = timer_timerfd_set;
+	e->fd = (int)ctx->args[0];		// timer fd
+	e->op = (__u32)ctx->args[1];		// flags (1==TFD_TIMER_ABSTIME)
+	e->nready = 0;
+	e->ev_mask = 0;
+	e->timer_ptr = 0;
+	// args[2] = const struct itimerspec *new_value. timespec is {tv_sec@0, tv_nsec@8}
+	// (8+8 on amd64) so it_value (2nd timespec) lives at offset 16. it_value=={0,0}
+	// means DISARM — the "app cancelled its keepalive/idle timer" signal.
+	__u64 v_sec = 0, v_nsec = 0;
+	const void *nv = (const void *)ctx->args[2];
+	if (nv) {
+		bpf_probe_read_user(&v_sec,  sizeof(v_sec),  nv + 16);
+		bpf_probe_read_user(&v_nsec, sizeof(v_nsec), nv + 24);
+	}
+	e->expires_ns = v_sec * 1000000000ULL + v_nsec;
+	gadget_submit_buf(ctx, &timer_events, e, sizeof(*e));
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_epoll_ctl")
+int mep_timer_epoll_ctl(struct trace_event_raw_sys_enter *ctx)
+{
+	if (!mep_proc_wanted())
+		return 0;
+	int op = (int)ctx->args[1];		// EPOLL_CTL_ADD=1 DEL=2 MOD=3
+	struct timer_event *e = gadget_reserve_buf(&timer_events, sizeof(*e));
+	if (!e)
+		return 0;
+	e->timestamp_raw = bpf_ktime_get_boot_ns();
+	gadget_process_populate(&e->proc);
+	e->kind_raw = (op == 2) ? timer_epoll_ctl_del :
+	              (op == 3) ? timer_epoll_ctl_mod : timer_epoll_ctl_add;
+	e->fd = (int)ctx->args[2];		// fd being (de)registered
+	e->op = (__u32)op;
+	e->nready = 0;
+	e->expires_ns = 0;
+	e->timer_ptr = (__u64)(__u32)ctx->args[0];	// epfd as loose correlation handle
+	// args[3] = struct epoll_event *; the interest mask is the leading __u32.
+	__u32 mask = 0;
+	const void *ev = (const void *)ctx->args[3];
+	if (ev && op != 2)			// DEL ignores the event ptr
+		bpf_probe_read_user(&mask, sizeof(mask), ev);
+	e->ev_mask = mask;			// bit 0x2000 (EPOLLRDHUP) => peer-close aware
+	gadget_submit_buf(ctx, &timer_events, e, sizeof(*e));
+	return 0;
+}
+
+static __always_inline int mep_timer_wait_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	if (!mep_proc_wanted())
+		return 0;
+	struct timer_event *e = gadget_reserve_buf(&timer_events, sizeof(*e));
+	if (!e)
+		return 0;
+	e->timestamp_raw = bpf_ktime_get_boot_ns();
+	gadget_process_populate(&e->proc);
+	e->kind_raw = timer_epoll_wait;
+	e->fd = (int)ctx->args[0];		// epfd
+	e->op = (__u32)ctx->args[3];		// timeout(ms); -1==block forever
+	e->nready = -1;				// enter: outcome not known yet
+	e->ev_mask = 0;
+	e->expires_ns = 0;
+	e->timer_ptr = 0;
+	gadget_submit_buf(ctx, &timer_events, e, sizeof(*e));
+	return 0;
+}
+SEC("tracepoint/syscalls/sys_enter_epoll_pwait")
+int mep_timer_epoll_pwait_enter(struct trace_event_raw_sys_enter *ctx)
+{ return mep_timer_wait_enter(ctx); }
+SEC("tracepoint/syscalls/sys_enter_epoll_wait")
+int mep_timer_epoll_wait_enter(struct trace_event_raw_sys_enter *ctx)
+{ return mep_timer_wait_enter(ctx); }
+
+static __always_inline int mep_timer_wait_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	if (!mep_proc_wanted())
+		return 0;
+	struct timer_event *e = gadget_reserve_buf(&timer_events, sizeof(*e));
+	if (!e)
+		return 0;
+	e->timestamp_raw = bpf_ktime_get_boot_ns();
+	gadget_process_populate(&e->proc);
+	e->kind_raw = timer_epoll_ret;
+	e->fd = 0;
+	e->op = 0;
+	e->nready = (int)ctx->ret;		// #ready fds; 0 == TIMEOUT (woke on nothing)
+	e->ev_mask = 0;
+	e->expires_ns = 0;
+	e->timer_ptr = 0;
+	gadget_submit_buf(ctx, &timer_events, e, sizeof(*e));
+	return 0;
+}
+SEC("tracepoint/syscalls/sys_exit_epoll_pwait")
+int mep_timer_epoll_pwait_exit(struct trace_event_raw_sys_exit *ctx)
+{ return mep_timer_wait_exit(ctx); }
+SEC("tracepoint/syscalls/sys_exit_epoll_wait")
+int mep_timer_epoll_wait_exit(struct trace_event_raw_sys_exit *ctx)
+{ return mep_timer_wait_exit(ctx); }
+
+SEC("tracepoint/timer/hrtimer_start")
+int mep_timer_hrtimer_start(struct trace_event_raw_hrtimer_start *ctx)
+{
+	// hrtimer_start mostly fires in the ARMING task's context (from the
+	// timerfd_settime/nanosleep syscall) so the pid gate is meaningful here.
+	if (!mep_proc_wanted())
+		return 0;
+	__u64 ptr = (__u64)ctx->hrtimer;
+	struct mep_timer_owner ow = {};
+	ow.tgid = bpf_get_current_pid_tgid() >> 32;
+	ow.arm_ts = bpf_ktime_get_boot_ns();
+	bpf_get_current_comm(&ow.comm, sizeof(ow.comm));
+	bpf_map_update_elem(&mep_timer_armed, &ptr, &ow, BPF_ANY);
+	struct timer_event *e = gadget_reserve_buf(&timer_events, sizeof(*e));
+	if (!e)
+		return 0;
+	e->timestamp_raw = ow.arm_ts;
+	gadget_process_populate(&e->proc);
+	e->kind_raw = timer_hrtimer_arm;
+	e->fd = -1;
+	e->op = 0;
+	e->nready = 0;
+	e->ev_mask = 0;
+	e->expires_ns = (__u64)ctx->expires;	// absolute kernel-time deadline
+	e->timer_ptr = ptr;
+	gadget_submit_buf(ctx, &timer_events, e, sizeof(*e));
+	return 0;
+}
+
+SEC("tracepoint/timer/hrtimer_expire_entry")
+int mep_timer_hrtimer_expire(struct trace_event_raw_hrtimer_expire_entry *ctx)
+{
+	// Runs in softirq: current task is NOT the owner. Correlate by the hrtimer
+	// address recorded at arm-time to (a) attribute to the correct process and
+	// (b) bound emission to only the target's timers.
+	__u64 ptr = (__u64)ctx->hrtimer;
+	struct mep_timer_owner *ow = bpf_map_lookup_elem(&mep_timer_armed, &ptr);
+	if (!ow)
+		return 0;
+	struct timer_event *e = gadget_reserve_buf(&timer_events, sizeof(*e));
+	if (!e)
+		return 0;
+	e->timestamp_raw = bpf_ktime_get_boot_ns();
+	__builtin_memset(&e->proc, 0, sizeof(e->proc));
+	e->proc.pid = ow->tgid;			// attribute to the arming process
+	e->proc.tid = ow->tgid;
+	__builtin_memcpy(&e->proc.comm, ow->comm, sizeof(e->proc.comm));
+	e->kind_raw = timer_hrtimer_fire;
+	e->fd = -1;
+	e->op = 0;
+	e->nready = 0;
+	e->ev_mask = 0;
+	e->expires_ns = (__u64)ctx->now;	// when it actually fired
+	e->timer_ptr = ptr;
+	gadget_submit_buf(ctx, &timer_events, e, sizeof(*e));
+	bpf_map_delete_elem(&mep_timer_armed, &ptr);
+	return 0;
+}
+
 char LICENSE[] SEC("license") = "GPL";

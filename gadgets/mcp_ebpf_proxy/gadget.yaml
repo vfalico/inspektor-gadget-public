@@ -1002,6 +1002,38 @@ datasources:
         annotations:
           columns.hidden: "true"
           description: '[sock_snapshot] tp->lsndtime (raw) -- last data-send timestamp, for idle-duration reasoning. Full sockets only.'
+  mep_timer:
+    fields:
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime ns; prefer the formatted timestamp column for wall-clock.'
+      proc:
+        annotations:
+          description: 'Process context (pid/tid/comm/mount-ns). On hrtimer_fire this is reconstructed from the arm-time owner (softirq has no task context).'
+      kind_raw:
+        annotations:
+          description: 'Event kind: timerfd_set / epoll_ctl_add|mod|del / epoll_wait (enter) / epoll_ret (exit) / hrtimer_arm / hrtimer_fire. epoll_wait->epoll_ret with nready=0 is the "woke on nothing / lost the race" signature; a timerfd_set/hrtimer_arm with NO matching hrtimer_fire is "timer never fired".'
+      fd:
+        annotations:
+          value.unit: "count"
+          description: 'epfd (epoll_ctl/wait) or timer fd (timerfd_settime); -1 for hrtimer events.'
+      nready:
+        annotations:
+          value.unit: "count"
+          description: 'epoll_wait return: number of ready fds. 0 == TIMEOUT (event loop woke on nothing); -1 on the enter row.'
+      ev_mask:
+        annotations:
+          description: 'epoll interest mask from epoll_ctl. Bit 0x2000 (EPOLLRDHUP) set => app asked to be told about peer half-close; absent => it will MISS a peer FIN (a refused-dependency death SSE class).'
+      op:
+        annotations:
+          description: 'EPOLL_CTL op (1=ADD 2=DEL 3=MOD), timerfd flags (1=TFD_TIMER_ABSTIME), or epoll_wait timeout in ms.'
+      expires_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          description: 'hrtimer absolute deadline (arm) / actual fire ktime (fire) / timerfd it_value (0 == DISARM).'
+      timer_ptr:
+        annotations:
+          description: 'hrtimer kernel address — the arm<->fire correlation key; also the epfd handle on epoll_ctl rows.'
   mep_sys:
     fields:
       arg0:
@@ -1387,6 +1419,7 @@ params:
       - runq_lat
       - sock_state
       - sock_snapshot
+      - epoll_timer
     cuda_op:
       key: cuda_op
       defaultValue: ""
