@@ -1842,6 +1842,131 @@ struct net_event {
 GADGET_TRACER_MAP(net_events, 1024 * 256);
 GADGET_TRACER(mep_net, net_events, net_event);
 
+// ============================================================ per_key_rollup ==
+// per_key_rollup. A per-FLOW rollup view over the always-on net
+// datasource: instead of scrolling thousands of per-packet rows, IG periodically
+// fetches one row PER 4-tuple carrying count, byte-sum, inter-event gap
+// min/max/sum (mean = gap_sum/(count-1)), retransmits, inbound-RST count,
+// closing-state activity and last TCP state. A ~constant gap => periodic
+// keep-alive/ping; a large last-vs-mean gap => idle; bytes_sum==0 with count>1
+// => empty keep-alives; closing_evts>0 => write/IO while the socket was tearing
+// down (the write-after-peer-FIN shape). Modeled on gadgets/top_tcp's
+// per-flow GADGET_MAPITER, EXTENDED with the inter-event gap tracking top_tcp
+// lacks. Key is the pure 4-tuple (NOT pid) so the item-12 inbound-RST hook --
+// which runs in softirq with no meaningful current task -- can find and bump the
+// same flow; the owning pid/comm are recorded as VALUE fields from the first
+// event that carried process context.
+struct net_rollup_key {
+	__u32 daddr;	// remote IPv4 (network order) -- matches net_event.daddr
+	__u32 saddr;	// local IPv4 (network order)
+	__u16 dport;	// remote port (host order, decoded)
+	__u16 sport;	// local port (host order)
+};
+struct net_rollup_val {
+	__u64 count;		// net events observed on this flow
+	__u64 first_ts_raw;	// first event (boot ns)
+	__u64 last_ts_raw;	// most recent event (boot ns) -- last-gap = now-this
+	__u64 gap_min_ns;	// smallest inter-event gap
+	__u64 gap_max_ns;	// largest inter-event gap
+	__u64 gap_sum_ns;	// sum of gaps; mean = gap_sum_ns/(count-1)
+	__u64 bytes_sum;	// total bytes moved (sendmsg/udp size); 0-byte pings visible as count>1,bytes_sum==0
+	__u64 retrans_count;	// net_retransmit ops on this flow (loss/blackhole signal)
+	__u64 rst_count;	// inbound RSTs on this flow. Populated whenever the
+				// mep_tcp_reset hook is co-attached (always under sock_state;
+				// and under net_trace via the net_trace keep-set co-attach)
+				// so a refused/aborted connect shows rst_count>0 here.
+	__u64 closing_evts;	// net events seen while tcp_state was a closing state (CLOSE_WAIT/FIN_WAIT*/LAST_ACK/CLOSING) -- write-after-peer-FIN shape
+	__u32 pid;		// owning pid (from first event with proc context)
+	__u8  last_state;	// most recent tcp_state on this flow
+	gadget_comm comm[TASK_COMM_LEN];	// owning comm
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct net_rollup_key);
+	__type(value, struct net_rollup_val);
+} net_rollup_map SEC(".maps");
+
+// GADGET_MAPITER -> IG periodically fetches net_rollup_map into the `net_rollup`
+// datasource, flattening key+value struct members into columns.
+GADGET_MAPITER(net_rollup, net_rollup_map);
+
+static __always_inline struct net_rollup_val *
+net_rollup_slot(struct net_rollup_key *k)
+{
+	struct net_rollup_val *v = bpf_map_lookup_elem(&net_rollup_map, k);
+	if (v)
+		return v;
+	struct net_rollup_val zero = {};
+	bpf_map_update_elem(&net_rollup_map, k, &zero, BPF_NOEXIST);
+	return bpf_map_lookup_elem(&net_rollup_map, k);
+}
+
+// Fold one net_event into its flow rollup. Called at every net submit site AFTER
+// net_decode_sk has populated the 4-tuple. Additive counters use __sync_fetch_
+// and_add; the init / min-max / last-write races are benign for a diagnostic
+// rollup (top_tcp has the same class of non-atomic init).
+static __always_inline void net_rollup_update(struct net_event *e)
+{
+	struct net_rollup_key k = {};
+	k.daddr = e->daddr; k.saddr = e->saddr;
+	k.dport = e->dport; k.sport = e->sport;
+	if (k.daddr == 0 && k.dport == 0)	// undecoded 4-tuple -> skip junk row
+		return;
+	struct net_rollup_val *v = net_rollup_slot(&k);
+	if (!v)
+		return;
+	__u64 now = e->timestamp_raw;
+	if (v->count == 0) {
+		v->first_ts_raw = now;
+		v->pid = e->proc.pid;
+		__builtin_memcpy(v->comm, e->proc.comm, sizeof(v->comm));
+	} else {
+		__u64 gap = now - v->last_ts_raw;
+		if (v->gap_min_ns == 0 || gap < v->gap_min_ns)
+			v->gap_min_ns = gap;
+		if (gap > v->gap_max_ns)
+			v->gap_max_ns = gap;
+		__sync_fetch_and_add(&v->gap_sum_ns, gap);
+	}
+	v->last_ts_raw = now;
+	v->last_state = e->tcp_state;
+	__sync_fetch_and_add(&v->count, 1);
+	if (e->bytes)
+		__sync_fetch_and_add(&v->bytes_sum, e->bytes);
+	if (e->net_op_raw == net_retransmit)
+		__sync_fetch_and_add(&v->retrans_count, 1);
+	// closing-state activity: CLOSE_WAIT(8) FIN_WAIT1(4) FIN_WAIT2(5)
+	// LAST_ACK(9) CLOSING(11) -- a write/IO here is the write-after-peer-FIN /
+	// activity-during-teardown signal.
+	__u8 st = e->tcp_state;
+	if (st == 8 || st == 4 || st == 5 || st == 9 || st == 11)
+		__sync_fetch_and_add(&v->closing_evts, 1);
+}
+
+// Bump the inbound-RST counter for a flow. Called from the item-12 tcp_reset
+// hook (inbound RST on an EXISTING socket, so the 4-tuple orientation matches a
+// flow the net path already created). softirq-safe: no current-task access.
+static __always_inline void net_rollup_rst(__u32 daddr, __u32 saddr,
+					   __u16 dport, __u16 sport)
+{
+	struct net_rollup_key k = {};
+	k.daddr = daddr; k.saddr = saddr; k.dport = dport; k.sport = sport;
+	if (k.daddr == 0 && k.dport == 0)
+		return;
+	// LOOKUP-ONLY (no create-on-miss): only bump the RST counter on a flow the
+	// net family is ALREADY tracking. This hook also fires under sock_state
+	// (where the net programs are not attached and no rollup slot exists); it
+	// must NOT spawn an orphan rollup row there (rst_count=1, count=0, no
+	// 4-tuple gap data). Under sock_state the affirmative RST signal is carried
+	// by the dedicated ss_reset_rx datasource instead.
+	struct net_rollup_val *v = bpf_map_lookup_elem(&net_rollup_map, &k);
+	if (!v)
+		return;
+	__sync_fetch_and_add(&v->rst_count, 1);
+	v->last_ts_raw = bpf_ktime_get_boot_ns();
+}
+
 // carry sk pointer from tcp_v4_connect entry -> return so we can decode the
 // 4-tuple at return time (when the connection fields are populated) AND attach
 // the retval.
@@ -1910,6 +2035,7 @@ int BPF_KRETPROBE(mep_net_connect_ret, int ret)
 	// connect" is directly measurable as connect-to-established time.
 	e->tcp_state = BPF_CORE_READ(sk, __sk_common.skc_state);
 	e->connect_latency_ns = bpf_ktime_get_boot_ns() - t0;
+	net_rollup_update(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
@@ -1925,6 +2051,7 @@ int BPF_KPROBE(mep_net_retransmit, struct sock *sk)
 	struct inet_connection_sock *icsk = (struct inet_connection_sock *)sk;
 	e->retrans_out = BPF_CORE_READ(icsk, icsk_retransmits);
 	e->tcp_state   = BPF_CORE_READ(sk, __sk_common.skc_state);
+	net_rollup_update(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
@@ -1936,6 +2063,7 @@ int BPF_KPROBE(mep_net_sendmsg, struct sock *sk, struct msghdr *msg, size_t size
 	if (!e) return 0;
 	net_decode_sk(e, sk);
 	e->bytes = size;
+	net_rollup_update(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
@@ -1953,6 +2081,7 @@ int BPF_KPROBE(mep_net_udp_send, struct sock *sk, struct msghdr *msg, size_t siz
 	if (!e) return 0;
 	net_decode_sk(e, sk);
 	e->bytes = size;
+	net_rollup_update(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
@@ -1964,6 +2093,7 @@ int BPF_KPROBE(mep_net_udp_recv, struct sock *sk, struct msghdr *msg, size_t siz
 	if (!e) return 0;
 	net_decode_sk(e, sk);
 	e->bytes = size;
+	net_rollup_update(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
@@ -2048,6 +2178,11 @@ int BPF_KPROBE(mep_tcp_reset, struct sock *sk)
 	} else {
 		e->sk_null = 1;
 	}
+	// [per_key_rollup] unify: this inbound RST also increments the flow's rollup rst_count
+	// (same 4-tuple orientation as the net path). The sk==NULL outbound
+	// send_reset smoking-gun stays in the dedicated ss_reset_tx row (reversed
+	// skb orientation would not unify by flow key).
+	net_rollup_rst(e->daddr, e->saddr, e->dport, e->sport);
 	gadget_submit_buf(ctx, &sockstate_events, e, sizeof(*e));
 	return 0;
 }

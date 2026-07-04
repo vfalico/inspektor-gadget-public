@@ -469,7 +469,18 @@ func gadgetPreStart() int32 {
 	case "heap_profile":
 		return preStartFixed("heap_profile", heapProfilePrograms)
 	case "net_trace":
-		return preStartFixed("net_trace", netTracePrograms)
+		// Co-attach the item-12a inbound-RST hook (mep_tcp_reset) so the
+		// net_rollup datasource's rst_count actually populates here. Note: 
+		// tcp_v4_connect's kretprobe returns retval=0/SYN_SENT on a refused
+		// connect (the refusal RST is delivered asynchronously in softirq),
+		// so the net family itself never sees the RST — only mep_tcp_reset
+		// does. Without this co-attach rst_count would be structurally
+		// always-0 under net_trace (a misleading dead column). The reset hook
+		// is idempotent across families (enableExact de-dups), and its
+		// net_rollup_rst() bump is LOOKUP-ONLY so it can only annotate a flow
+		// the net programs are already tracking.
+		return preStartFixed("net_trace",
+			append(append([]string{}, netTracePrograms...), "mep_tcp_reset"))
 	case "sock_state":
 		return preStartFixed("sock_state", sockStatePrograms)
 	case "fs_trace":

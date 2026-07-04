@@ -1050,6 +1050,97 @@ datasources:
           description: '[ENRICH] TCP state: on connect = state at tcp_v4_connect return;
             on retransmit = state at loss (1=ESTABLISHED mid-stream, 2=SYN_SENT connect-time
             blackhole)'
+  net_rollup:
+    fields:
+      daddr:
+        annotations:
+          columns.hex: "true"
+          description: 'Remote IPv4 of the flow (network order) — the rollup key'
+      saddr:
+        annotations:
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: 'Local IPv4 (network order)'
+      dport:
+        annotations:
+          columns.width: "8"
+          description: 'Remote port (host order) — the rollup key'
+      sport:
+        annotations:
+          columns.hidden: "true"
+          columns.width: "8"
+          description: 'Local port (host order)'
+      count:
+        annotations:
+          value.unit: "count"
+          value.semantics: "cumulative"
+          columns.width: "8"
+          description: 'Net events folded into this flow. count>1 with bytes_sum==0 = empty keep-alives.'
+      bytes_sum:
+        annotations:
+          value.unit: "bytes"
+          value.semantics: "cumulative"
+          columns.width: "12"
+          description: 'Total bytes moved on this flow (sendmsg/udp size sum). 0 with count>1 = pure keep-alive/ping traffic.'
+      gap_min_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          columns.hidden: "true"
+          description: 'Smallest inter-event gap. min≈max≈mean ⇒ a PERIODIC flow (keep-alive/ping cadence).'
+          formatters.duration.target: gap_min
+      gap_max_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          columns.hidden: "true"
+          description: 'Largest inter-event gap. A large max vs small mean = a stall/idle punctuating otherwise steady traffic.'
+          formatters.duration.target: gap_max
+      gap_sum_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          columns.hidden: "true"
+          description: 'Sum of inter-event gaps; mean gap = gap_sum_ns/(count-1). Constant mean ⇒ periodic; use with last_ts to judge current idle.'
+          formatters.duration.target: gap_sum
+      retrans_count:
+        annotations:
+          value.unit: "count"
+          value.semantics: "cumulative"
+          columns.width: "9"
+          description: 'tcp_retransmit_skb ops on this flow — loss/blackhole signal (0 = healthy, climbing = trouble).'
+      rst_count:
+        annotations:
+          value.unit: "count"
+          value.semantics: "cumulative"
+          columns.width: "9"
+          description: 'Inbound RSTs received on this flow (item-12 tcp_reset hook). >0 = peer actively reset — refused/torn-down endpoint.'
+      closing_evts:
+        annotations:
+          value.unit: "count"
+          value.semantics: "cumulative"
+          columns.width: "9"
+          description: 'Net events seen while the socket was in a CLOSING state (CLOSE_WAIT/FIN_WAIT*/LAST_ACK/CLOSING) — the write-after-peer-FIN / activity-during-teardown shape (write-after-peer-FIN).'
+      last_state:
+        annotations:
+          columns.width: "10"
+          description: 'Most recent tcp_state on this flow (1=ESTABLISHED, 8=CLOSE_WAIT,...). With rst_count/closing_evts gives the flow terminal disposition.'
+      first_ts_raw:
+        annotations:
+          columns.hidden: "true"
+          description: 'First event on this flow (raw ktime ns); span = last_ts_raw-first_ts_raw.'
+      last_ts_raw:
+        annotations:
+          description: 'Most recent event on this flow (raw ktime ns); now-last_ts_raw = current idle since last activity.'
+      pid:
+        annotations:
+          columns.width: "8"
+          description: 'Owning pid captured from the first event that carried process context (net path; softirq RST bumps do not overwrite it).'
+      comm:
+        annotations:
+          columns.width: "16"
+          description: 'Owning process comm (first event with proc context).'
+
   runq_events:
     fields:
       cpu:
