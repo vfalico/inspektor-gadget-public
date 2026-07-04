@@ -1849,7 +1849,7 @@ int BPF_KPROBE(mep_net_udp_recv, struct sock *sk, struct msghdr *msg, size_t siz
 // the 4-tuple with old->new state. Directly answers "did this connection ever
 // reach ESTABLISHED or die in SYN_SENT?" and "when did the peer half-close
 // (ESTABLISHED->CLOSE_WAIT)?" without hand-diffing syscall traces.
-enum sockstate_op { ss_transition };
+enum sockstate_op { ss_transition, ss_reset_rx, ss_reset_tx };
 
 struct sockstate_event {
 	gadget_timestamp timestamp_raw;
@@ -1860,8 +1860,10 @@ struct sockstate_event {
 	__u16 sport;		// local port (host order)
 	__u16 dport;		// remote port (host order)
 	__s32 oldstate;		// [transition] previous TCP state
-	__s32 newstate;		// [transition] new TCP state
+	__s32 newstate;		// [transition] new TCP state; [reset] state at reset
 	__u16 family;		// 2=AF_INET, 10=AF_INET6
+	__u8  reset_dir;	// [sock_state] 0=n/a(transition), 1=inbound RST recv, 2=outbound RST sent
+	__u8  sk_null;		// [sock_state] 1 if the (send_)reset had sk==NULL (no socket)
 };
 
 GADGET_TRACER_MAP(sockstate_events, 1024 * 256);
@@ -1876,6 +1878,7 @@ static __always_inline struct sockstate_event *sockstate_new(enum sockstate_op o
 	e->ss_op_raw = op;
 	e->saddr = e->daddr = 0; e->sport = e->dport = 0;
 	e->oldstate = e->newstate = 0; e->family = 0;
+	e->reset_dir = 0; e->sk_null = 0;
 	return e;
 }
 
@@ -1897,6 +1900,66 @@ int mep_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 	// saddr/daddr are raw __be32 stored in u8[4] arrays; copy the 4 bytes.
 	__builtin_memcpy(&e->saddr, ctx->saddr, 4);
 	__builtin_memcpy(&e->daddr, ctx->daddr, 4);
+	gadget_submit_buf(ctx, &sockstate_events, e, sizeof(*e));
+	return 0;
+}
+
+// Inbound RST: inbound RST RECEIVED on an existing socket (reset_dir=1).
+SEC("kprobe/tcp_reset")
+int BPF_KPROBE(mep_tcp_reset, struct sock *sk)
+{
+	struct sockstate_event *e = sockstate_new(ss_reset_rx);
+	if (!e) return 0;
+	e->reset_dir = 1;
+	if (sk) {
+		e->daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+		e->saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+		__u16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
+		e->dport = bpf_ntohs(dport);
+		e->sport = BPF_CORE_READ(sk, __sk_common.skc_num);
+		e->newstate = BPF_CORE_READ(sk, __sk_common.skc_state);
+		e->family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	} else {
+		e->sk_null = 1;
+	}
+	gadget_submit_buf(ctx, &sockstate_events, e, sizeof(*e));
+	return 0;
+}
+
+// Outbound RST: outbound RST SENT (reset_dir=2). sk==NULL => no matching socket
+// (stale/torn-down endpoint) — the stale-endpoint smoking gun. When sk==NULL the
+// 4-tuple is recovered from the offending inbound skb so the row still names
+// which remote endpoint got the RST.
+SEC("kprobe/tcp_v4_send_reset")
+int BPF_KPROBE(mep_tcp_send_reset, const struct sock *sk, struct sk_buff *skb)
+{
+	struct sockstate_event *e = sockstate_new(ss_reset_tx);
+	if (!e) return 0;
+	e->reset_dir = 2;
+	e->family = 2;	// AF_INET (v4 path)
+	if (sk) {
+		e->daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+		e->saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+		__u16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
+		e->dport = bpf_ntohs(dport);
+		e->sport = BPF_CORE_READ(sk, __sk_common.skc_num);
+		e->newstate = BPF_CORE_READ(sk, __sk_common.skc_state);
+	} else {
+		e->sk_null = 1;
+		// Parse the inbound packet we are RSTing so the row names its target.
+		void *head = (void *)BPF_CORE_READ(skb, head);
+		__u16 net_off = BPF_CORE_READ(skb, network_header);
+		__u16 tr_off  = BPF_CORE_READ(skb, transport_header);
+		struct iphdr iph = {};
+		struct tcphdr th = {};
+		bpf_probe_read_kernel(&iph, sizeof(iph), (char *)head + net_off);
+		bpf_probe_read_kernel(&th,  sizeof(th),  (char *)head + tr_off);
+		// Inbound packet: iph.saddr is the remote peer that got the RST.
+		e->daddr = iph.saddr;	// remote (sender of the offending packet)
+		e->saddr = iph.daddr;	// us
+		e->dport = bpf_ntohs(th.source);	// remote port
+		e->sport = bpf_ntohs(th.dest);		// our (nonexistent) local port
+	}
 	gadget_submit_buf(ctx, &sockstate_events, e, sizeof(*e));
 	return 0;
 }

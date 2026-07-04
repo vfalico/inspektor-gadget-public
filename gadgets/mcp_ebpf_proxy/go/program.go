@@ -130,6 +130,8 @@ var netTracePrograms = []string{
 // list with the tcp_reset RST/FIN probes in a follow-up commit.)
 var sockStatePrograms = []string{
 	"mep_sock_set_state",
+	// sock_state — affirmative inbound/outbound RST + FIN detection.
+	"mep_tcp_reset", "mep_tcp_send_reset",
 }
 
 // fs_trace: filesystem (vfs_read/write byte counts, vfs_open result).
