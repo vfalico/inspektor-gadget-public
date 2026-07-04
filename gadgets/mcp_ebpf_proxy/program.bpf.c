@@ -168,6 +168,20 @@ int BPF_KRETPROBE(mep_kretprobe, long retval)
 // cannot carry the MCP client's runtime values for this capability.
 // ===========================================================================
 
+// [errno_decode] Failure-mode buckets for a syscall retval. Lets an MCP client see
+// WHY a connect failed (refused vs unreachable vs timed-out vs still-in-flight)
+// without memorising errno numbers. Auto-decoded by IG from BTF
+// (err_class_raw -> "errc_refused").
+enum mep_errclass {
+	errc_ok,		// retval >= 0
+	errc_inprogress,	// EINPROGRESS/EAGAIN -- async connect in flight (normal)
+	errc_refused,		// ECONNREFUSED -- peer up, port closed (RST)
+	errc_unreachable,	// EHOSTUNREACH/ENETUNREACH -- no route to peer
+	errc_timedout,		// ETIMEDOUT -- peer silent (dropped SYN / dead host)
+	errc_reset,		// ECONNRESET/EPIPE -- peer tore down an established conn
+	errc_other,		// any other negative errno
+};
+
 struct syscall_event {
 	gadget_timestamp timestamp_raw;
 	struct gadget_process proc;
@@ -193,10 +207,60 @@ struct syscall_event {
 	__u16 dport;		// remote port (host order)
 	__u8  sk_state;		// TCP state (1=ESTABLISHED,8=CLOSE_WAIT,...); 0 if unresolved
 	__u8  sk_family;	// 2=AF_INET,10=AF_INET6; 0 if fd is not an inet socket
+	// [errno_decode] classified failure mode of retval (see enum mep_errclass).
+	gadget_errno err_raw;		// positive errno (0 on success); IG symbolises name
+	enum mep_errclass err_class_raw;
 };
 
 GADGET_TRACER_MAP(syscalls, 1024 * 256);
 GADGET_TRACER(mep_sys, syscalls, syscall_event);
+
+// [errno_decode] Map a syscall retval to (positive errno, failure class).
+static __always_inline enum mep_errclass mep_classify_errno(__s64 ret, __u32 *err_out)
+{
+	if (ret >= 0) { *err_out = 0; return errc_ok; }
+	__u32 e = (__u32)(-ret);
+	*err_out = e;
+	switch (e) {
+	case 115: /* EINPROGRESS */
+	case 11:  /* EAGAIN */
+		return errc_inprogress;
+	case 111: /* ECONNREFUSED */
+		return errc_refused;
+	case 113: /* EHOSTUNREACH */
+	case 101: /* ENETUNREACH */
+	case 112: /* EHOSTDOWN */
+		return errc_unreachable;
+	case 110: /* ETIMEDOUT */
+		return errc_timedout;
+	case 104: /* ECONNRESET */
+	case 32:  /* EPIPE */
+		return errc_reset;
+	default:
+		return errc_other;
+	}
+}
+
+// [errno_decode / causal death] Per-process (tgid) record of the LAST FAILED
+// socket syscall: its errno + intended 4-tuple + when. On process exit the
+// sched_process_exit probe pairs this with the exit code so an MCP client can answer
+// "did this process die BECAUSE of that refused connect?" (a process that died after a refused dependency connect). Keyed by
+// tgid; overwritten by each new failure; consumed+deleted at exit.
+struct mep_sockfail {
+	__u64 ts;		// boot-ns of the failure
+	__u32 err;		// positive errno
+	__u32 nr;		// syscall nr that failed (42=connect,...)
+	__u32 saddr, daddr;
+	__u16 sport, dport;
+	__u8  err_class;	// enum mep_errclass
+	__u8  sk_family;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u32);		// tgid
+	__type(value, struct mep_sockfail);
+} last_sockfail SEC(".maps");
 
 #define MEP_ANY_SYSCALL 0xffffffffULL
 
@@ -459,6 +523,12 @@ int mep_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 	e->phase_raw = ret;
 	e->arg0 = e->arg1 = e->arg2 = e->arg3 = e->arg4 = e->arg5 = 0;
 	e->retval = (__s64)ctx->args[1];
+	// [errno_decode] classify the failure mode (refused/unreachable/timed-out).
+	{
+		__u32 _errno = 0;
+		e->err_class_raw = mep_classify_errno(e->retval, &_errno);
+		e->err_raw = _errno;
+	}
 	// per-call wall-clock — no manual enter/ret correlation needed.
 	e->duration_ns = (enter_ts && now > enter_ts) ? (now - enter_ts) : 0;
 	// [per_conn_identity] stamp the exit row with the enter-time identity so the
@@ -466,6 +536,19 @@ int mep_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 	e->saddr = xid.saddr; e->daddr = xid.daddr;
 	e->sport = xid.sport; e->dport = xid.dport;
 	e->sk_state = xid.sk_state; e->sk_family = xid.sk_family;
+	// [errno_decode/causal death] remember a FAILED socket syscall for this
+	// process so a later exit can be attributed to it. Skip the benign
+	// EINPROGRESS async-connect path (not a real failure).
+	if (e->retval < 0 && e->err_class_raw != errc_inprogress && mep_is_sockcall(nr)) {
+		__u32 _tgid = pid_tgid >> 32;
+		struct mep_sockfail _rec = {
+			.ts = now, .err = e->err_raw, .nr = (__u32)nr,
+			.saddr = e->saddr, .daddr = e->daddr,
+			.sport = e->sport, .dport = e->dport,
+			.err_class = (__u8)e->err_class_raw, .sk_family = e->sk_family,
+		};
+		bpf_map_update_elem(&last_sockfail, &_tgid, &_rec, BPF_ANY);
+	}
 	gadget_submit_buf(ctx, &syscalls, e, sizeof(*e));
 	return 0;
 }
@@ -1961,6 +2044,62 @@ int BPF_KPROBE(mep_tcp_send_reset, const struct sock *sk, struct sk_buff *skb)
 		e->sport = bpf_ntohs(th.dest);		// our (nonexistent) local port
 	}
 	gadget_submit_buf(ctx, &sockstate_events, e, sizeof(*e));
+	return 0;
+}
+
+// ===========================================================================
+// [errno_decode / causal death linkage] sched:sched_process_exit
+// When a process that trace_syscall was watching EXITS, pair its exit code
+// with the LAST failed socket syscall it made (last_sockfail). The emitted
+// mep_death row answers the dependency-death question directly: "pid 1234 exited
+// (code=1) 3.2ms after connect(10.0.0.5:8080) failed ECONNREFUSED" -- causal
+// dependency-death, not a guess. Only fires for the group leader (pid==tgid)
+// and only when a failure was recorded, so it inherits trace_syscall's pid
+// scope and stays silent for healthy processes.
+// ===========================================================================
+struct death_event {
+	gadget_timestamp timestamp_raw;
+	struct gadget_process proc;
+	__s32 exit_code;		// task->exit_code (>>8 = status, &0x7f = signal)
+	gadget_errno last_err_raw;	// errno of the last failed socket syscall
+	enum mep_errclass last_err_class_raw;
+	__u32 last_nr;			// which syscall failed (42=connect)
+	gadget_duration gap_ns;		// exit_ts - fail_ts (how soon after the failure)
+	__u32 saddr, daddr;		// intended peer of the failed syscall
+	__u16 sport, dport;
+	__u8  sk_family;
+};
+GADGET_TRACER_MAP(death_events, 64 * 1024);
+GADGET_TRACER(mep_death, death_events, death_event);
+
+SEC("tracepoint/sched/sched_process_exit")
+int mep_death_probe(void *ctx)
+{
+	__u64 pt = bpf_get_current_pid_tgid();
+	__u32 tgid = pt >> 32;
+	__u32 pid  = (__u32)pt;
+	if (pid != tgid)		// only the group leader's exit == process death
+		return 0;
+	struct mep_sockfail *f = bpf_map_lookup_elem(&last_sockfail, &tgid);
+	if (!f)				// process made no failed socket call -- silent
+		return 0;
+
+	struct death_event *e = gadget_reserve_buf(&death_events, sizeof(*e));
+	if (!e) { bpf_map_delete_elem(&last_sockfail, &tgid); return 0; }
+	__u64 now = bpf_ktime_get_boot_ns();
+	e->timestamp_raw = now;
+	gadget_process_populate(&e->proc);
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	e->exit_code = BPF_CORE_READ(task, exit_code);
+	e->last_err_raw = f->err;
+	e->last_err_class_raw = (enum mep_errclass)f->err_class;
+	e->last_nr = f->nr;
+	e->gap_ns = (now > f->ts) ? (now - f->ts) : 0;
+	e->saddr = f->saddr; e->daddr = f->daddr;
+	e->sport = f->sport; e->dport = f->dport;
+	e->sk_family = f->sk_family;
+	gadget_submit_buf(ctx, &death_events, e, sizeof(*e));
+	bpf_map_delete_elem(&last_sockfail, &tgid);
 	return 0;
 }
 

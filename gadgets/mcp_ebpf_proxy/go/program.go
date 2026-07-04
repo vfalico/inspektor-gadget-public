@@ -43,6 +43,7 @@ const (
 	progKretprobe = "mep_kretprobe"
 	progSysEnter  = "mep_sys_enter"
 	progSysExit   = "mep_sys_exit"
+	progDeath     = "mep_death_probe"
 	progKsym      = "mep_ksym"
 
 	// attach_uprobe: generic retargetable userspace uprobe/uretprobe.
@@ -174,7 +175,7 @@ var enrichedFamilies = [][]string{
 // every program in the object; any not enabled by the chosen capability is
 // disabled with the sentinel.
 var allPrograms = append([]string{
-	progKprobe, progKretprobe, progSysEnter, progSysExit, progKsym,
+	progKprobe, progKretprobe, progSysEnter, progSysExit, progKsym, progDeath,
 	progUprobe, progUretprobe,
 }, cudaPrograms...)
 
@@ -849,7 +850,7 @@ func preStartTraceSyscall() int32 {
 
 	// Enable only the two raw-syscall tracepoints (keep their SEC-default attach
 	// target — do NOT rewrite attach_to for tracepoints).
-	enableExact(map[string]string{progSysEnter: "", progSysExit: ""})
+	enableExact(map[string]string{progSysEnter: "", progSysExit: "", progDeath: ""})
 
 	if syscall == "" {
 		api.Infof("mcp_ebpf_proxy[trace_syscall]: tracing ALL syscalls pid=%d", pid)
