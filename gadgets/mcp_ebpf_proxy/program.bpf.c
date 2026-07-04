@@ -618,6 +618,14 @@ GADGET_PARAM(uprobe_str_arg);
 const volatile __u32 uprobe_str_len_arg = 0xff;
 GADGET_PARAM(uprobe_str_len_arg);
 
+// [kern_user_correlate] which uprobe arg (0-4) holds a file descriptor to
+// resolve into the kernel struct sock (fd -> 4-tuple + state); 0xff (default)
+// disables it. Binds a userspace uprobe hit (an app connection object passed
+// by fd) to the kernel socket identity — the kernel<->userspace correlation
+// ask (uprobe emits fd -> bind struct sock to app conn object).
+const volatile __u32 uprobe_fd_arg = 0xff;
+GADGET_PARAM(uprobe_fd_arg);
+
 SEC("uprobe/__mep_uprobe_dummy")
 int BPF_UPROBE(mep_uprobe)
 {
@@ -656,6 +664,22 @@ int BPF_UPROBE(mep_uprobe)
 			} else {
 				bpf_probe_read_user_str(e->arg_str, sizeof(e->arg_str), (void *)p);
 			}
+		}
+	}
+	// [kern_user_correlate] optionally resolve a file-descriptor argument at
+	// this uprobe into the kernel socket identity (4-tuple + state), binding
+	// the userspace conn object to the kernel struct sock. Runs in the target
+	// task context, so bpf_get_current_task()'s fd table is the app's own.
+	// sk_family stays 0 when the arg is not an inet socket fd (leave it alone
+	// so an attach-family sock* decode, if any, is not clobbered).
+	if (uprobe_fd_arg <= 4) {
+		__u64 fargs[8] = { e->arg0, e->arg1, e->arg2, e->arg3, e->arg4, 0, 0, 0 };
+		struct mep_sockid _id;
+		mep_resolve_sock_fd((int)fargs[uprobe_fd_arg & 7], &_id);
+		if (_id.sk_family) {
+			e->saddr = _id.saddr; e->daddr = _id.daddr;
+			e->sport = _id.sport; e->dport = _id.dport;
+			e->sk_state = _id.sk_state; e->sk_family = _id.sk_family;
 		}
 	}
 	// [uprobe_pairing] bump this tid's in-flight depth and stamp it.
