@@ -3,19 +3,19 @@
 
 // WASM control plane for mcp_ebpf_proxy — a single multi-capability gadget.
 //
-// The agent picks a `capability`; gadgetPreStart() enables only that
+// the MCP client picks a `capability`; gadgetPreStart() enables only that
 // capability's eBPF programs (rewriting programs.<name>.attach_to to the chosen
 // kernel symbol for `attach`, or leaving the SEC-default target for the
 // tracepoint/iter capabilities) and disables every other program with the
 // gadget_program_disabled sentinel. For `trace_syscall` it also resolves the
-// agent's syscall name -> id and populates the (pid, syscall) BPF filter maps,
+// client's syscall name -> id and populates the (pid, syscall) BPF filter maps,
 // because gadgetPreStart runs AFTER the eBPF object is loaded (rodata frozen),
 // so the runtime values travel through maps rather than const-volatile globals.
 //
-//	capability = attach          -> mep_kprobe / mep_kretprobe (retargeted)
-//	capability = attach_uprobe   -> mep_uprobe / mep_uretprobe (retargeted to path:sym)
-//	capability = trace_syscall   -> mep_sys_enter / mep_sys_exit + filter maps
-//	capability = cuda_memtrace   -> CUDA driver+runtime alloc/free uprobes
+//	capability = attach -> mep_kprobe / mep_kretprobe (retargeted)
+//	capability = attach_uprobe -> mep_uprobe / mep_uretprobe (retargeted to path:sym)
+//	capability = trace_syscall -> mep_sys_enter / mep_sys_exit + filter maps
+//	capability = cuda_memtrace -> CUDA driver+runtime alloc/free uprobes
 //	capability = list_attachable -> mep_ksym (iter/ksym), name/type via rodata
 //
 // READ-ONLY control plane: it only validates input, sets config, populates
@@ -31,10 +31,10 @@ import (
 
 const disabled = "gadget_program_disabled"
 
-// maxFuncLen bounds the agent-supplied symbol name.
+// maxFuncLen bounds the MCP client-supplied symbol name.
 const maxFuncLen = 128
 
-// maxUprobeTargetLen bounds the agent-supplied "<lib-or-path>:<symbol>" target.
+// maxUprobeTargetLen bounds the MCP client-supplied "<lib-or-path>:<symbol>" target.
 const maxUprobeTargetLen = 384
 
 // eBPF program section names (must match SEC()/func names in program.bpf.c).
@@ -184,7 +184,7 @@ var modePrograms = map[string][]string{
 }
 
 // uprobeModePrograms maps the attach_uprobe `mode` to the uprobe programs that
-// should be retargeted to the agent-supplied target.
+// should be retargeted to the MCP client-supplied target.
 var uprobeModePrograms = map[string][]string{
 	"uprobe":           {progUprobe},
 	"uretprobe":        {progUretprobe},
@@ -205,9 +205,9 @@ var validatedFunc string
 // --- attach-confirmation / coverage feedback --------------------------
 //
 // A capability's PreStart records WHAT it attached here, and gadgetStart emits a
-// single mep_coverage record so the agent can distinguish "attached but the
+// single mep_coverage record so the MCP client can distinguish "attached but the
 // workload produced no events" from "attach failed / wrong target". Without this
-// an empty result is ambiguous and the model burns RCA cycles re-trying.
+// an empty result is ambiguous and a caller wastes cycles re-trying.
 var (
 	covCapability string   // selected capability
 	covTargets    []string // attach targets actually programmed
@@ -274,7 +274,7 @@ var (
 
 	// Enriched swiss-army families share the SAME filter_pid map as
 	// trace_syscall but do NOT use filter_syscall/enabled. enrichedActive is
-	// set by preStartFixed/preStartCudaMemtrace when the agent passes a pid, so
+	// set by preStartFixed/preStartCudaMemtrace when the MCP client passes a pid, so
 	// gadgetStart knows to publish filter_pid for them too.
 	enrichedActive    bool
 	enrichedFilterPid uint64 // pid, or 0 == any
@@ -326,7 +326,7 @@ func fsOpFilterValue() (uint64, bool) {
 // filter_cuda_op selector (see CUDA_OP_FILTER_* in program.bpf.c). Empty/"all"
 // keeps every GPU op class; "copy" keeps only the memcpy_h2d+memcpy_d2h rows
 // that carry the PCIe transfer byte volume; h2d/d2h narrow to one direction;
-// launch/sync keep that single class. Unknown => error. This lets the agent
+// launch/sync keep that single class. Unknown => error. This lets the MCP client
 // isolate the PCIe copy signal from the cuLaunchKernel flood that would
 // otherwise truncate it out of the MCP result (mirror of the fs_op fix).
 func cudaOpFilterValue() (uint64, bool) {
@@ -374,7 +374,7 @@ func readPidParam(tag string) (uint64, bool) {
 }
 
 // validLibChar allows the characters that can appear in a library base-name or
-// an absolute .so path (letters, digits, and the path/version punctuation
+// an absolute.so path (letters, digits, and the path/version punctuation
 // "._-+/"), rejecting NUL, whitespace, ":" and shell metacharacters.
 func validLibChar(b byte) bool {
 	switch {
@@ -490,7 +490,7 @@ func preStartAttach() int32 {
 		return 1
 	}
 
-	// `function` is attacker-influenced input from an AI agent over MCP and is
+	// `function` is attacker-influenced input from an MCP client over MCP and is
 	// used as a kallsyms lookup key and the kprobe attach target. Constrain it
 	// to the kernel-symbol grammar BEFORE either use.
 	if len(function) > maxFuncLen {
@@ -547,7 +547,7 @@ func preStartAttach() int32 {
 // ----------------------------------------------------------- attach_uprobe ---
 
 // preStartAttachUprobe retargets the generic uprobe/uretprobe pair to an
-// arbitrary userspace symbol supplied by the agent as the `target` param in the
+// arbitrary userspace symbol supplied by the MCP client as the `target` param in the
 // form "<lib-or-abs-path>:<symbol>", e.g. "libssl:SSL_read" or
 // "/usr/lib/x86_64-linux-gnu/libc.so.6:malloc". IG's uprobetracer splits on the
 // first ':' (pkg/uprobetracer/tracer.go) — the left side is either an absolute
@@ -637,7 +637,7 @@ func preStartAttachUprobe() int32 {
 	enableExact(keep)
 
 	// host-uprobe recipe: callers use IG/MCP host mode to attach to host
-	// processes. Because host mode is intentionally broad, publish the agent's
+	// processes. Because host mode is intentionally broad, publish the MCP client's
 	// pid selector into filter_pid and flip enabled in gadgetStart(); the BPF
 	// mep_uprobe/mep_uretprobe programs consult mep_proc_wanted() before
 	// reserving/submitting an event. pid=0 keeps the legacy host-wide behavior.
@@ -697,14 +697,14 @@ func preStartCudaMemsnapshot() int32 {
 	enrichedActive = true
 	api.Infof("mcp_ebpf_proxy[cuda_memsnapshot]: standing GPU residency via NVML uprobes (%d progs) at %s, pid filter=%d", len(memsnapPrograms), nvml, pid)
 	recordCoverage("cuda_memsnapshot", memsnapPrograms, len(memsnapPrograms), pid,
-		"per-PID GPU residency via NVML running-process table. If gpu_pid=0 / used_gpu_mem=0 for proc rows, that is STRUCTURALLY EXPECTED in a containerized pod without an active CUDA context or with NVML PID-namespace restrictions (nvmlDeviceGetComputeRunningProcesses returns no per-proc entries) — do NOT loop re-querying; treat device rows (dev_used/dev_free/dev_total) as the authoritative VRAM signal instead. Empty proc rows here != attach failure: these uprobes only fire when an NVML consumer (nvidia-smi/dcgm/accounting agent) calls the probed symbol.")
+		"per-PID GPU residency via NVML running-process table. If gpu_pid=0 / used_gpu_mem=0 for proc rows, that is STRUCTURALLY EXPECTED in a containerized pod without an active CUDA context or with NVML PID-namespace restrictions (nvmlDeviceGetComputeRunningProcesses returns no per-proc entries) — do NOT loop re-querying; treat device rows (dev_used/dev_free/dev_total) as the authoritative VRAM signal instead. Empty proc rows here != attach failure: these uprobes only fire when an NVML consumer (nvidia-smi/dcgm/accounting daemon) calls the probed symbol.")
 	return 0
 }
 
 // preStartCudaSmutil enables the NVML per-PID SM/compute-utilization probe set.
 // It RETARGETS each program to the absolute libnvidia-ml.so.1 path (base-name
 // does not resolve for this lib). Whenever any NVML consumer (nvidia-smi, dcgm,
-// the GPU accounting agent) calls nvmlDeviceGetProcessUtilization, we decode the
+// the GPU accounting daemon) calls nvmlDeviceGetProcessUtilization, we decode the
 // returned sample[] array and emit one row per PID with its smUtil/memUtil %.
 // This is the DIRECT per-PID compute-occupancy signal: a PID that HOLDS VRAM
 // (cuda_memsnapshot) but reports smUtil==0% is reserved-but-unused / reclaimable.
@@ -734,7 +734,7 @@ func preStartCudaSmutil() int32 {
 // other program with the sentinel. This is the shared PreStart for all of the
 // enriched "swiss-army" capabilities (cuda_profile, lock_trace, heap_profile,
 // net_trace, fs_trace, mm_trace, irq_trace, block_io, runq_lat): none of them
-// takes an agent-supplied attach target, so there is no per-capability symbol
+// takes an MCP client-supplied attach target, so there is no per-capability symbol
 // validation — the targets are compiled-in SEC() defaults. An optional `pid`
 // process filter (gadget.yaml) is applied by IG's standard filter, not here.
 func preStartFixed(name string, programs []string) int32 {
@@ -753,7 +753,7 @@ func preStartFixed(name string, programs []string) int32 {
 	}
 	enrichedFilterPid = pid
 	enrichedActive = true
-	// fs_trace exposes an additional op-class filter (filter_fs_op) so the agent
+	// fs_trace exposes an additional op-class filter (filter_fs_op) so the MCP client
 	// can isolate failing opens (fs_op=fault|filp_open) from the high-volume
 	// vfs_read/vfs_write stream that would otherwise truncate them out of the
 	// MCP result. The other families have a single low-rate op set; default 0.
@@ -769,7 +769,7 @@ func preStartFixed(name string, programs []string) int32 {
 		}
 	}
 	// cuda_profile exposes a parallel op-class filter (filter_cuda_op) so the
-	// agent can isolate the PCIe copy rows (cuda_op=copy|h2d|d2h) from the
+	// client can isolate the PCIe copy rows (cuda_op=copy|h2d|d2h) from the
 	// high-rate cuLaunchKernel stream that would otherwise truncate them out of
 	// the MCP window. 0 for every other family == CUDA_OP_FILTER_ALL (no-op).
 	enrichedCudaOp = 0

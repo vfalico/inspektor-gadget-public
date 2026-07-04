@@ -1,16 +1,16 @@
 name: mcp ebpf proxy
 description: |
   Single multi-capability, read-only kernel+GPU observation gadget that exposes
-  generic eBPF tracing to AI agents through ig-mcp-server as ONE MCP tool. The
-  agent enumerates the capabilities below, picks `capability`, reads the output
+  generic eBPF tracing to MCP clients through ig-mcp-server as ONE MCP tool. The
+  client enumerates the capabilities below, picks `capability`, reads the output
   field meanings, and on a wrong/absent request gets an error that points to the
   next step. CORE generic capabilities:
-    - attach          : kprobe/kretprobe on ANY kernel function chosen at run
+    - attach : kprobe/kretprobe on ANY kernel function chosen at run
                         time (no rebuild); first five args + return value. On
                         "symbol not found" -> call list_attachable first.
-    - attach_uprobe   : uprobe/uretprobe on ANY userspace <lib-or-path>:<symbol>
+    - attach_uprobe : uprobe/uretprobe on ANY userspace <lib-or-path>:<symbol>
                         (e.g. libc:malloc, libcuda.so.1:cuMemAlloc_v2).
-    - trace_syscall   : raw_syscalls sys_enter/sys_exit for a syscall name + pid
+    - trace_syscall : raw_syscalls sys_enter/sys_exit for a syscall name + pid
                         (six args + retval). OUTPUT syscall = DECODED syscall
                         NAME (not the raw number); duration_ns = per-call
                         wall time on the sys_exit. For socket detail use net_trace.
@@ -26,32 +26,32 @@ description: |
   decoded syscall / fname / comm) by count over the FULL pre-truncation set
   — so the dominant contributor is visible WITHOUT client-side parsing of a
   clipped sample (sort/limit operators do not apply to streaming sources).
-    - cuda_memtrace   : CUDA driver+runtime alloc/free; size+ptr per event to
+    - cuda_memtrace : CUDA driver+runtime alloc/free; size+ptr per event to
                         reconcile pairs and flag leaks (is_runtime separates
                         libcuda vs libcudart so you can DEDUPE double-counts).
     - cuda_memsnapshot: STANDING per-PID GPU memory residency via NVML (snapshot,
                         NOT alloc/free deltas) — shows VRAM each PID still HOLDS across the
                         whole window even when alloc/free traffic is quiet.
-    - cuda_smutil     : STANDING per-PID GPU COMPUTE (SM) utilization via NVML
+    - cuda_smutil : STANDING per-PID GPU COMPUTE (SM) utilization via NVML
                         (snapshot %); the recent_sm_util / reserved_unused_bytes idle-VRAM fields are
                         on cuda_memsnapshot (mep_memsnap), not here. Orthogonal to cuda_memsnapshot's VRAM
                         gauge — shows whether each PID is actually DRIVING the
                         SMs or merely holding memory while idle (smUtil/memUtil).
-    - cuda_profile    : GPU launch/sync/memcpy + grid/block dims, stream, size.
-    - lock_trace      : userspace pthread mutex/cond wait — blocked-time + lock.
+    - cuda_profile : GPU launch/sync/memcpy + grid/block dims, stream, size.
+    - lock_trace : userspace pthread mutex/cond wait — blocked-time + lock.
                         OUTPUT holder_tid = the TID currently HOLDING the
                         contended lock (the convoy owner the waiter is
                         blocked behind; 0 if uncontended/unknown); addr =
                         the lock/futex word; duration_ns = blocked time.
-    - heap_profile    : libc malloc/calloc/realloc/free churn + leak (PLUS kernel brk/anon-mmap growth so HOST-process leaks are visible) (size,ptr).
-    - net_trace       : TCP connect/retransmit/sendmsg with decoded daddr/dport
+    - heap_profile : libc malloc/calloc/realloc/free churn + leak (PLUS kernel brk/anon-mmap growth so HOST-process leaks are visible) (size,ptr).
+    - net_trace : TCP connect/retransmit/sendmsg with decoded daddr/dport
                         and retval (ECONNREFUSED etc.) — use INSTEAD of raw
                         trace_syscall when you need connection-level detail.
-    - fs_trace        : Filesystem. vfs_read/vfs_write/vfs_open (operation, requested/transferred byte count, result) AND failing opens via do_filp_open (the fs-layer open that runs before vfs_open and returns -errno when path resolution fails). Emits op, byte count, return code/errno, and the requested file path (OUTPUT fname) for vfs_read/write/open and failing opens. Path-resolution failures such as ENOENT on a missing file appear here because they never reach vfs_open. ALSO emits the RELEASE side via filp_close (fs_op=close): pair open vs close per PID to compute an fd open-minus-close BALANCE — the fd-leak signal (opens that accumulate with no matching close). Use fs_op=close to isolate releases.
-    - mm_trace        : page-fault + direct-reclaim with duration (mem pressure).
-    - irq_trace       : softirq service time per vector.
-    - block_io        : per-request block-device latency (dev, sector, is_write).
-    - runq_lat        : scheduler run-queue latency per task (CPU starvation).
+    - fs_trace : Filesystem. vfs_read/vfs_write/vfs_open (operation, requested/transferred byte count, result) AND failing opens via do_filp_open (the fs-layer open that runs before vfs_open and returns -errno when path resolution fails). Emits op, byte count, return code/errno, and the requested file path (OUTPUT fname) for vfs_read/write/open and failing opens. Path-resolution failures such as ENOENT on a missing file appear here because they never reach vfs_open. ALSO emits the RELEASE side via filp_close (fs_op=close): pair open vs close per PID to compute an fd open-minus-close BALANCE — the fd-leak signal (opens that accumulate with no matching close). Use fs_op=close to isolate releases.
+    - mm_trace : page-fault + direct-reclaim with duration (mem pressure).
+    - irq_trace : softirq service time per vector.
+    - block_io : per-request block-device latency (dev, sector, is_write).
+    - runq_lat : scheduler run-queue latency per task (CPU starvation).
   Read-only: observes arguments, registers, tracepoint context and the kallsyms
   iterator only; never modifies kernel state. A machine-readable catalog with
   full param/field/error-next-step semantics ships alongside as
@@ -812,6 +812,32 @@ datasources:
           columns.hex: "true"
           columns.hidden: "true"
           description: Sixth syscall argument (sys_enter)
+      daddr:
+        annotations:
+          columns.hex: "true"
+          description: '[per_conn_identity] Remote IPv4 (network order) of the socket referenced by fd(arg0) for socket syscalls (connect/sendto/recvfrom/read/write/sendmsg/recvmsg/close/accept4). 0 if the fd is not an inet socket or was unresolved. Stamped on BOTH the enter row and the exit row (so connect==-ECONNREFUSED carries the peer it failed to reach).'
+      dport:
+        annotations:
+          columns.width: "8"
+          description: '[per_conn_identity] Remote port (host order) of the socket fd; 0 if unresolved.'
+      saddr:
+        annotations:
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: '[per_conn_identity] Local IPv4 (network order) of the socket fd; 0 if unresolved.'
+      sport:
+        annotations:
+          columns.hidden: "true"
+          columns.width: "8"
+          description: '[per_conn_identity] Local port (host order) of the socket fd; 0 if unresolved.'
+      sk_state:
+        annotations:
+          columns.width: "9"
+          description: '[per_conn_identity] TCP state of the socket fd at the syscall (1=ESTABLISHED, 2=SYN_SENT, 8=CLOSE_WAIT, 9=LAST_ACK,...). A write/sendmsg/sendto on sk_state=8 (CLOSE_WAIT) is the affirmative write-after-peer-FIN signal. 0 if unresolved/non-TCP.'
+      sk_family:
+        annotations:
+          columns.width: "9"
+          description: '[per_conn_identity] Address family of the socket fd (2=AF_INET, 10=AF_INET6). 0 means the fd(arg0) was NOT an inet socket (regular file, pipe, non-fd syscall) — in that case the 4-tuple fields are all 0 and should be ignored.'
       duration_ns:
         annotations:
           value.unit: "nanoseconds"
@@ -991,7 +1017,7 @@ datasources:
       type:
         annotations:
           columns.width: "4"
-          description: kallsyms type char (t/T text, d/D data, ...)
+          description: kallsyms type char (t/T text, d/D data,...)
 params:
   ebpf:
     ksym_filter:
@@ -1003,7 +1029,7 @@ params:
       key: max
       defaultValue: "0"
       description: '[list_attachable] Cap the number of symbols returned (0 = unlimited).
-        kallsyms has ~300k entries; a bound keeps the response small for an agent.
+        kallsyms has ~300k entries; a bound keeps the response small for an MCP client.
         Combine with filter/type to narrow which symbols are returned.'
     ksym_type:
       key: type
@@ -1123,7 +1149,7 @@ params:
       key: target
       defaultValue: ""
       description: '[attach_uprobe] Userspace attach target as <lib-or-path>:<symbol>.
-        The left side is an absolute .so path or a library base-name resolved via
+        The left side is an absolute.so path or a library base-name resolved via
         the target process ld.so.cache (e.g. libc, libssl, /usr/lib/x86_64-linux-gnu/libcuda.so.1);
         the right side is an exported symbol (e.g. malloc, SSL_read, cuMemAlloc_v2).
         Resolved by IG''s uprobetracer at attach time.'

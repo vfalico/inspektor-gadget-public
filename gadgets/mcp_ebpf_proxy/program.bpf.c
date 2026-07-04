@@ -2,19 +2,19 @@
 // Copyright (c) 2025 The Inspektor Gadget authors
 
 // mcp_ebpf_proxy: a single, multi-capability, READ-ONLY kernel-observation
-// gadget that exposes generic eBPF/kernel observation to AI agents through
-// ig-mcp-server as ONE MCP tool (gadget_mcp_ebpf_proxy). The agent selects a
+// gadget that exposes generic eBPF/kernel observation to MCP clients through
+// ig-mcp-server as ONE MCP tool (gadget_mcp_ebpf_proxy). the MCP client selects a
 // `capability` at call time; the WASM control plane (go/program.go) enables
 // only that capability's programs and disables the rest with the
 // gadget_program_disabled sentinel (checked before the program-type switch in
 // pkg/operators/ebpf/attach.go, so it disables kprobe, tracepoint and iter
 // programs uniformly).
 //
-//   capability = attach          -> mep_kprobe / mep_kretprobe   (datasource: events)
-//   capability = attach_uprobe   -> mep_uprobe / mep_uretprobe   (datasource: events)
-//   capability = trace_syscall   -> mep_sys_enter / mep_sys_exit (datasource: syscalls)
-//   capability = cuda_memtrace   -> mep_cu_* / mep_cudart_*      (datasource: cuda_events)
-//   capability = list_attachable -> mep_ksym (iter/ksym)         (datasource: symbols)
+// capability = attach -> mep_kprobe / mep_kretprobe (datasource: events)
+// capability = attach_uprobe -> mep_uprobe / mep_uretprobe (datasource: events)
+// capability = trace_syscall -> mep_sys_enter / mep_sys_exit (datasource: syscalls)
+// capability = cuda_memtrace -> mep_cu_* / mep_cudart_* (datasource: cuda_events)
+// capability = list_attachable -> mep_ksym (iter/ksym) (datasource: symbols)
 //
 // READ-ONLY: only observes registers, raw-tracepoint context and the kallsyms
 // iterator. NEVER calls bpf_override_return(), bpf_send_signal() or any writer.
@@ -32,7 +32,7 @@
 #include <gadget/types.h>
 
 // ===========================================================================
-// capability: attach  -- runtime-retargetable kprobe/kretprobe
+// capability: attach -- runtime-retargetable kprobe/kretprobe
 // (kept byte-identical to the proven first-cut programs)
 // ===========================================================================
 
@@ -101,10 +101,10 @@ int BPF_KRETPROBE(mep_kretprobe, long retval)
 }
 
 // ===========================================================================
-// capability: trace_syscall  -- raw_syscalls sys_enter/sys_exit, filtered by
+// capability: trace_syscall -- raw_syscalls sys_enter/sys_exit, filtered by
 // (pid, syscall-nr). Filters are populated from WASM via BPF maps because
 // gadgetPreStart() runs AFTER the eBPF object is loaded, so rodata globals
-// cannot carry the agent's runtime values for this capability.
+// cannot carry the MCP client's runtime values for this capability.
 // ===========================================================================
 
 struct syscall_event {
@@ -121,6 +121,17 @@ struct syscall_event {
 	__u64 arg5;
 	__s64 retval;
 	gadget_duration duration_ns;	// enter->ret wall-clock (ret rows); 0 on enter rows
+	// [per_conn_identity] socket 4-tuple + TCP state, resolved from the fd arg
+	// (arg0) for socket syscalls (connect/sendto/recvfrom/read/write/sendmsg/
+	// recvmsg/close/accept). Zero for non-socket fds / non-fd syscalls. Cached
+	// at enter and re-stamped on the exit row so the retval/errno row ALSO
+	// carries the peer identity (e.g. connect()==-ECONNREFUSED to daddr:dport).
+	__u32 saddr;		// local IPv4 (network order); 0 if unresolved
+	__u32 daddr;		// remote IPv4 (network order); 0 if unresolved
+	__u16 sport;		// local port (host order)
+	__u16 dport;		// remote port (host order)
+	__u8  sk_state;		// TCP state (1=ESTABLISHED,8=CLOSE_WAIT,...); 0 if unresolved
+	__u8  sk_family;	// 2=AF_INET,10=AF_INET6; 0 if fd is not an inet socket
 };
 
 GADGET_TRACER_MAP(syscalls, 1024 * 256);
@@ -159,7 +170,12 @@ struct {
 // per-task scratch: remember the syscall nr + enter timestamp seen at enter so
 // sys_exit can match it arch-independently (avoids reading orig_ax at exit) AND
 // compute the per-call duration.
-struct mep_sysactive { __u64 nr; __u64 ts; };
+struct mep_sysactive {
+	__u64 nr; __u64 ts;
+	// [per_conn_identity] cache the enter-time socket identity so the exit row
+	// (which carries retval/duration) is stamped with the SAME 4-tuple+state.
+	__u32 saddr, daddr; __u16 sport, dport; __u8 sk_state, sk_family;
+};
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 4096);
@@ -190,7 +206,7 @@ static __always_inline bool mep_sys_wanted(__u64 nr)
 // (gadget.yaml) is published into the filter_pid map by the WASM control plane
 // (gadgetStart -> putFilter). When set to a non-zero pid, only events whose
 // CURRENT task tgid matches are emitted; pid==0 (the load-time default) means
-// "all processes" so the families are unfiltered unless the agent asks for a
+// "all processes" so the families are unfiltered unless the MCP client asks for a
 // pid. This runs in the TARGET process context for the userspace-uprobe
 // families (cuda/cuprof/lock/heap) and the syscall context for the kernel
 // process-context families (net connect/sendmsg, fs read/write/open, mm fault/
@@ -215,6 +231,106 @@ static __always_inline bool mep_proc_wanted(void)
 			return false;
 	}
 	return true;
+}
+
+// [per_conn_identity] Resolve a socket fd -> inet 4-tuple + TCP state via a
+// CO-RE fd-table walk (task->files->fdt->fd[n]->private_data as struct socket).
+// SAFE against non-socket fds: we validate the socket->file back-pointer equals
+// the file we walked from, then require skc_family in {AF_INET,AF_INET6}. Any
+// mismatch leaves the identity zeroed. Best-effort + read-only; a failed walk
+// (bad fd, closed race, non-inet) simply yields sk_family==0.
+#ifndef AF_INET
+#define AF_INET  2
+#endif
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
+struct mep_sockid { __u32 saddr, daddr; __u16 sport, dport; __u8 sk_state, sk_family; };
+
+static __always_inline void mep_resolve_sock_fd(int fd, struct mep_sockid *id)
+{
+	id->saddr = id->daddr = 0; id->sport = id->dport = 0;
+	id->sk_state = 0; id->sk_family = 0;
+	if (fd < 0 || fd >= 4096)
+		return;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	if (!task)
+		return;
+	struct files_struct *files = BPF_CORE_READ(task, files);
+	if (!files)
+		return;
+	struct fdtable *fdt = BPF_CORE_READ(files, fdt);
+	if (!fdt)
+		return;
+	unsigned int max_fds = BPF_CORE_READ(fdt, max_fds);
+	if ((unsigned int)fd >= max_fds)
+		return;
+	struct file **fd_array = BPF_CORE_READ(fdt, fd);
+	if (!fd_array)
+		return;
+	struct file *file = NULL;
+	bpf_probe_read_kernel(&file, sizeof(file), fd_array + fd);
+	if (!file)
+		return;
+	struct socket *sock = BPF_CORE_READ(file, private_data);
+	if (!sock)
+		return;
+	// back-pointer validation: a real struct socket points back at THIS file.
+	if (BPF_CORE_READ(sock, file) != file)
+		return;
+	struct sock *sk = BPF_CORE_READ(sock, sk);
+	if (!sk)
+		return;
+	__u16 fam = BPF_CORE_READ(sk, __sk_common.skc_family);
+	if (fam != AF_INET && fam != AF_INET6)
+		return;
+	id->sk_family = (__u8)fam;
+	id->sk_state  = (__u8)BPF_CORE_READ(sk, __sk_common.skc_state);
+	id->daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+	id->saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+	id->dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
+	id->sport = BPF_CORE_READ(sk, __sk_common.skc_num);
+}
+
+// [per_conn_identity/errno_decode] Read the INTENDED destination from a
+// userspace sockaddr pointer (connect(2) arg1, sendto(2) arg4). This fills in
+// daddr:dport even when the fd-resolved sock has no peer yet — i.e. on a
+// connect that is about to fail (ECONNREFUSED/EHOSTUNREACH) the row still names
+// the endpoint the process tried to reach. AF_INET only; best-effort user read.
+static __always_inline void mep_read_uaddr_dest(__u64 uaddr, __u32 *daddr, __u16 *dport)
+{
+	if (!uaddr)
+		return;
+	struct { __u16 fam; __u16 port; __u32 addr; } sa = {};
+	if (bpf_probe_read_user(&sa, sizeof(sa), (void *)uaddr) != 0)
+		return;
+	if (sa.fam != AF_INET)
+		return;
+	*dport = bpf_ntohs(sa.port);
+	*daddr = sa.addr;	// already network order
+}
+
+// x86_64 socket-relevant syscalls whose arg0 is an fd worth resolving. Kept
+// tight so the fd-table walk only runs on connection-carrying calls, not on
+// the whole syscall firehose.
+static __always_inline bool mep_is_sockcall(__u64 nr)
+{
+	switch (nr) {
+	case 0:   // read
+	case 1:   // write
+	case 3:   // close
+	case 42:  // connect
+	case 43:  // accept
+	case 44:  // sendto
+	case 45:  // recvfrom
+	case 46:  // sendmsg
+	case 47:  // recvmsg
+	case 48:  // shutdown
+	case 288: // accept4
+		return true;
+	default:
+		return false;
+	}
 }
 
 SEC("raw_tracepoint/sys_enter")
@@ -247,6 +363,35 @@ int mep_sys_enter(struct bpf_raw_tracepoint_args *ctx)
 	e->arg4 = (__u64)PT_REGS_PARM5_CORE_SYSCALL(regs);
 	e->arg5 = (__u64)PT_REGS_PARM6_CORE_SYSCALL(regs);
 	e->retval = 0;
+	// [per_conn_identity] resolve fd(arg0) -> 4-tuple+state for socket syscalls,
+	// stamp this enter row AND cache it for the matching exit row.
+	e->saddr = e->daddr = 0; e->sport = e->dport = 0; e->sk_state = e->sk_family = 0;
+	if (mep_is_sockcall(nr)) {
+		struct mep_sockid id;
+		mep_resolve_sock_fd((int)e->arg0, &id);
+		// connect(2): dest sockaddr is arg1; sendto(2): arg4. Fill the intended
+		// destination from userspace when the sock has no peer yet (pre/failed
+		// connect) so the row names WHO the process tried to reach.
+		if (id.daddr == 0) {
+			if (nr == 42)       // connect
+				mep_read_uaddr_dest(e->arg1, &id.daddr, &id.dport);
+			else if (nr == 44)  // sendto
+				mep_read_uaddr_dest(e->arg4, &id.daddr, &id.dport);
+			if (id.daddr && id.sk_family == 0)
+				id.sk_family = AF_INET;	// mark as inet even if fd-walk missed
+		}
+		e->saddr = id.saddr; e->daddr = id.daddr;
+		e->sport = id.sport; e->dport = id.dport;
+		e->sk_state = id.sk_state; e->sk_family = id.sk_family;
+		if (id.sk_family) {
+			struct mep_sysactive *ap = bpf_map_lookup_elem(&active_syscall, &pid_tgid);
+			if (ap) {
+				ap->saddr = id.saddr; ap->daddr = id.daddr;
+				ap->sport = id.sport; ap->dport = id.dport;
+				ap->sk_state = id.sk_state; ap->sk_family = id.sk_family;
+			}
+		}
+	}
 	gadget_submit_buf(ctx, &syscalls, e, sizeof(*e));
 	return 0;
 }
@@ -262,6 +407,10 @@ int mep_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 	__u64 nr = ap->nr;
 	__u64 enter_ts = ap->ts;
+	// [per_conn_identity] copy cached socket identity out BEFORE deleting.
+	struct mep_sockid xid = { .saddr = ap->saddr, .daddr = ap->daddr,
+		.sport = ap->sport, .dport = ap->dport,
+		.sk_state = ap->sk_state, .sk_family = ap->sk_family };
 	bpf_map_delete_elem(&active_syscall, &pid_tgid);
 
 	__u64 now = bpf_ktime_get_boot_ns();
@@ -276,18 +425,23 @@ int mep_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 	e->retval = (__s64)ctx->args[1];
 	// per-call wall-clock — no manual enter/ret correlation needed.
 	e->duration_ns = (enter_ts && now > enter_ts) ? (now - enter_ts) : 0;
+	// [per_conn_identity] stamp the exit row with the enter-time identity so the
+	// retval/errno (e.g. connect==-ECONNREFUSED) is attributed to the peer.
+	e->saddr = xid.saddr; e->daddr = xid.daddr;
+	e->sport = xid.sport; e->dport = xid.dport;
+	e->sk_state = xid.sk_state; e->sk_family = xid.sk_family;
 	gadget_submit_buf(ctx, &syscalls, e, sizeof(*e));
 	return 0;
 }
 
 
 // ===========================================================================
-// capability: attach_uprobe  -- runtime-retargetable uprobe/uretprobe on an
+// capability: attach_uprobe -- runtime-retargetable uprobe/uretprobe on an
 // arbitrary userspace symbol. Mirrors `attach` (kprobe) but for user space.
 // The WASM control plane rewrites programs.mep_uprobe.attach_to (and
-// .mep_uretprobe) to "<lib-or-abs-path>:<symbol>", e.g.
-//   /usr/lib/x86_64-linux-gnu/libssl.so.3:SSL_read   (absolute path), or
-//   libc:malloc                                       (library name; resolved
+//.mep_uretprobe) to "<lib-or-abs-path>:<symbol>", e.g.
+// /usr/lib/x86_64-linux-gnu/libssl.so.3:SSL_read (absolute path), or
+// libc:malloc (library name; resolved
 // via the target's /etc/ld.so.cache by IG's uprobetracer). The SEC default
 // below is a harmless self-reference ("ig:__mep_uprobe_dummy") so the object
 // loads even when this capability is disabled; the real target always arrives
@@ -332,13 +486,13 @@ int BPF_URETPROBE(mep_uretprobe, long retval)
 }
 
 // ===========================================================================
-// capability: cuda_memtrace  -- CUDA GPU memory alloc/free leak tracing via
+// capability: cuda_memtrace -- CUDA GPU memory alloc/free leak tracing via
 // uprobes on the CUDA driver (libcuda) and runtime (libcudart) allocators.
 // Emits one `cuda_event` per alloc and per free with the exact byte size and
-// device pointer, so an agent can reconcile alloc/free pairs and flag leaks
+// device pointer, so an MCP client can reconcile alloc/free pairs and flag leaks
 // (allocations with no matching free while a process is alive). Tracking is
 // per (pid, ptr) because device pointers are per-process. This is the
-// agent-facing, event-streaming counterpart of the upstream top_cuda_memory
+// client-facing, event-streaming counterpart of the upstream top_cuda_memory
 // gadget (which only keeps per-process running totals). Driver + runtime are
 // traced as SEPARATE libraries because cudaMalloc internally calls
 // cuMemAlloc_v2 on the same thread; sharing a per-tid context map would let
@@ -658,7 +812,7 @@ int BPF_URETPROBE(mep_cudart_free_async_ret, long ret)
 }
 
 // ===========================================================================
-// capability: list_attachable  -- iter/ksym enumerates kernel symbols from
+// capability: list_attachable -- iter/ksym enumerates kernel symbols from
 // inside eBPF (no host-FS read). A name-prefix (ksym_filter) and kallsyms
 // type-char (ksym_type) filter are applied in-kernel. Both are eBPF rodata
 // params: declared const volatile + GADGET_PARAM(), so the ebpf operator
@@ -673,7 +827,7 @@ GADGET_PARAM(ksym_filter);
 GADGET_PARAM(ksym_type);
 
 // ksym_max bounds how many matching symbols are emitted (0 == unlimited).
-// kallsyms has ~300k entries on a stock kernel; an agent doing discovery
+// kallsyms has ~300k entries on a stock kernel; an MCP client doing discovery
 // rarely needs them all, and an unbounded enumeration produces a multi-MiB
 // response. A small cap (e.g. 1000) keeps the result token-friendly while
 // the prefix/type filters narrow WHICH symbols are returned. The cap is
@@ -749,8 +903,8 @@ int mep_ksym(struct bpf_iter__ksym *ctx)
 	// kprobe_events parser rejects a '.' in the probe target with -EINVAL, so
 	// advertising them via list_attachable only yields an opaque
 	// "write /sys/kernel/tracing/kprobe_events: invalid argument" -32603 when an
-	// agent later attaches one (e.g. __alloc_pages_slowpath
-	// .constprop.0). A '.' in a kernel symbol name is the unambiguous marker of
+	// client later attaches one (e.g. __alloc_pages_slowpath
+	//.constprop.0). A '.' in a kernel symbol name is the unambiguous marker of
 	// such a non-attachable clone -- legitimate kprobe-able symbols never carry
 	// one -- so filter them at the producer (bounded scan of the stack copy).
 #pragma unroll
@@ -780,19 +934,19 @@ int mep_ksym(struct bpf_iter__ksym *ctx)
 
 
 // ===========================================================================
-// capability: cuda_profile  -- CUDA GPU *activity* profiling via uprobes on the
+// capability: cuda_profile -- CUDA GPU *activity* profiling via uprobes on the
 // driver (libcuda) launch / sync / host<->device copy entry points. Where
 // cuda_memtrace answers "is GPU memory leaking", cuda_profile answers "is the
 // GPU actually busy, and where is time going" — GPU occupancy/right-
 // sizing and PCIe-bound questions. It enriches each call with the SUBSYSTEM-
-// SPECIFIC arguments an agent needs:
-//   - cuLaunchKernel / cuLaunchKernelEx : grid (gx,gy,gz) and block (bx,by,bz)
-//     dimensions -> threads-per-launch, so an agent can see launch RATE and
-//     occupancy intent without reading SM counters.
-//   - cuMemcpyHtoD/DtoH(_Async)_v2      : transfer byteCount + direction, so an
-//     agent can see PCIe H2D/D2H volume and spot a copy-bound workload.
-//   - cuStreamSynchronize/cuCtxSynchronize : a SYNC barrier with a measured
-//     wall-clock DURATION (uprobe->uretprobe delta) -> host-side GPU wait time.
+// SPECIFIC arguments an MCP client needs:
+// - cuLaunchKernel / cuLaunchKernelEx : grid (gx,gy,gz) and block (bx,by,bz)
+// dimensions -> threads-per-launch, so an MCP client can see launch RATE and
+// occupancy intent without reading SM counters.
+// - cuMemcpyHtoD/DtoH(_Async)_v2 : transfer byteCount + direction, so an
+// client can see PCIe H2D/D2H volume and spot a copy-bound workload.
+// - cuStreamSynchronize/cuCtxSynchronize : a SYNC barrier with a measured
+// wall-clock DURATION (uprobe->uretprobe delta) -> host-side GPU wait time.
 // Each event carries op, the decoded args, and (for sync) duration_ns. This is
 // the launch/stall/transfer signal, correlated externally with an
 // NVML SM%/mem% sample. READ-ONLY: pure ABI observation.
@@ -810,7 +964,7 @@ struct cuprof_event {
 	struct gadget_process proc;
 
 	enum cuprof_op gpu_op_raw;
-	__u32 gx, gy, gz;	// grid dims  (launch)
+	__u32 gx, gy, gz;	// grid dims (launch)
 	__u32 bx, by, bz;	// block dims (launch)
 	__u64 bytes;		// transfer size (memcpy)
 	gadget_duration duration_ns;	// wall-clock of the call (sync); 0 otherwise
@@ -830,20 +984,20 @@ struct {
 	__type(value, __u64);	// entry ktime_ns
 } cuprof_sync_enter SEC(".maps");
 
-// --- cuda_profile server-side op-class filter  -----------
+// --- cuda_profile server-side op-class filter -----------
 // cuda_profile multiplexes FOUR op classes onto one cuprof_events ring:
-//   cuprof_launch (cuLaunchKernel*), cuprof_sync, cuprof_memcpy_h2d/d2h.
+// cuprof_launch (cuLaunchKernel*), cuprof_sync, cuprof_memcpy_h2d/d2h.
 // On a busy GPU box the kernel-LAUNCH stream dominates: a single closed-loop
 // PCIe-bottleneck repro emitted 115278 cuprof_launch rows vs only 646 memcpy
 // H2D/D2H rows (0.56%). Those rare copy rows — the ONLY ones carrying the H2D
 // byte volume that proves a PCIe copy bottleneck — get truncated out of the MCP
-// result window, so the agent sees only bytes:0 launch rows and cannot name the
+// result window, so the MCP client sees only bytes:0 launch rows and cannot name the
 // mechanism (validated end-to-end: cuda_profile returned
 // isTruncated=true, 0 memcpy rows surfaced). This mirrors the proven fs_op fix:
-// let the agent isolate ONE op class in-kernel so the diagnostic survives.
-//   copy  : keep only memcpy_h2d + memcpy_d2h (the PCIe transfer rows)
-//   launch: keep only kernel launches
-//   sync  : keep only stream/ctx synchronize
+// let the MCP client isolate ONE op class in-kernel so the diagnostic survives.
+// copy : keep only memcpy_h2d + memcpy_d2h (the PCIe transfer rows)
+// launch: keep only kernel launches
+// sync : keep only stream/ctx synchronize
 // Empty/all == keep every class (default, a no-op for the other consumers).
 #define CUDA_OP_FILTER_ALL    0
 #define CUDA_OP_FILTER_LAUNCH 1
@@ -898,8 +1052,8 @@ static __always_inline struct cuprof_event *cuprof_new(enum cuprof_op op)
 }
 
 // CUresult cuLaunchKernel(CUfunction f, uint gx, uint gy, uint gz,
-//                         uint bx, uint by, uint bz, uint shmem,
-//                         CUstream s, void **params, void **extra)
+// uint bx, uint by, uint bz, uint shmem,
+// CUstream s, void **params, void **extra)
 // Args: PARM2..PARM7 carry the 6 grid/block dims (PARM1 = the function handle).
 SEC("uprobe/libcuda:cuLaunchKernel")
 int BPF_UPROBE(mep_cuprof_launch)
@@ -925,7 +1079,7 @@ int BPF_UPROBE(mep_cuprof_launch)
 }
 
 // cuLaunchKernelEx(const CUlaunchConfig *cfg, CUfunction f, void **params,
-//                  void **extra) — grid/block live inside *cfg. We record the
+// void **extra) — grid/block live inside *cfg. We record the
 // launch event (dims read from the config struct: gridDimX/Y/Z then
 // blockDimX/Y/Z are the first 6 uints of CUlaunchConfig).
 SEC("uprobe/libcuda:cuLaunchKernelEx")
@@ -983,9 +1137,9 @@ int BPF_URETPROBE(mep_cuprof_ctxsync_ret, long ret) { return cuprof_sync_exit_fn
 
 // ---- memcpy: record direction + byteCount ----------------------------------
 // CUresult cuMemcpyHtoD_v2(CUdeviceptr dst, const void *src, size_t ByteCount)
-//   -> ByteCount is PARM3
+// -> ByteCount is PARM3
 // CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr dst, const void *src,
-//                               size_t ByteCount, CUstream s) -> PARM3
+// size_t ByteCount, CUstream s) -> PARM3
 SEC("uprobe/libcuda:cuMemcpyHtoD_v2")
 int BPF_UPROBE(mep_cuprof_h2d, u64 dst, void *src, u64 bytes)
 {
@@ -1026,15 +1180,15 @@ int BPF_UPROBE(mep_cuprof_d2h_async, void *dst, u64 src, u64 bytes)
 
 
 // ===========================================================================
-// capability: lock_trace  -- userspace lock CONTENTION via uprobes on the libc
+// capability: lock_trace -- userspace lock CONTENTION via uprobes on the libc
 // pthread synchronization primitives, measuring the WALL-CLOCK time each thread
 // spends BLOCKED. This is the userspace lock-contention signal:
-//   - pthread_mutex_lock(m)        : uprobe->uretprobe delta = time spent
-//     waiting to ACQUIRE the mutex (the contention cost). addr = &m.
-//   - pthread_cond_wait(c, m)      : delta = time blocked on the condvar. addr = &c.
-//   - pthread_cond_timedwait(c,m,t): same, bounded by the caller's timeout.
+// - pthread_mutex_lock(m) : uprobe->uretprobe delta = time spent
+// waiting to ACQUIRE the mutex (the contention cost). addr = &m.
+// - pthread_cond_wait(c, m) : delta = time blocked on the condvar. addr = &c.
+// - pthread_cond_timedwait(c,m,t): same, bounded by the caller's timeout.
 // An uncontended lock returns in tens of nanoseconds; a contended one shows
-// micro/millisecond waits, and the addr column lets an agent see that the waits
+// micro/millisecond waits, and the addr column lets an MCP client see that the waits
 // concentrate on ONE lock. We deliberately do NOT trace the (instantaneous)
 // unlock — the blocked-acquire duration is the contention signal. READ-ONLY.
 // ===========================================================================
@@ -1203,7 +1357,7 @@ int mep_lock_futex_enter(struct trace_event_raw_sys_enter *ctx)
 	p.ts = bpf_ktime_get_boot_ns();
 	p.addr = (__u64)ctx->args[0];	// uaddr (the lock/cond futex word)
 	p.op = lock_futex_wait;
-	//  (futex path): the contended pthread mutex blocks here in the
+	// (futex path): the contended pthread mutex blocks here in the
 	// kernel. Sample who currently holds uaddr (recorded by the
 	// pthread_mutex_lock uretprobe on a successful acquire) so this blocked
 	// waiter can attribute its stall to the owning thread. 0 if unknown.
@@ -1241,13 +1395,13 @@ int mep_lock_futex_exit(struct trace_event_raw_sys_exit *ctx)
 }
 
 // ===========================================================================
-// capability: heap_profile  -- userspace HEAP churn/leak via uprobes on the
+// capability: heap_profile -- userspace HEAP churn/leak via uprobes on the
 // libc allocator (malloc/calloc/realloc/free), emitting one event per call with
 // the requested size and the returned/freed pointer. This is the
 // userspace allocation signal at the C-library layer (the counterpart of
-// cuda_memtrace for host RAM): an agent reconciles alloc/free pairs to see
-//   - churn   : a high malloc+free RATE on the hot path (alloc==free, but huge), and
-//   - leak    : a sustained alloc>free imbalance (live bytes climbing).
+// cuda_memtrace for host RAM): an MCP client reconciles alloc/free pairs to see
+// - churn : a high malloc+free RATE on the hot path (alloc==free, but huge), and
+// - leak : a sustained alloc>free imbalance (live bytes climbing).
 // size is taken at uprobe entry (the request); ptr at uretprobe (the result),
 // matched per-tid. free carries the freed ptr (size unknown at libc layer, so
 // reconciliation is by ptr identity). READ-ONLY: pure allocator-ABI observation.
@@ -1490,22 +1644,22 @@ int mep_heap_mmap(struct trace_event_raw_sys_enter *ctx)
 // READ-ONLY: registers, BTF-typed tracepoint context, and CO-RE struct reads
 // only — never a writer helper.
 //
-//   capability = net_trace  -> Networking : tcp connect / retransmit / sendmsg
-//   capability = fs_trace   -> Filesystem : vfs_read / vfs_write / vfs_open
-//   capability = mm_trace   -> Memory mgmt: page faults + direct reclaim
-//   capability = irq_trace  -> Drivers/IRQ: softirq entry->exit duration
-//   capability = block_io   -> Block I/O  : per-request dev/sector/bytes/latency
-//   capability = runq_lat   -> Scheduler  : run-queue (wakeup->on-cpu) latency
+// capability = net_trace -> Networking : tcp connect / retransmit / sendmsg
+// capability = fs_trace -> Filesystem : vfs_read / vfs_write / vfs_open
+// capability = mm_trace -> Memory mgmt: page faults + direct reclaim
+// capability = irq_trace -> Drivers/IRQ: softirq entry->exit duration
+// capability = block_io -> Block I/O : per-request dev/sector/bytes/latency
+// capability = runq_lat -> Scheduler : run-queue (wakeup->on-cpu) latency
 // ===========================================================================
 
 // --------------------------------------------------------------- net_trace --
 // Networking subsystem. Decodes the connection 4-tuple + result needed to see WHY
 // connections are slow or failing:
-//   - tcp_v4_connect(sk,...)     : daddr/dport from struct sock (the target), and
-//     the kretprobe retval (0 ok; -ECONNREFUSED/-ETIMEDOUT etc. on failure).
-//   - tcp_retransmit_skb(sk,...) : a retransmit event for sk's 4-tuple (tail
-//     latency / loss signal).
-//   - tcp_sendmsg(sk,msg,size)   : bytes queued for send (throughput signal).
+// - tcp_v4_connect(sk,...) : daddr/dport from struct sock (the target), and
+// the kretprobe retval (0 ok; -ECONNREFUSED/-ETIMEDOUT etc. on failure).
+// - tcp_retransmit_skb(sk,...) : a retransmit event for sk's 4-tuple (tail
+// latency / loss signal).
+// - tcp_sendmsg(sk,msg,size) : bytes queued for send (throughput signal).
 enum net_op { net_connect, net_retransmit, net_sendmsg, net_udp_send, net_udp_recv };
 
 struct net_event {
@@ -1547,6 +1701,12 @@ static __always_inline void net_decode_sk(struct net_event *e, struct sock *sk)
 	__u16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
 	e->dport = bpf_ntohs(dport);
 	e->sport = BPF_CORE_READ(sk, __sk_common.skc_num);
+	// [per_conn_identity] socket state on EVERY net event (not just connect/
+	// retransmit): sendmsg/udp rows now prove WHICH tcp_state the socket was in
+	// when the write happened — e.g. a tcp_sendmsg on a CLOSE_WAIT(8) socket is
+	// the affirmative write-after-peer-FIN signal (write-after-peer-FIN), and an
+	// ESTABLISHED(1) vs SYN_SENT(2) sendmsg distinguishes live vs racing conn.
+	e->tcp_state = BPF_CORE_READ(sk, __sk_common.skc_state);
 }
 
 static __always_inline struct net_event *net_new(enum net_op op)
@@ -1623,7 +1783,7 @@ int BPF_KPROBE(mep_net_sendmsg, struct sock *sk, struct msghdr *msg, size_t size
 // name lookup" symptom shows no net evidence at all. udp_sendmsg/udp_recvmsg
 // decode the connected-socket 4-tuple (glibc connect()s the UDP socket for a
 // stub-resolver query, so skc_daddr/skc_dport are populated) and the byte
-// count, giving the agent direct visibility of the :53 request/response pair.
+// count, giving the MCP client direct visibility of the :53 request/response pair.
 SEC("kprobe/udp_sendmsg")
 int BPF_KPROBE(mep_net_udp_send, struct sock *sk, struct msghdr *msg, size_t size)
 {
@@ -1649,9 +1809,9 @@ int BPF_KPROBE(mep_net_udp_recv, struct sock *sk, struct msghdr *msg, size_t siz
 // ---------------------------------------------------------------- fs_trace --
 // Filesystem subsystem. Per-call VFS activity with the byte count + result, exposing a
 // hot read/write path or a failing open:
-//   - vfs_read(file,buf,count,pos)  : requested count (entry) + bytes read (ret)
-//   - vfs_write(file,buf,count,pos) : requested count (entry) + bytes written (ret)
-//   - vfs_open(path,file)           : open events (ret 0 ok / -errno)
+// - vfs_read(file,buf,count,pos) : requested count (entry) + bytes read (ret)
+// - vfs_write(file,buf,count,pos) : requested count (entry) + bytes written (ret)
+// - vfs_open(path,file) : open events (ret 0 ok / -errno)
 enum fs_op { fs_read, fs_write, fs_open, fs_filp_open, fs_io_submit, fs_io_uring_enter, fs_close };
 
 struct fs_event {
@@ -1677,13 +1837,13 @@ struct {
 // ---- fs_trace server-side filters -----------------------
 // The unfiltered fs_trace stream is dominated by system-wide vfs_read/vfs_write
 // (>500k events/window); a rare failing open (do_filp_open -> -ENOENT) is ~0.08%
-// and gets truncated out of the MCP result window before the agent ever sees it.
-// Two in-kernel reductions let the agent (or the gadget) cut that noise AT THE
+// and gets truncated out of the MCP result window before the MCP client ever sees it.
+// Two in-kernel reductions let the MCP client (or the gadget) cut that noise AT THE
 // SOURCE so the diagnostic rows survive truncation:
-//   1. filter_fs_op : keep only ONE op class, or only faults (retval<0). The
-//      agent selects it with the `fs_op` MCP param; default 0 == keep all.
-//   2. fs_is_self()  : ALWAYS drop the tracer's own ig / ig-mcp-server I/O so the
-//      gadget never reports its bookkeeping reads/writes as application activity.
+// 1. filter_fs_op : keep only ONE op class, or only faults (retval<0). The
+// client selects it with the `fs_op` MCP param; default 0 == keep all.
+// 2. fs_is_self() : ALWAYS drop the tracer's own ig / ig-mcp-server I/O so the
+// gadget never reports its bookkeeping reads/writes as application activity.
 #define FS_FILTER_ALL   0
 #define FS_FILTER_READ  1
 #define FS_FILTER_WRITE 2
@@ -1716,7 +1876,7 @@ static __always_inline bool fs_emit_wanted(enum fs_op op, __s64 ret)
 		return true;
 	if (*f == FS_FILTER_FAULT) {
 		// A "fault" is a GENUINE diagnostic error worth surfacing (ENOENT,
-		// EACCES, EIO, ENOSPC, ...). Benign flow-control returns are NOT faults
+		// EACCES, EIO, ENOSPC,...). Benign flow-control returns are NOT faults
 		// and, on a busy host, vfs_read on non-blocking sockets emits a CONSTANT
 		// -EAGAIN flood that drowns the rare diagnostic rows under MCP response
 		// truncation (validated: fs_op=fault carried 496 EAGAIN
@@ -1726,11 +1886,11 @@ static __always_inline bool fs_emit_wanted(enum fs_op op, __s64 ret)
 			return false;          // success path is never a fault
 		__s64 e = -ret;            // positive errno
 		if (e == 11  /* EAGAIN == EWOULDBLOCK */ ||
-		    e == 4   /* EINTR        */ ||
-		    e == 115 /* EINPROGRESS  */ ||
-		    e == 512 /* ERESTARTSYS  */ ||
+		    e == 4   /* EINTR */ ||
+		    e == 115 /* EINPROGRESS */ ||
+		    e == 512 /* ERESTARTSYS */ ||
 		    e == 513 /* ERESTARTNOINTR */ ||
-		    e == 514 /* ERESTARTNOHAND  */)
+		    e == 514 /* ERESTARTNOHAND */)
 			return false;          // benign flow-control, not a diagnostic fault
 		return true;               // genuine fault -> surface it
 	}
@@ -1808,7 +1968,7 @@ int BPF_KRETPROBE(mep_fs_open_ret, long ret) { return fs_rw_exit(ctx, ret); }
 
 // int filp_close(struct file *filp, fl_owner_t id) — the VFS close that backs
 // close(2) (and close-on-exec + exit-time fd teardown). It is the RELEASE side
-// that balances vfs_open above: with both an agent computes a per-PID
+// that balances vfs_open above: with both an MCP client computes a per-PID
 // open-minus-close balance, the fd-leak signal (opens that accumulate
 // with no matching close). Single-shot emit — close has no diagnostic return
 // worth pairing for the balance, so no enter/ret stash is needed.
@@ -1889,10 +2049,10 @@ int BPF_KRETPROBE(mep_fs_filp_open_ret, long ret)
 
 // ---------------------------------------------------------------- mm_trace --
 // Memory-management subsystem. Two complementary signals for observing memory pressure:
-//   - handle_mm_fault(...)    : page-fault RATE (minor/major fault pressure)
-//   - try_to_free_pages(...)  : DIRECT RECLAIM entry+duration (the smoking gun
-//     of memory pressure — the kernel is synchronously reclaiming to satisfy an
-//     allocation, stalling the faulting task).
+// - handle_mm_fault(...) : page-fault RATE (minor/major fault pressure)
+// - try_to_free_pages(...) : DIRECT RECLAIM entry+duration (the smoking gun
+// of memory pressure — the kernel is synchronously reclaiming to satisfy an
+// allocation, stalling the faulting task).
 enum mm_op { mm_fault, mm_reclaim };
 
 struct mm_event {
@@ -2040,7 +2200,7 @@ int mep_irq_exit(struct trace_event_raw_softirq *ctx)
 // async I/O submission. Neither io_submit(2) nor io_uring_enter(2) has a
 // sys_enter tracepoint, so we attach via ksyscall (libbpf resolves the arch
 // wrapper). These surface async-I/O submission that never appears as a
-// read()/write() syscall: an agent seeing high throughput but few rw syscalls
+// read()/write() syscall: an MCP client seeing high throughput but few rw syscalls
 // finds the work here. count = number of ops submitted in this call.
 SEC("ksyscall/io_uring_enter")
 int BPF_KSYSCALL(mep_fs_io_uring_enter, unsigned int fd, unsigned int to_submit, unsigned int min_complete, unsigned int flags)
@@ -2092,7 +2252,7 @@ struct blk_event {
 	__u64 bytes;
 	gadget_duration latency_ns;	// issue -> done
 	__u8  is_write;
-	__u8  req_op;		// [ENRICH] REQ_OP_* (0=READ 1=WRITE 2=FLUSH 3=DISCARD 9=WRITE_ZEROES ...) — explains bytes==0 (FLUSH/barrier carry no payload)
+	__u8  req_op;		// [ENRICH] REQ_OP_* (0=READ 1=WRITE 2=FLUSH 3=DISCARD 9=WRITE_ZEROES...) — explains bytes==0 (FLUSH/barrier carry no payload)
 	__u16 queue_depth;	// [ENRICH] in-flight block requests (device queue depth) this I/O observed at issue — makes a "deep queue" measurable next to latency_ns
 };
 
@@ -2203,7 +2363,7 @@ struct {
 	__type(value, __u64);	// enqueue ts
 } runq_enq SEC(".maps");
 
-// void ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags, ...)
+// void ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,...)
 SEC("kprobe/ttwu_do_activate")
 int BPF_KPROBE(mep_runq_enqueue, void *rq, struct task_struct *p)
 {
@@ -2255,34 +2415,34 @@ struct {
 // cuda_memsnapshot — STANDING per-PID GPU memory residency gauge (NVML)
 // ---------------------------------------------------------------------------
 // WHY THIS EXISTS (closed-loop capability gap):
-//   The event-delta family (cuda_memtrace) traces alloc/free as they happen.
-//   A process that RESERVES a large VRAM pool ONCE at startup — before any
-//   observation window — emits ZERO alloc/free events during capture, so the
-//   delta tracer is structurally blind to "reserved >> used" over-allocation.
-//   A SNAPSHOT is needed here: the current standing reservation per PID, not a
-//   stream of deltas. This capability provides exactly that.
+// The event-delta family (cuda_memtrace) traces alloc/free as they happen.
+// A process that RESERVES a large VRAM pool ONCE at startup — before any
+// observation window — emits ZERO alloc/free events during capture, so the
+// delta tracer is structurally blind to "reserved >> used" over-allocation.
+// A SNAPSHOT is needed here: the current standing reservation per PID, not a
+// stream of deltas. This capability provides exactly that.
 //
 // MECHANISM (read-only, piggyback on any NVML consumer — nvidia-smi, dcgm):
-//   uprobe  nvmlDeviceGetComputeRunningProcesses_v3(dev, *count, infos[]):
-//           stash the caller's count_ptr + infos_ptr (per tid).
-//   uretprobe (ret==0): read *count, walk the nvmlProcessInfo_v3_t[] array,
-//           emit one snapshot event per running PID with its usedGpuMemory.
-//   uretprobe nvmlDeviceGetMemoryInfo_v2(dev, *mem): emit device total/free/used.
+// uprobe nvmlDeviceGetComputeRunningProcesses_v3(dev, *count, infos[]):
+// stash the caller's count_ptr + infos_ptr (per tid).
+// uretprobe (ret==0): read *count, walk the nvmlProcessInfo_v3_t[] array,
+// emit one snapshot event per running PID with its usedGpuMemory.
+// uretprobe nvmlDeviceGetMemoryInfo_v2(dev, *mem): emit device total/free/used.
 //
-//   nvmlProcessInfo_v3_t layout (NVML >= R510):
-//       unsigned int       pid;            // @0
-//       unsigned long long usedGpuMemory;  // @8  (8-aligned -> 4 bytes pad @4)
-//       unsigned int       gpuInstanceId;  // @16
-//       unsigned int       computeInstanceId; // @20
-//   => stride 24 bytes; pid@0, usedGpuMemory@8.
+// nvmlProcessInfo_v3_t layout (NVML >= R510):
+// unsigned int pid; // @0
+// unsigned long long usedGpuMemory; // @8 (8-aligned -> 4 bytes pad @4)
+// unsigned int gpuInstanceId; // @16
+// unsigned int computeInstanceId; // @20
+// => stride 24 bytes; pid@0, usedGpuMemory@8.
 //
-//   nvmlMemory_v2_t layout:
-//       unsigned int       version;  // @0
-//       (4 pad)
-//       unsigned long long total;    // @8
-//       unsigned long long reserved; // @16
-//       unsigned long long free;     // @24
-//       unsigned long long used;     // @32
+// nvmlMemory_v2_t layout:
+// unsigned int version; // @0
+// (4 pad)
+// unsigned long long total; // @8
+// unsigned long long reserved; // @16
+// unsigned long long free; // @24
+// unsigned long long used; // @32
 //
 // READ-ONLY: pure observation; never alters NVML returns or buffers.
 // ===========================================================================
@@ -2300,7 +2460,7 @@ struct memsnap_event {
 	__u8  pad[4];
 	__u32 gpu_pid;			// the PID that HOLDS the memory (from NVML table)
 	__u64 used_gpu_mem;		// bytes this PID currently reserves on the GPU
-	__u64 dev_total;		// device: total bytes  (memsnap_device only)
+	__u64 dev_total;		// device: total bytes (memsnap_device only)
 	__u64 dev_free;			// device: free bytes
 	__u64 dev_used;			// device: used bytes
 	__u32 recent_sm_util;		// most-recent externally-sampled SM%% for gpu_pid (0 = no recent compute)
@@ -2339,7 +2499,7 @@ struct {
 
 // ---- compute-running-processes: capture output pointers on entry -----------
 // int nvmlDeviceGetComputeRunningProcesses_v3(dev, unsigned int *count,
-//                                             nvmlProcessInfo_v3_t *infos)
+// nvmlProcessInfo_v3_t *infos)
 SEC("uprobe/libnvidia-ml:nvmlDeviceGetComputeRunningProcesses_v3")
 int BPF_UPROBE(mep_memsnap_procs_enter, void *dev, void *count, void *infos)
 {
@@ -2484,34 +2644,34 @@ int BPF_URETPROBE(mep_memsnap_dev_ret, long ret)
 // cuda_smutil — STANDING per-PID GPU COMPUTE (SM) utilization gauge (NVML)
 // ---------------------------------------------------------------------------
 // WHY THIS EXISTS (closed-loop capability gap):
-//   cuda_memsnapshot answers "how much VRAM does each PID HOLD". But the F2
-//   over-allocation analysis also needs the orthogonal axis: "is that PID actually
-//   USING the GPU compute units, or just squatting on memory?". Kernel-launch
-//   COUNTS (cuda_profile) are a weak proxy — a PID can launch many tiny kernels
-//   yet drive ~0% SM, or launch few huge ones at 100% SM. The DIRECT hardware
-//   signal is per-PID SM-occupancy %, which NVML exposes via
-//   nvmlDeviceGetProcessUtilization(). With it, "idle-held (SM~0%) VRAM" is proven
-//   directly: PID holds N GiB AND smUtil==0%  ->  reclaimable.
+// cuda_memsnapshot answers "how much VRAM does each PID HOLD". But the F2
+// over-allocation analysis also needs the orthogonal axis: "is that PID actually
+// USING the GPU compute units, or just squatting on memory?". Kernel-launch
+// COUNTS (cuda_profile) are a weak proxy — a PID can launch many tiny kernels
+// yet drive ~0% SM, or launch few huge ones at 100% SM. The DIRECT hardware
+// signal is per-PID SM-occupancy %, which NVML exposes via
+// nvmlDeviceGetProcessUtilization(). With it, "idle-held (SM~0%) VRAM" is proven
+// directly: PID holds N GiB AND smUtil==0% -> reclaimable.
 //
 // MECHANISM (read-only, piggyback on any NVML consumer — nvidia-smi, dcgm,
-//            the cluster's per-PID GPU accounting agent):
-//   int nvmlDeviceGetProcessUtilization(dev,
-//           nvmlProcessUtilizationSample_t *utilization,   // arg1 (out buf)
-//           unsigned int *processSamplesCount,             // arg2 (in/out)
-//           unsigned long long lastSeenTimeStamp)          // arg3
-//   uprobe  : stash utilization_ptr (arg1) + count_ptr (arg2) per tid.
-//   uretprobe (ret==0): read *count, walk the sample[] array, emit one row per
-//             PID with its smUtil/memUtil percentages.
+// the cluster's per-PID GPU accounting daemon):
+// int nvmlDeviceGetProcessUtilization(dev,
+// nvmlProcessUtilizationSample_t *utilization, // arg1 (out buf)
+// unsigned int *processSamplesCount, // arg2 (in/out)
+// unsigned long long lastSeenTimeStamp) // arg3
+// uprobe : stash utilization_ptr (arg1) + count_ptr (arg2) per tid.
+// uretprobe (ret==0): read *count, walk the sample[] array, emit one row per
+// PID with its smUtil/memUtil percentages.
 //
-//   nvmlProcessUtilizationSample_t layout (NVML R384+):
-//       unsigned int       pid;       // @0
-//       (4 bytes pad @4 — next field is 8-aligned)
-//       unsigned long long timeStamp; // @8
-//       unsigned int       smUtil;    // @16  (% SM active for this PID)
-//       unsigned int       memUtil;   // @20  (% framebuffer BW for this PID)
-//       unsigned int       encUtil;   // @24
-//       unsigned int       decUtil;   // @28
-//   => stride 32 bytes; pid@0, smUtil@16, memUtil@20.
+// nvmlProcessUtilizationSample_t layout (NVML R384+):
+// unsigned int pid; // @0
+// (4 bytes pad @4 — next field is 8-aligned)
+// unsigned long long timeStamp; // @8
+// unsigned int smUtil; // @16 (% SM active for this PID)
+// unsigned int memUtil; // @20 (% framebuffer BW for this PID)
+// unsigned int encUtil; // @24
+// unsigned int decUtil; // @28
+// => stride 32 bytes; pid@0, smUtil@16, memUtil@20.
 //
 // READ-ONLY: pure observation; never alters NVML returns or buffers.
 // ===========================================================================
