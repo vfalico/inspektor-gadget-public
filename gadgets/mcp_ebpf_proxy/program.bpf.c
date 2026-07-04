@@ -125,6 +125,10 @@ struct event {
 	// stack_watermark_bytes threshold for this call chain (else 0). Fires at most
 	// once per tid call chain so a deep recursion does not spam an alarm per frame.
 	__u8  stack_alarm;
+	// [uprobe_argdecode] symbolized/string decode of a user-space argument at
+	// a uprobe: the actual $ref (path, host, method, Rust &str) instead of a
+	// raw pointer. Filled only when the uprobe_str_arg param selects an arg.
+	char arg_str[128];
 };
 
 GADGET_TRACER_MAP(events, 1024 * 256);
@@ -604,6 +608,16 @@ struct {
 const volatile __u32 stack_watermark_bytes = 0;
 GADGET_PARAM(stack_watermark_bytes);
 
+// [uprobe_argdecode] which uprobe arg (0-4) is a pointer to a user string to
+// decode into arg_str; 0xff (default) disables the decode. uprobe_str_len_arg
+// (0-4) optionally names an arg holding an explicit byte length for a
+// non-NUL-terminated string (Rust &str fat pointer: ptr,len); 0xff => read a
+// C NUL-terminated string. Lets an MCP client read the $ref at a uprobe.
+const volatile __u32 uprobe_str_arg = 0xff;
+GADGET_PARAM(uprobe_str_arg);
+const volatile __u32 uprobe_str_len_arg = 0xff;
+GADGET_PARAM(uprobe_str_len_arg);
+
 SEC("uprobe/__mep_uprobe_dummy")
 int BPF_UPROBE(mep_uprobe)
 {
@@ -622,6 +636,28 @@ int BPF_UPROBE(mep_uprobe)
 	e->arg2 = (__u64)PT_REGS_PARM3(ctx);
 	e->arg3 = (__u64)PT_REGS_PARM4(ctx);
 	e->arg4 = (__u64)PT_REGS_PARM5(ctx);
+	// [uprobe_argdecode] optionally decode a user-space string argument at this
+	// uprobe. uprobe_str_arg picks which arg (0-4) is the pointer; with
+	// uprobe_str_len_arg set we read an explicit length (Rust &str), else a C
+	// NUL-terminated string. arg_str stays empty on non-string uprobes.
+	if (uprobe_str_arg <= 4) {
+		__u64 uargs[8] = { e->arg0, e->arg1, e->arg2, e->arg3, e->arg4, 0, 0, 0 };
+		__u64 p = uargs[uprobe_str_arg & 7];
+		if (p) {
+			if (uprobe_str_len_arg <= 4) {
+				__u64 n = uargs[uprobe_str_len_arg & 7];
+				if (n >= sizeof(e->arg_str))
+					n = sizeof(e->arg_str) - 1;
+				bpf_probe_read_user(e->arg_str, n, (void *)p);
+				// terminate at the ACTUAL length: a shorter read must not
+				// expose stale ringbuf-slot tail bytes from a prior event
+				// (the doubling seen in unit-proof v1: 'envoy...15001er-...15001').
+				e->arg_str[n] = 0;
+			} else {
+				bpf_probe_read_user_str(e->arg_str, sizeof(e->arg_str), (void *)p);
+			}
+		}
+	}
 	// [uprobe_pairing] bump this tid's in-flight depth and stamp it.
 	// [stack_watermark] on the OUTERMOST entry, stamp entry_sp = current user SP
 	// as the call chain's stack base; on deeper hits emit stack_used = base - sp

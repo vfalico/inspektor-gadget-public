@@ -384,6 +384,9 @@ datasources:
 
   mep:
     fields:
+      arg_str:
+        annotations:
+          description: '[uprobe_argdecode] Decoded user-space STRING argument at a uprobe (path/host/method/Rust &str) when the uprobe_str_arg param selects a char* arg; empty otherwise. uprobe_str_len_arg gives an explicit byte length for non-NUL-terminated strings.'
       arg0:
         annotations:
           columns.hex: "true"
