@@ -827,6 +827,45 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
+  mep_sockstate:
+    fields:
+      ss_op:
+        annotations:
+          columns.width: "12"
+          description: 'Decoded op. For sock_state this is always "transition" (an inet_sock_set_state fired). sock_state adds reset_rx/reset_tx.'
+      ss_op_raw:
+        annotations:
+          columns.hidden: "true"
+          description: 'Raw integer enum backing ss_op.'
+      oldstate:
+        annotations:
+          description: '[sock_state] Previous TCP state (1=ESTABLISHED,2=SYN_SENT,3=SYN_RECV,4=FIN_WAIT1,5=FIN_WAIT2,6=TIME_WAIT,7=CLOSE,8=CLOSE_WAIT,9=LAST_ACK,10=LISTEN,11=CLOSING,12=NEW_SYN_RECV).'
+      newstate:
+        annotations:
+          description: '[sock_state] New TCP state. SYN_SENT(2)->CLOSE(7) with no ESTABLISHED(1) between = connection refused/never established; ESTABLISHED(1)->CLOSE_WAIT(8) = peer half-closed (sent FIN first).'
+      saddr:
+        annotations:
+          columns.hex: "true"
+          description: 'Local IPv4 (network order).'
+      daddr:
+        annotations:
+          columns.hex: "true"
+          description: 'Remote IPv4 (network order).'
+      sport:
+        annotations:
+          description: 'Local port (host order).'
+      dport:
+        annotations:
+          description: 'Remote port (host order).'
+      family:
+        annotations:
+          description: 'Address family (2=AF_INET, 10=AF_INET6).'
+      proc:
+        annotations:
+          description: 'Process context at the probe. Transitions often fire in softirq/timer context, so proc may name an incidentally-running task — key on the 4-tuple to correlate, not proc.'
+      timestamp_raw:
+        annotations:
+          description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column.'
   mep_sys:
     fields:
       arg0:
@@ -1101,7 +1140,7 @@ params:
         path, bytes, latency, and syscall return code/errno; supports fs_op=fault|filp_open
         to isolate FAILING opens such as openat->ENOENT from read/write noise), mm_trace
         (page-fault + direct reclaim), irq_trace (softirq service time), block_io
-        (per-request block latency), runq_lat (scheduler run-queue latency). NOTE on the NVML per-PID capabilities (cuda_memsnapshot/cuda_smutil): per-process GPU accounting (nvmlDeviceGetComputeRunningProcesses / GetProcessUtilization) needs an active CUDA context and sufficient permission, and is frequently STRUCTURALLY EMPTY inside a containerized pod — gpu_pid=0 / used_gpu_mem=0 for proc rows is EXPECTED there and is NOT an error or an attach failure. When proc rows are empty, read the device-wide rows (dev_total/dev_used/dev_free) as the authoritative VRAM signal instead of re-querying. A one-row mep_coverage record is emitted each run listing the attached targets + matched pid filter so attached-but-idle is distinguishable from attach-failed.'
+        (per-request block latency), runq_lat (scheduler run-queue latency), sock_state (TCP connection-lifecycle tracer via sock/inet_sock_set_state: emits old->new state + 4-tuple on EVERY transition, so SYN_SENT->CLOSE with no ESTABLISHED = refused and ESTABLISHED->CLOSE_WAIT = peer sent FIN first; datasource mep_sockstate, no attach target). NOTE on the NVML per-PID capabilities (cuda_memsnapshot/cuda_smutil): per-process GPU accounting (nvmlDeviceGetComputeRunningProcesses / GetProcessUtilization) needs an active CUDA context and sufficient permission, and is frequently STRUCTURALLY EMPTY inside a containerized pod — gpu_pid=0 / used_gpu_mem=0 for proc rows is EXPECTED there and is NOT an error or an attach failure. When proc rows are empty, read the device-wide rows (dev_total/dev_used/dev_free) as the authoritative VRAM signal instead of re-querying. A one-row mep_coverage record is emitted each run listing the attached targets + matched pid filter so attached-but-idle is distinguishable from attach-failed.'
       possibleValues:
       - attach
       - attach_uprobe
@@ -1119,6 +1158,7 @@ params:
       - irq_trace
       - block_io
       - runq_lat
+      - sock_state
     cuda_op:
       key: cuda_op
       defaultValue: ""

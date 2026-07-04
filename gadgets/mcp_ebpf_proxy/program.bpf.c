@@ -1842,6 +1842,65 @@ int BPF_KPROBE(mep_net_udp_recv, struct sock *sk, struct msghdr *msg, size_t siz
 	return 0;
 }
 
+// ============================================================= sock_state ==
+// capability: sock_state — TCP connection-lifecycle visibility.
+//
+// sock_state — sock/inet_sock_set_state tracepoint. EVERY TCP state transition for
+// the 4-tuple with old->new state. Directly answers "did this connection ever
+// reach ESTABLISHED or die in SYN_SENT?" and "when did the peer half-close
+// (ESTABLISHED->CLOSE_WAIT)?" without hand-diffing syscall traces.
+enum sockstate_op { ss_transition };
+
+struct sockstate_event {
+	gadget_timestamp timestamp_raw;
+	struct gadget_process proc;
+	enum sockstate_op ss_op_raw;
+	__u32 saddr;		// local IPv4 (network order)
+	__u32 daddr;		// remote IPv4 (network order)
+	__u16 sport;		// local port (host order)
+	__u16 dport;		// remote port (host order)
+	__s32 oldstate;		// [transition] previous TCP state
+	__s32 newstate;		// [transition] new TCP state
+	__u16 family;		// 2=AF_INET, 10=AF_INET6
+};
+
+GADGET_TRACER_MAP(sockstate_events, 1024 * 256);
+GADGET_TRACER(mep_sockstate, sockstate_events, sockstate_event);
+
+static __always_inline struct sockstate_event *sockstate_new(enum sockstate_op op)
+{
+	struct sockstate_event *e = gadget_reserve_buf(&sockstate_events, sizeof(*e));
+	if (!e) return 0;
+	e->timestamp_raw = bpf_ktime_get_boot_ns();
+	gadget_process_populate(&e->proc);
+	e->ss_op_raw = op;
+	e->saddr = e->daddr = 0; e->sport = e->dport = 0;
+	e->oldstate = e->newstate = 0; e->family = 0;
+	return e;
+}
+
+// sock_state: system-wide TCP state-transition tracer. Fires in both process and
+// softirq context (passive SYN_RECV->ESTABLISHED etc.), so it is NOT proc-gated
+// — the MCP client scopes by 4-tuple. TCP-only (protocol==IPPROTO_TCP==6).
+SEC("tracepoint/sock/inet_sock_set_state")
+int mep_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
+{
+	if (ctx->protocol != 6)	// IPPROTO_TCP
+		return 0;
+	struct sockstate_event *e = sockstate_new(ss_transition);
+	if (!e) return 0;
+	e->oldstate = ctx->oldstate;
+	e->newstate = ctx->newstate;
+	e->sport = ctx->sport;	// tracepoint stores host-order sport/dport
+	e->dport = ctx->dport;
+	e->family = ctx->family;
+	// saddr/daddr are raw __be32 stored in u8[4] arrays; copy the 4 bytes.
+	__builtin_memcpy(&e->saddr, ctx->saddr, 4);
+	__builtin_memcpy(&e->daddr, ctx->daddr, 4);
+	gadget_submit_buf(ctx, &sockstate_events, e, sizeof(*e));
+	return 0;
+}
+
 // ---------------------------------------------------------------- fs_trace --
 // Filesystem subsystem. Per-call VFS activity with the byte count + result, exposing a
 // hot read/write path or a failing open:

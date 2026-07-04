@@ -124,6 +124,14 @@ var netTracePrograms = []string{
 	"mep_net_retransmit", "mep_net_sendmsg",
 }
 
+// sock_state: TCP connection-lifecycle visibility (sock_state).
+// sock_state — mep_sock_set_state: sock/inet_sock_set_state tracepoint, every
+// old->new TCP transition for the 4-tuple. (sock_state extends this
+// list with the tcp_reset RST/FIN probes in a follow-up commit.)
+var sockStatePrograms = []string{
+	"mep_sock_set_state",
+}
+
 // fs_trace: filesystem (vfs_read/write byte counts, vfs_open result).
 var fsTracePrograms = []string{
 	"mep_fs_read", "mep_fs_read_ret",
@@ -157,7 +165,7 @@ var runqLatPrograms = []string{
 // assembly and the capability dispatch table.
 var enrichedFamilies = [][]string{
 	cudaProfilePrograms, lockTracePrograms, heapProfilePrograms,
-	netTracePrograms, fsTracePrograms, mmTracePrograms,
+	netTracePrograms, sockStatePrograms, fsTracePrograms, mmTracePrograms,
 	irqTracePrograms, blockIoPrograms, runqLatPrograms,
 }
 
@@ -459,6 +467,8 @@ func gadgetPreStart() int32 {
 		return preStartFixed("heap_profile", heapProfilePrograms)
 	case "net_trace":
 		return preStartFixed("net_trace", netTracePrograms)
+	case "sock_state":
+		return preStartFixed("sock_state", sockStatePrograms)
 	case "fs_trace":
 		return preStartFixed("fs_trace", fsTracePrograms)
 	case "mm_trace":
@@ -472,7 +482,7 @@ func gadgetPreStart() int32 {
 	case "list_attachable":
 		return preStartListAttachable()
 	default:
-		api.Errorf("mcp_ebpf_proxy: invalid capability %q; NEXT STEP: choose one of CORE{attach, attach_uprobe, trace_syscall, list_attachable} or ENRICHED{cuda_memtrace, cuda_profile, lock_trace, heap_profile, net_trace, fs_trace, mm_trace, irq_trace, block_io, runq_lat, cuda_smutil}. See capability_catalog.json for when-to-use of each", capability)
+		api.Errorf("mcp_ebpf_proxy: invalid capability %q; NEXT STEP: choose one of CORE{attach, attach_uprobe, trace_syscall, list_attachable} or ENRICHED{cuda_memtrace, cuda_profile, lock_trace, heap_profile, net_trace, sock_state, fs_trace, mm_trace, irq_trace, block_io, runq_lat, cuda_smutil}. See capability_catalog.json for when-to-use of each", capability)
 		return 1
 	}
 }
