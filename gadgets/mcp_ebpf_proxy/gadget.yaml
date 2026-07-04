@@ -772,6 +772,10 @@ datasources:
       dport:
         annotations:
           description: 'Destination TCP port (host order)'
+      dst_endpoint:
+        annotations:
+          template: l4endpoint
+          description: '[k8s_pod_meta] Remote peer as an L4 endpoint. In Kubernetes, IG''s KubeIPResolver enriches it to the destination pod name/namespace/UID + service, so a connect/retransmit can be aligned against the destination pod lifecycle (stale-endpoint).'
       net_op_raw:
         annotations:
           description: 'Raw integer enum backing the decoded column of the same name; prefer the decoded twin field.'

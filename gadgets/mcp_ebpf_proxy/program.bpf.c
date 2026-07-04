@@ -1878,10 +1878,36 @@ struct net_event {
 	__u32 retrans_out;	// [ENRICH] cumulative retransmits for this conn (icsk_retransmits)
 	__u8  tcp_state;	// [ENRICH] TCP state (connect: state at return; retransmit: state at loss)
 	gadget_duration connect_latency_ns;	// [ENRICH] tcp_v4_connect entry->return ns (connect op); 0 otherwise
+	struct gadget_l4endpoint_t dst_endpoint;	// [k8s_pod_meta] remote peer -> KubeIPResolver (pod/ns/UID)
 };
 
 GADGET_TRACER_MAP(net_events, 1024 * 256);
 GADGET_TRACER(mep_net, net_events, net_event);
+
+// [k8s_pod_meta] Publish the REMOTE peer of a net event as a
+// struct gadget_l4endpoint_t so IG's in-tree KubeIPResolver operator (which
+// keys on this exact BTF type) resolves daddr -> podName/namespace/UID +
+// service in user space when the gadget runs in Kubernetes. Mesh-critical for
+// a connect to a stale/dead endpoint:
+// it aligns "connect to 10.x" against the destination POD, not an opaque IP.
+//
+// Scoped to mep_net ONLY: every net event is definitionally an inet socket op
+// (tcp_*/udp_* kprobes), so version is ALWAYS 4. We set version=4 even when
+// daddr==0 (unresolved) -> formats as 0.0.0.0 -> KubeIPResolver GetPodByIp
+// returns nil -> row emitted unenriched (NO drop). Putting this type on a
+// datasource that also carries non-socket rows (mep_sys open/read of a file)
+// makes the l4endpoint formatter error "unknown IP version: 0" and DROP the row
+// (EmitAndRelease -> processEvent Warnf+continue). v4-only mirrors the
+// pre-existing v4-only daddr field (v6 is a separate enhancement).
+static __always_inline void mep_fill_net_ep(struct net_event *e)
+{
+	__builtin_memset(&e->dst_endpoint, 0, sizeof(e->dst_endpoint));
+	e->dst_endpoint.addr_raw.v4 = e->daddr;		// network order (matches.v4)
+	e->dst_endpoint.port = e->dport;		// already host order
+	e->dst_endpoint.proto_raw =
+		(e->net_op_raw == net_udp_send || e->net_op_raw == net_udp_recv) ? 17 : 6;
+	e->dst_endpoint.version = 4;
+}
 
 // ============================================================ per_key_rollup ==
 // per_key_rollup. A per-FLOW rollup view over the always-on net
@@ -2077,6 +2103,7 @@ int BPF_KRETPROBE(mep_net_connect_ret, int ret)
 	e->tcp_state = BPF_CORE_READ(sk, __sk_common.skc_state);
 	e->connect_latency_ns = bpf_ktime_get_boot_ns() - t0;
 	net_rollup_update(e);
+	mep_fill_net_ep(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
@@ -2093,6 +2120,7 @@ int BPF_KPROBE(mep_net_retransmit, struct sock *sk)
 	e->retrans_out = BPF_CORE_READ(icsk, icsk_retransmits);
 	e->tcp_state   = BPF_CORE_READ(sk, __sk_common.skc_state);
 	net_rollup_update(e);
+	mep_fill_net_ep(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
@@ -2105,6 +2133,7 @@ int BPF_KPROBE(mep_net_sendmsg, struct sock *sk, struct msghdr *msg, size_t size
 	net_decode_sk(e, sk);
 	e->bytes = size;
 	net_rollup_update(e);
+	mep_fill_net_ep(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
@@ -2123,6 +2152,7 @@ int BPF_KPROBE(mep_net_udp_send, struct sock *sk, struct msghdr *msg, size_t siz
 	net_decode_sk(e, sk);
 	e->bytes = size;
 	net_rollup_update(e);
+	mep_fill_net_ep(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
@@ -2135,6 +2165,7 @@ int BPF_KPROBE(mep_net_udp_recv, struct sock *sk, struct msghdr *msg, size_t siz
 	net_decode_sk(e, sk);
 	e->bytes = size;
 	net_rollup_update(e);
+	mep_fill_net_ep(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
