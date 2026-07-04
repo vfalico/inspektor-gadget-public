@@ -32,6 +32,55 @@
 #include <gadget/types.h>
 
 // ===========================================================================
+// [per_conn_identity] shared socket-identity primitives (per_conn_identity).
+// Hoisted so EVERY family stamps the 4-tuple + TCP state where a socket is in
+// scope: attach (generic kprobe arg0-as-sock), trace_syscall (fd->sock),
+// fs_trace (file->sock on read/write/close), net_trace (sk directly).
+// ===========================================================================
+#ifndef AF_INET
+#define AF_INET  2
+#endif
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
+
+struct mep_sockid { __u32 saddr, daddr; __u16 sport, dport; __u8 sk_state, sk_family; };
+
+// Decode 4-tuple + TCP state from a struct sock*. SAFE on a garbage pointer:
+// the skc_family gate (AF_INET/AF_INET6) rejects non-sockets, leaving
+// sk_family=0 ("arg was not an inet socket").
+static __always_inline void mep_decode_sk(struct sock *sk, struct mep_sockid *id)
+{
+	id->saddr = id->daddr = 0; id->sport = id->dport = 0;
+	id->sk_state = 0; id->sk_family = 0;
+	if (!sk)
+		return;
+	__u16 fam = BPF_CORE_READ(sk, __sk_common.skc_family);
+	if (fam != AF_INET && fam != AF_INET6)
+		return;
+	id->sk_family = (__u8)fam;
+	id->sk_state  = (__u8)BPF_CORE_READ(sk, __sk_common.skc_state);
+	id->daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+	id->saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+	id->dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
+	id->sport = BPF_CORE_READ(sk, __sk_common.skc_num);
+}
+
+// Resolve struct file* -> struct sock* (NULL if not a socket). Validates the
+// socket->file back-pointer to reject a file whose private_data is not a socket.
+static __always_inline struct sock *mep_sock_from_file(struct file *file)
+{
+	if (!file)
+		return 0;
+	struct socket *sock = BPF_CORE_READ(file, private_data);
+	if (!sock)
+		return 0;
+	if (BPF_CORE_READ(sock, file) != file)
+		return 0;
+	return BPF_CORE_READ(sock, sk);
+}
+
+// ===========================================================================
 // capability: attach -- runtime-retargetable kprobe/kretprobe
 // (kept byte-identical to the proven first-cut programs)
 // ===========================================================================
@@ -55,6 +104,12 @@ struct event {
 	__u64 arg3;
 	__u64 arg4;
 	__s64 retval;
+	// [per_conn_identity attach] best-effort socket identity when arg0 is a
+	// struct sock* (the dominant net-family kprobe target: tcp_*, udp_*,
+	// inet_*). sk_family=0 => arg0 was not an inet socket (ignore the 4-tuple).
+	__u32 saddr, daddr;
+	__u16 sport, dport;
+	__u8  sk_state, sk_family;
 };
 
 GADGET_TRACER_MAP(events, 1024 * 256);
@@ -71,6 +126,8 @@ static __always_inline struct event *mep_new(enum mep_phase phase)
 	e->func[0] = '\0';
 	e->arg0 = e->arg1 = e->arg2 = e->arg3 = e->arg4 = 0;
 	e->retval = 0;
+	e->saddr = e->daddr = 0; e->sport = e->dport = 0;
+	e->sk_state = e->sk_family = 0;
 	return e;
 }
 
@@ -85,6 +142,10 @@ int BPF_KPROBE(mep_kprobe)
 	e->arg2 = (__u64)PT_REGS_PARM3(ctx);
 	e->arg3 = (__u64)PT_REGS_PARM4(ctx);
 	e->arg4 = (__u64)PT_REGS_PARM5(ctx);
+	// [per_conn_identity attach] stamp the 4-tuple+state if arg0 is a sock.
+	{ struct mep_sockid _id; mep_decode_sk((struct sock *)e->arg0, &_id);
+	  e->saddr = _id.saddr; e->daddr = _id.daddr; e->sport = _id.sport;
+	  e->dport = _id.dport; e->sk_state = _id.sk_state; e->sk_family = _id.sk_family; }
 	gadget_submit_buf(ctx, &events, e, sizeof(*e));
 	return 0;
 }
@@ -239,13 +300,6 @@ static __always_inline bool mep_proc_wanted(void)
 // the file we walked from, then require skc_family in {AF_INET,AF_INET6}. Any
 // mismatch leaves the identity zeroed. Best-effort + read-only; a failed walk
 // (bad fd, closed race, non-inet) simply yields sk_family==0.
-#ifndef AF_INET
-#define AF_INET  2
-#endif
-#ifndef AF_INET6
-#define AF_INET6 10
-#endif
-struct mep_sockid { __u32 saddr, daddr; __u16 sport, dport; __u8 sk_state, sk_family; };
 
 static __always_inline void mep_resolve_sock_fd(int fd, struct mep_sockid *id)
 {
@@ -270,26 +324,8 @@ static __always_inline void mep_resolve_sock_fd(int fd, struct mep_sockid *id)
 		return;
 	struct file *file = NULL;
 	bpf_probe_read_kernel(&file, sizeof(file), fd_array + fd);
-	if (!file)
-		return;
-	struct socket *sock = BPF_CORE_READ(file, private_data);
-	if (!sock)
-		return;
-	// back-pointer validation: a real struct socket points back at THIS file.
-	if (BPF_CORE_READ(sock, file) != file)
-		return;
-	struct sock *sk = BPF_CORE_READ(sock, sk);
-	if (!sk)
-		return;
-	__u16 fam = BPF_CORE_READ(sk, __sk_common.skc_family);
-	if (fam != AF_INET && fam != AF_INET6)
-		return;
-	id->sk_family = (__u8)fam;
-	id->sk_state  = (__u8)BPF_CORE_READ(sk, __sk_common.skc_state);
-	id->daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
-	id->saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
-	id->dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
-	id->sport = BPF_CORE_READ(sk, __sk_common.skc_num);
+	// shared decode: file -> sock -> 4-tuple + state (per_conn_identity primitives).
+	mep_decode_sk(mep_sock_from_file(file), id);
 }
 
 // [per_conn_identity/errno_decode] Read the INTENDED destination from a
@@ -1821,12 +1857,18 @@ struct fs_event {
 	__u64 count;		// requested bytes (read/write)
 	__s64 retval;		// bytes transferred OR open result (0 ok / -errno)
 	char fname[256];	// failing-open path (fs_filp_open); empty for rw/open
+	// [per_conn_identity fs] populated when the fd is actually a socket — an
+	// fs read/write/close on a TCP/UDP socket. Makes "write on a CLOSE_WAIT(8)
+	// socket" (write-after-peer-FIN) visible. sk_family=0 for regular files.
+	__u32 saddr, daddr;
+	__u16 sport, dport;
+	__u8  sk_state, sk_family;
 };
 
 GADGET_TRACER_MAP(fs_events, 1024 * 256);
 GADGET_TRACER(mep_fs, fs_events, fs_event);
 
-struct fs_pending { enum fs_op op; __u64 count; char name[128]; };
+struct fs_pending { enum fs_op op; __u64 count; char name[128]; struct mep_sockid sid; };
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
@@ -1908,10 +1950,12 @@ static __always_inline bool fs_emit_wanted(enum fs_op op, __s64 ret)
 }
 
 static __always_inline int fs_rw_enter_named(enum fs_op op, __u64 count,
-					    struct dentry *de)
+					    struct dentry *de, struct sock *sk)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct fs_pending p = { .op = op, .count = count };
+	// [per_conn_identity fs] stash socket identity if this fd is a socket.
+	mep_decode_sk(sk, &p.sid);
 	// capture the dentry leaf name (e.g. "app.conf") so fs_trace rows
 	// answer WHICH file, not just how much I/O. Bounded kernel-str read; leaf
 	// only (not full path) to stay clear of the bpf_d_path hook allowlist.
@@ -1925,7 +1969,7 @@ static __always_inline int fs_rw_enter_named(enum fs_op op, __u64 count,
 }
 static __always_inline int fs_rw_enter(enum fs_op op, __u64 count)
 {
-	return fs_rw_enter_named(op, count, NULL);
+	return fs_rw_enter_named(op, count, NULL, (struct sock *)0);
 }
 static __always_inline int fs_rw_exit(void *ctx, long ret)
 {
@@ -1933,6 +1977,7 @@ static __always_inline int fs_rw_exit(void *ctx, long ret)
 	struct fs_pending *p = bpf_map_lookup_elem(&fs_pending_map, &tid);
 	if (!p) return 0;
 	enum fs_op op = p->op; __u64 count = p->count;
+	struct mep_sockid sid = p->sid;
 	bpf_map_delete_elem(&fs_pending_map, &tid);
 	if (!mep_proc_wanted())
 		return 0;
@@ -1946,23 +1991,25 @@ static __always_inline int fs_rw_exit(void *ctx, long ret)
 	// surface the leaf filename captured at enter (empty if unknown).
 	__builtin_memcpy(e->fname, p->name, sizeof(e->fname) < sizeof(p->name) ? sizeof(e->fname) : sizeof(p->name));
 	e->fname[sizeof(e->fname) - 1] = '\0';
+	e->saddr = sid.saddr; e->daddr = sid.daddr; e->sport = sid.sport;
+	e->dport = sid.dport; e->sk_state = sid.sk_state; e->sk_family = sid.sk_family;
 	gadget_submit_buf(ctx, &fs_events, e, sizeof(*e));
 	return 0;
 }
 
 // ssize_t vfs_read(struct file *, char __user *, size_t count, loff_t *pos)
 SEC("kprobe/vfs_read")
-int BPF_KPROBE(mep_fs_read, struct file *f, void *buf, size_t count) { return fs_rw_enter_named(fs_read, count, BPF_CORE_READ(f, f_path.dentry)); }
+int BPF_KPROBE(mep_fs_read, struct file *f, void *buf, size_t count) { return fs_rw_enter_named(fs_read, count, BPF_CORE_READ(f, f_path.dentry), mep_sock_from_file(f)); }
 SEC("kretprobe/vfs_read")
 int BPF_KRETPROBE(mep_fs_read_ret, long ret) { return fs_rw_exit(ctx, ret); }
 
 SEC("kprobe/vfs_write")
-int BPF_KPROBE(mep_fs_write, struct file *f, void *buf, size_t count) { return fs_rw_enter_named(fs_write, count, BPF_CORE_READ(f, f_path.dentry)); }
+int BPF_KPROBE(mep_fs_write, struct file *f, void *buf, size_t count) { return fs_rw_enter_named(fs_write, count, BPF_CORE_READ(f, f_path.dentry), mep_sock_from_file(f)); }
 SEC("kretprobe/vfs_write")
 int BPF_KRETPROBE(mep_fs_write_ret, long ret) { return fs_rw_exit(ctx, ret); }
 
 SEC("kprobe/vfs_open")
-int BPF_KPROBE(mep_fs_open, struct path *path) { return fs_rw_enter_named(fs_open, 0, BPF_CORE_READ(path, dentry)); }
+int BPF_KPROBE(mep_fs_open, struct path *path) { return fs_rw_enter_named(fs_open, 0, BPF_CORE_READ(path, dentry), (struct sock *)0); }
 SEC("kretprobe/vfs_open")
 int BPF_KRETPROBE(mep_fs_open_ret, long ret) { return fs_rw_exit(ctx, ret); }
 
@@ -1991,6 +2038,11 @@ int BPF_KPROBE(mep_fs_close, struct file *f)
 		if (nm)
 			bpf_probe_read_kernel_str(e->fname, sizeof(e->fname), nm);
 	}
+	// [per_conn_identity fs] a close on a socket fd names the 4-tuple+state at
+	// teardown (e.g. close of a socket still in ESTABLISHED = abortive close).
+	{ struct mep_sockid _id; mep_decode_sk(mep_sock_from_file(f), &_id);
+	  e->saddr = _id.saddr; e->daddr = _id.daddr; e->sport = _id.sport;
+	  e->dport = _id.dport; e->sk_state = _id.sk_state; e->sk_family = _id.sk_family; }
 	gadget_submit_buf(ctx, &fs_events, e, sizeof(*e));
 	return 0;
 }

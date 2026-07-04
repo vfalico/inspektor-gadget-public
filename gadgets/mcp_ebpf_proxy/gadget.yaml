@@ -406,6 +406,28 @@ datasources:
           columns.hex: "true"
           columns.hidden: "true"
           description: Fifth argument (PT_REGS_PARM5) at kprobe entry
+      daddr:
+        annotations:
+          columns.hex: "true"
+          description: '[per_conn_identity attach] Remote IPv4 (network order) when arg0(PARM1) is a struct sock* — the dominant net-family kprobe convention (tcp_*, udp_*, inet_*, sk_*). 0 if arg0 is not an inet socket (see sk_family).'
+      dport:
+        annotations:
+          description: '[per_conn_identity attach] Remote port (host order) when arg0 is a struct sock*; 0 otherwise.'
+      saddr:
+        annotations:
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: '[per_conn_identity attach] Local IPv4 (network order) when arg0 is a struct sock*; 0 otherwise.'
+      sport:
+        annotations:
+          columns.hidden: "true"
+          description: '[per_conn_identity attach] Local port (host order) when arg0 is a struct sock*; 0 otherwise.'
+      sk_state:
+        annotations:
+          description: '[per_conn_identity attach] TCP state of arg0-as-sock (1=ESTABLISHED,2=SYN_SENT,8=CLOSE_WAIT,9=LAST_ACK,...); 0 if arg0 is not an inet socket. Lets a bare kprobe on e.g. tcp_sendmsg/tcp_close self-annotate the connection state with NO extra capability.'
+      sk_family:
+        annotations:
+          description: '[per_conn_identity attach] Address family of arg0-as-sock (2=AF_INET,10=AF_INET6). 0 => arg0(PARM1) was NOT a struct sock* (regular kprobe target) — ignore the 4-tuple/state fields in that case.'
       func:
         annotations:
           columns.width: "24"
@@ -548,6 +570,28 @@ datasources:
       fname:
         annotations:
           description: 'Leaf filename of the target (e.g. "app.conf") for read/write/open, or the requested path for a failing open — answers WHICH file the I/O hit (empty only if the dentry was unavailable)'
+      daddr:
+        annotations:
+          columns.hex: "true"
+          description: '[per_conn_identity fs] Remote IPv4 (network order) when the read/write/close fd is a SOCKET (not a regular file). 0 for regular-file I/O.'
+      dport:
+        annotations:
+          description: '[per_conn_identity fs] Remote port (host order) for a socket fd; 0 for regular files.'
+      saddr:
+        annotations:
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: '[per_conn_identity fs] Local IPv4 (network order) for a socket fd; 0 for regular files.'
+      sport:
+        annotations:
+          columns.hidden: "true"
+          description: '[per_conn_identity fs] Local port (host order) for a socket fd; 0 for regular files.'
+      sk_state:
+        annotations:
+          description: '[per_conn_identity fs] TCP state at the fs op on a socket fd. A vfs_write with sk_state=8 (CLOSE_WAIT) is the affirmative write-after-peer-FIN signal; a filp_close with sk_state=1 (ESTABLISHED) is an abortive close. 0 for regular files.'
+      sk_family:
+        annotations:
+          description: '[per_conn_identity fs] 2=AF_INET,10=AF_INET6 when the fd is a socket; 0 => regular file/pipe (ignore the 4-tuple).'
       fs_op_raw:
         annotations:
           description: 'Raw integer enum backing the decoded column of the same name; prefer the decoded twin field.'
