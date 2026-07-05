@@ -1,4 +1,4 @@
-# Output evals for mep-ebpf-debug (correct capability + params selection)
+# Output evals for ebpf-proxy-debug (correct capability + params selection)
 # Scenario -> expected capability & decisive params. Verified shapes match
 # references/verified-runs.md captured on slavanestedvm.
 

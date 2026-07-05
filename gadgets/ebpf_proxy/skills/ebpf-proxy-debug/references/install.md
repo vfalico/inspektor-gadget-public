@@ -1,7 +1,7 @@
-# Installing MEP + `ig` (no MCP server needed)
+# Installing eBPF Proxy + `ig` (no MCP server needed)
 
-MEP runs as an OCI gadget through the `ig` CLI. You need: a BTF-enabled Linux
-kernel, `ig`, and the `mcp_ebpf_proxy:mep` image in the local `ig` store.
+eBPF Proxy runs as an OCI gadget through the `ig` CLI. You need: a BTF-enabled Linux
+kernel, `ig`, and the `ebpf_proxy:latest` image in the local `ig` store.
 
 ## 1. Prereqs
 - Kernel with BTF: `test -r /sys/kernel/btf/vmlinux` (Ubuntu 22.04+/24.04, Azure
@@ -19,24 +19,24 @@ sudo install ./ig /usr/local/bin/ig
 ig version
 ```
 
-## 3. Build the MEP image into the local ig store
-From the branch that carries the gadget (`mep`):
+## 3. Build the eBPF Proxy image into the local ig store
+From the branch that carries the gadget (`ebpf_proxy`):
 ```bash
-cd gadgets/mcp_ebpf_proxy
-sudo ig image build -t mcp_ebpf_proxy:mep --local .   # needs clang/libbpf
-sudo ig image list | grep mcp_ebpf_proxy              # confirm
+cd gadgets/ebpf_proxy
+sudo ig image build -t ebpf_proxy:latest --local .   # needs clang/libbpf
+sudo ig image list | grep ebpf_proxy              # confirm
 ```
 `--local` builds with the local toolchain (no builder container).
 
 ## 4. Smoke test
 ```bash
-sudo ig run mcp_ebpf_proxy:mep --verify-image=false \
+sudo ig run ebpf_proxy:latest --verify-image=false \
   --capability=list_attachable --filter=do_sys_open --max=3 -o columns
 ```
-You should see `do_sys_openat2` etc. Or run `scripts/mep-doctor.sh`.
+You should see `do_sys_openat2` etc. Or run `scripts/ebpf-proxy-doctor.sh`.
 
 ## 5. Kubernetes / AKS
 For in-cluster use, deploy Inspektor Gadget (`kubectl gadget deploy`) and
-`kubectl gadget run mcp_ebpf_proxy:mep ...`, OR use a node debug session
+`kubectl gadget run ebpf_proxy:latest ...`, OR use a node debug session
 (`kubectl debug node/<n>` + `nsenter`) and run `ig` directly on the node.
-See the `mep-aks-azure-debug` skill.
+See the `ebpf-proxy-aks-azure-debug` skill.

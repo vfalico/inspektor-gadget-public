@@ -1,4 +1,4 @@
-# Trigger evals for mep-ebpf-debug (tune the description)
+# Trigger evals for ebpf-proxy-debug (tune the description)
 # 24 prompts: 16 SHOULD trigger, 8 should NOT. Run by checking whether the
 # description's trigger phrases match the prompt intent.
 
@@ -28,7 +28,7 @@
 21. "review this PR for style" (static review)
 22. "what's the git blame on this line?" (VCS)
 23. "design a REST API for users" (design)
-24. "profile my GPU kernel VRAM residency" (-> mep-gpu-debug skill, not this one)
+24. "profile my GPU kernel VRAM residency" (-> ebpf-proxy-gpu-debug skill, not this one)
 
 # PASS = each SHOULD maps to a capability in the decision map; each should-NOT is declined
-# or routed elsewhere. #24 is the deliberate boundary with mep-gpu-debug.
+# or routed elsewhere. #24 is the deliberate boundary with ebpf-proxy-gpu-debug.

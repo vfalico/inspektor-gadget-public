@@ -1,4 +1,4 @@
-# MEP gotchas (each verified on slavanestedvm, kernel 6.17.0-1018-azure)
+# eBPF Proxy gotchas (each verified on slavanestedvm, kernel 6.17.0-1018-azure)
 
 ## 1. Signature verification blocks local images
 A locally-built/unsigned image fails with
@@ -9,7 +9,7 @@ A locally-built/unsigned image fails with
 The gadget.yaml *display names* are `ksym_filter`, `ksym_max`, `ksym_type`, but
 the CLI flags are the `key:` fields: **`--filter`**, **`--max`**, **`--type`**.
 `--ksym_filter` errors `unknown flag: --ksym_filter`. Confirm with
-`ig run mcp_ebpf_proxy:mep --verify-image=false --help`.
+`ig run ebpf_proxy:latest --verify-image=false --help`.
 
 ## 3. `list_attachable` renders in columns, not JSON events
 Symbols come out on the `symbols` datasource as `TYPE NAME MODULE`. In this build
@@ -21,15 +21,15 @@ enumeration needs a moment.
 ## 4. `-o json` nests process identity under `proc.*`
 `proc.comm`, `proc.pid`, `proc.tid`, `proc.parent.comm`, `proc.creds.uid`.
 A naive top-level `row["comm"]` is `None`. `-o columns` flattens to `COMM`/`PID`.
-`scripts/mep-summarize.py` resolves both shapes.
+`scripts/ebpf-proxy-summarize.py` resolves both shapes.
 
 ## 5. `--pid` (gadget) vs `operator.oci.wasm.pid`
 Use the gadget `--pid` to FILTER EVENTS (in-kernel `filter_pid` map). The WASM
 operator's `pid` param only scopes uprobe ATTACH resolution — it does not filter
 event output.
 
-## 6. `mep_coverage`: attached-but-idle vs attach-fail
-Every run emits one `mep_coverage` record (`capability`, `attached_targets`,
+## 6. `ebpf_proxy_coverage`: attached-but-idle vs attach-fail
+Every run emits one `ebpf_proxy_coverage` record (`capability`, `attached_targets`,
 `attached_count`, `pid_filter`, `note`). `attached_count > 0` with **zero events**
 = attached-but-idle: WIDEN `--timeout`/`--pid`; do NOT switch capability. This is
 the #1 source of false "it didn't work".
@@ -42,7 +42,7 @@ short `--timeout`, and op-class filters (`fs_op=fault`, `cuda_op=copy`) first.
 ## 8. NVML per-PID GPU fields are often 0 in containers
 `gpu_pid`, `used_gpu_mem`, `sm_util` are frequently structurally empty inside
 containers by NVML design — **0 is expected**, not a bug. Use device-level
-`dev_total`/`dev_used`/`dev_free`. (GPU details in the `mep-gpu-debug` skill.)
+`dev_total`/`dev_used`/`dev_free`. (GPU details in the `ebpf-proxy-gpu-debug` skill.)
 
 ## 9. columns mode prints a header block per datasource
 `-o columns` prints a header for EVERY datasource in the gadget (fs/net/heap/runq/

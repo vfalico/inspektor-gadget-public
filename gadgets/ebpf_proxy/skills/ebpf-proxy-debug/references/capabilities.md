@@ -1,8 +1,8 @@
-# MEP capability catalog (params + fields) — 20 capabilities
+# eBPF Proxy capability catalog (params + fields) — 20 capabilities
 
-Invocation: `sudo ig run mcp_ebpf_proxy:mep --verify-image=false --capability=<CAP> [params] --timeout=<s> -o json`
+Invocation: `sudo ig run ebpf_proxy:latest --verify-image=false --capability=<CAP> [params] --timeout=<s> -o json`
 Common params: `--pid=<N>` (in-kernel event filter), `--timeout=<s>`.
-Every run emits one `mep_coverage` record (see gotchas.md #6). Socket-bearing rows
+Every run emits one `ebpf_proxy_coverage` record (see gotchas.md #6). Socket-bearing rows
 carry the **inline 4-tuple** `saddr/daddr/sport/dport/sk_state/sk_family` — see
 `connection-identity.md`.
 
@@ -19,21 +19,21 @@ carry the **inline 4-tuple** `saddr/daddr/sport/dport/sk_state/sk_family` — se
 
 ### trace_syscall — raw_syscalls enter/exit for a pid
 - params: `--syscall=<name>` (openat, execve, kill, ...), `--pid=<N>`
-- fields (`mep_sys`): `syscall(DECODED), syscall_nr_raw, arg0..arg5, retval, duration_ns, phase` + inline 4-tuple
+- fields (`ebpf_proxy_sys`): `syscall(DECODED), syscall_nr_raw, arg0..arg5, retval, duration_ns, phase` + inline 4-tuple
 
 ### list_attachable — enumerate kprobe-able kallsyms
 - params: `--filter=<prefix>` (key `filter`), `--max=<n>` (key `max`), `--type=<char>` (key `type`, e.g. `t`)
 - renders in `-o columns` as `TYPE NAME MODULE` (TYPE 116 = 't' = function). See gotchas #2/#3.
 
-### cuda_memtrace / cuda_memsnapshot / cuda_smutil / cuda_profile — GPU (see mep-gpu-debug skill)
+### cuda_memtrace / cuda_memsnapshot / cuda_smutil / cuda_profile — GPU (see ebpf-proxy-gpu-debug skill)
 
 ## ENRICHED swiss-army families (decoded per-subsystem columns; fixed SEC-default targets)
-### fs_trace — VFS read/write/open (datasource `mep_fs`)
+### fs_trace — VFS read/write/open (datasource `ebpf_proxy_fs`)
 - params: `--fs_op=fault|filp_open|close`, `--pid=<N>`
 - fields: `fname, retval(errno as -N), fs_op, fs_op_raw, count` + inline 4-tuple
 - `fs_op=fault` = only failing opens (ENOENT/EACCES); best for "can't find config".
 
-### net_trace — TCP connect/retransmit/sendmsg (datasource `mep_net`)
+### net_trace — TCP connect/retransmit/sendmsg (datasource `ebpf_proxy_net`)
 - fields: `daddr, saddr, dport, sport, bytes, retval, retrans_out, tcp_state, connect_latency_ns, net_op_raw, dst_endpoint(peer, k8s-resolved)`
 
 ### heap_profile — libc malloc/free churn+leak
@@ -46,23 +46,23 @@ carry the **inline 4-tuple** `saddr/daddr/sport/dport/sk_state/sk_family` — se
 ### runq_lat — scheduler run-queue latency (`cpu, runq_ns`) — VERY HIGH RATE, always scope
 
 ## Socket-state, correlation, event-loop & reliability capabilities (detail in the domain references)
-### sock_state — TCP state-machine + RST direction (datasource `mep_sockstate`) → socket-lifecycle.md
+### sock_state — TCP state-machine + RST direction (datasource `ebpf_proxy_sockstate`) → socket-lifecycle.md
 - fields: `ss_op(transition|reset_rx|reset_tx), ss_op_raw, oldstate, newstate, saddr/daddr/sport/dport, family, reset_dir(0/1/2), sk_null`
 - decisive: `SYN_SENT→CLOSE` no ESTABLISHED = refused; `ESTABLISHED→CLOSE_WAIT` = peer FIN; `sk_null=1` = stale-endpoint RST.
 
-### sock_snapshot — point-in-time TCP iterator (datasource `mep_socksnap`) → socket-lifecycle.md
+### sock_snapshot — point-in-time TCP iterator (datasource `ebpf_proxy_socksnap`) → socket-lifecycle.md
 - fields: `saddr/daddr/sport/dport, family, state, netns_id, sock_kind, srtt_us, rto, retransmits, snd_cwnd, sndq_bytes, unacked_bytes, rcvq_bytes, last_snd_ts`
 - decisive: high `unacked_bytes`+`retransmits` = peer not ACKing; high `rcvq_bytes` = app not reading.
 
-### sockpair_correlate — downstream↔upstream socket link (datasource `mep_sockpair`) → connection-identity.md
+### sockpair_correlate — downstream↔upstream socket link (datasource `ebpf_proxy_sockpair`) → connection-identity.md
 - fields: `down_{saddr,daddr,sport,dport}, up_{saddr,daddr,sport,dport}, down_state, up_state, up_retval, accept_to_connect_ns, proc`
 - decisive: one row = one proxied flow; `up_retval<0` = backend refused; big `accept_to_connect_ns` = proxy routing latency.
 
-### epoll_timer — event-loop causal chain (datasource `mep_timer`) → event-loop.md
+### epoll_timer — event-loop causal chain (datasource `ebpf_proxy_timer`) → event-loop.md
 - fields: `kind_raw, fd, nready, ev_mask, op, expires_ns, timer_ptr, proc`
 - decisive: `epoll_wait nready=0` spin = spurious wakeups; arm without re-arm = heartbeat timer died.
 
-### absence_assert — proof a periodic write stopped (datasource `mep_absence`) → reliability-asserts.md
+### absence_assert — proof a periodic write stopped (datasource `ebpf_proxy_absence`) → reliability-asserts.md
 - params: `--host`, `--absence_period_ns=<ns>` (0 = observational INFO only)
 - fields: `verdict, saddr/daddr/sport/dport, state, last_write_gap_ns, expected_period_ns, observed_max_gap_ns, write_count, closing_evts`
 - decisive: `verdict=FAIL` + `closing_evts=0` = silent app stall; `+closing_evts>0` = flow closed.
@@ -71,9 +71,9 @@ carry the **inline 4-tuple** `saddr/daddr/sport/dport/sk_state/sk_family` — se
 - fields: `saddr/daddr/sport/dport, count, bytes_sum, gap_min_ns, gap_max_ns, gap_sum_ns, retrans_count, rst_count, closing_evts, last_state, first_ts_raw, last_ts_raw, pid, comm`
 - decisive: anti-truncation — one row/flow; rank by `retrans_count`/`rst_count`; `gap_max_ns` spike = periodic stall.
 
-### uprobe_argdecode — symbolized string arg (`arg_str` on `mep`) → event-loop.md
-### stack_watermark — near-overflow one-shot alarm (`stack_used`,`stack_alarm` on `mep`) → event-loop.md
-### call_depth pairing — recursion/never-returned (`call_depth`,`phase` on `mep`) → event-loop.md
+### uprobe_argdecode — symbolized string arg (`arg_str` on `ebpf_proxy`) → event-loop.md
+### stack_watermark — near-overflow one-shot alarm (`stack_used`,`stack_alarm` on `ebpf_proxy`) → event-loop.md
+### call_depth pairing — recursion/never-returned (`call_depth`,`phase` on `ebpf_proxy`) → event-loop.md
 ### kern_user_correlate — userspace fd → kernel socket (inline 4-tuple on uprobe rows) → connection-identity.md
 ### inline per_conn_identity — 4-tuple on every socket-bearing event (all datasources) → connection-identity.md
 

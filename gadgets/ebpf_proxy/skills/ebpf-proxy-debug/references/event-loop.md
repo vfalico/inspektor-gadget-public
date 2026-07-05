@@ -5,7 +5,7 @@ a stalled event loop, a call that recursed without returning, or a stack creepin
 toward overflow. All three are about **control-flow depth and timer/epoll causality**,
 not data.
 
-## 1. `epoll_timer` — event-loop causal chain (datasource `mep_timer`)
+## 1. `epoll_timer` — event-loop causal chain (datasource `ebpf_proxy_timer`)
 
 Traces the timer/epoll machinery an event loop is built on: `timerfd`, `hrtimer`,
 and `epoll_wait` readiness. This is how you see *why an event loop went quiet* or
@@ -38,7 +38,7 @@ and `epoll_wait` readiness. This is how you see *why an event loop went quiet* o
 
 Every `attach`/`attach_uprobe` row carries `phase` (`enter`|`ret`) and, for the
 uprobe pairing engine, `call_depth` — the in-flight nesting depth of the same
-call chain on the same thread. MEP auto-pairs enter/return.
+call chain on the same thread. eBPF Proxy auto-pairs enter/return.
 
 | field | meaning |
 |---|---|
@@ -76,7 +76,7 @@ When a uprobe target's argument is a `char *` (a path, a URL, a query, a hostnam
 the actual payload key without a userspace debugger.
 
 - attach with `attach_uprobe --target=<lib-or-binary>:<symbol>`; read `arg_str`
-  alongside `arg0..arg4` on the `mep` datasource.
+  alongside `arg0..arg4` on the `ebpf_proxy` datasource.
 - Combine with `call_depth`/`phase` to see *which* recursion level passed *which*
   string.
 

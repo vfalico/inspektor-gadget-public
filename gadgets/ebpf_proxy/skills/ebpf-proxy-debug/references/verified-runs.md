@@ -1,27 +1,27 @@
-# MEP verified runs — copy-paste commands with REAL captured output
+# eBPF Proxy verified runs — copy-paste commands with REAL captured output
 
 All captured on **slavanestedvm** (kernel 6.17.0-1018-azure, Ubuntu 24.04,
-image `mcp_ebpf_proxy:mep`) via plain `ig run` — no MCP server. Row counts are
+image `ebpf_proxy:latest`) via plain `ig run` — no MCP server. Row counts are
 the actual events captured in a short window against a synthetic workload
 (`workload.py`: fails to open `/etc/myapp/missing.conf`, connects to a refused
 localhost port, mallocs, spins).
 
 ## fs_trace (failing opens) — 578 events
 ```bash
-sudo ig run mcp_ebpf_proxy:mep --verify-image=false \
+sudo ig run ebpf_proxy:latest --verify-image=false \
   --capability=fs_trace --fs_op=fault --pid=<PID> --timeout=6 -o json
 ```
 Real event + coverage:
 ```json
 {"comm":"python3","pid":55577,"fname":"/etc/myapp/missing.conf","retval":-2,"fs_op":"fs_filp_open","count":0}
-mep_coverage: {"capability":"fs_trace","attached_count":8,"pid_filter":55577,
-  "attached_targets":"mep_fs_read,mep_fs_read_ret,mep_fs_write,mep_fs_write_ret,mep_fs_open,mep_fs_open_ret,mep_fs_filp_open,mep_fs_filp_open_ret"}
+ebpf_proxy_coverage: {"capability":"fs_trace","attached_count":8,"pid_filter":55577,
+  "attached_targets":"ebpf_proxy_fs_read,ebpf_proxy_fs_read_ret,ebpf_proxy_fs_write,ebpf_proxy_fs_write_ret,ebpf_proxy_fs_open,ebpf_proxy_fs_open_ret,ebpf_proxy_fs_filp_open,ebpf_proxy_fs_filp_open_ret"}
 ```
 `retval:-2` = ENOENT. Fix: create the file / correct the path, re-run -> 0 rows.
 
 ## net_trace (connect/retransmit) — 577 events
 ```bash
-sudo ig run mcp_ebpf_proxy:mep --verify-image=false \
+sudo ig run ebpf_proxy:latest --verify-image=false \
   --capability=net_trace --pid=<PID> --timeout=6 -o json
 ```
 ```json
@@ -31,7 +31,7 @@ sudo ig run mcp_ebpf_proxy:mep --verify-image=false \
 
 ## trace_syscall (per-syscall latency) — 2308 events
 ```bash
-sudo ig run mcp_ebpf_proxy:mep --verify-image=false \
+sudo ig run ebpf_proxy:latest --verify-image=false \
   --capability=trace_syscall --syscall=openat --pid=<PID> --timeout=6 -o json
 ```
 ```json
@@ -41,7 +41,7 @@ sudo ig run mcp_ebpf_proxy:mep --verify-image=false \
 
 ## attach (raw kprobe/kretprobe on a kernel symbol) — 13362 events
 ```bash
-sudo ig run mcp_ebpf_proxy:mep --verify-image=false \
+sudo ig run ebpf_proxy:latest --verify-image=false \
   --capability=attach --function=do_sys_openat2 --mode=kprobe_kretprobe \
   --pid=<PID> --timeout=6 -o json
 ```
@@ -53,19 +53,19 @@ sudo ig run mcp_ebpf_proxy:mep --verify-image=false \
 
 ## heap_profile (libc malloc/free) — system-wide
 ```bash
-sudo ig run mcp_ebpf_proxy:mep --verify-image=false \
+sudo ig run ebpf_proxy:latest --verify-image=false \
   --capability=heap_profile --pid=<PID> --timeout=6 -o json
 ```
 ```json
 {"size":null,"ptr":null,"heap_op":null,"proc.comm":null}   # sample; attaches 9 uprobes
-mep_coverage: attached_count=9 (malloc/calloc/realloc/free/brk/mmap + rets)
+ebpf_proxy_coverage: attached_count=9 (malloc/calloc/realloc/free/brk/mmap + rets)
 ```
 With a tight pid + short window you may see only the coverage row
 (attached-but-idle) — widen the window or run system-wide.
 
 ## runq_lat (scheduler run-queue latency) — 366266 events in ~6 s (HIGH RATE)
 ```bash
-sudo ig run mcp_ebpf_proxy:mep --verify-image=false \
+sudo ig run ebpf_proxy:latest --verify-image=false \
   --capability=runq_lat --pid=<PID> --timeout=3 -o json    # ALWAYS scope
 ```
 ```json
@@ -75,7 +75,7 @@ Unscoped this floods — filter by `--pid` and a short `--timeout`.
 
 ## list_attachable (enumerate kprobe-able symbols) — columns mode
 ```bash
-sudo ig run mcp_ebpf_proxy:mep --verify-image=false \
+sudo ig run ebpf_proxy:latest --verify-image=false \
   --capability=list_attachable --filter=tcp_v4 --max=8 --type=t -o columns
 ```
 Output (TYPE NAME MODULE; TYPE 116 = 't' = function):

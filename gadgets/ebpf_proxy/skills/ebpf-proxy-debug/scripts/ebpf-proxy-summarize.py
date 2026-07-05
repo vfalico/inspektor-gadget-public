@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize MEP `-o json` (stdin): separate mep_coverage from events, resolve
+"""Summarize eBPF Proxy `-o json` (stdin): separate ebpf_proxy_coverage from events, resolve
 proc.*, report top files/ports/return-codes so an agent reads signal not 10^5 rows."""
 import sys, json, collections
 cov=None; ev=[]
@@ -18,7 +18,7 @@ def g(d,*ks):
             if v is None: break
         if v is not None: return v
     return None
-print("=== mep_coverage ===")
+print("=== ebpf_proxy_coverage ===")
 if cov:
     print(json.dumps({k:cov.get(k) for k in ('capability','attached_count','pid_filter','attached_targets')}))
     if not ev: print("!! attached-but-idle: probes ON, no events. WIDEN --timeout/--pid; do NOT switch capability.")

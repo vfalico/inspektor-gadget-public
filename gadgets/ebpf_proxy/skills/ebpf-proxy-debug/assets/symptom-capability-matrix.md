@@ -1,4 +1,4 @@
-# MEP symptom → capability matrix (embeddable)
+# eBPF Proxy symptom → capability matrix (embeddable)
 
 | Symptom | Capability | Key params | Decisive field |
 |---|---|---|---|
@@ -31,8 +31,8 @@
 | RCA a kernel function | attach | `--function=SYM --mode=kprobe_kretprobe --pid=N` | `retval`, `phase`, `call_depth` |
 | RCA a userspace lib function | attach_uprobe | `--target=lib:sym --pid=N` | `retval`, `phase`, `arg_str` |
 | Which kernel symbols exist? | list_attachable | `--filter=PFX --max=N --type=t` | `NAME` |
-| GPU VRAM leak / residency / SM% | (mep-gpu-debug) | cuda_memtrace/memsnapshot/smutil | `used_gpu_mem`, `sm_util` |
+| GPU VRAM leak / residency / SM% | (ebpf-proxy-gpu-debug) | cuda_memtrace/memsnapshot/smutil | `used_gpu_mem`, `sm_util` |
 
-Always: read `mep_coverage` first; scope with `--pid` + short `--timeout`; every
+Always: read `ebpf_proxy_coverage` first; scope with `--pid` + short `--timeout`; every
 socket-bearing row already carries the inline 4-tuple (`saddr/daddr/sport/dport/
 sk_state`) so you seldom need a second capability just to identify the connection.

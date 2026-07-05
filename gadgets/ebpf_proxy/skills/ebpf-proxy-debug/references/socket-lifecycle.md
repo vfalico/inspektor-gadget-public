@@ -5,7 +5,7 @@ Three capabilities answer "what is happening to this TCP connection": `sock_stat
 and `sock_snapshot` (the *right-now* view). Together they distinguish the classic
 ambiguous failures: **refused vs reset vs peer-closed vs stale-endpoint**.
 
-## 1. `sock_state` — TCP state-machine tracer (datasource `mep_sockstate`)
+## 1. `sock_state` — TCP state-machine tracer (datasource `ebpf_proxy_sockstate`)
 
 Fires on `inet_sock_set_state` (every TCP state transition) plus the two RST paths.
 Key fields:
@@ -33,7 +33,7 @@ Key fields:
   something is talking to an endpoint that has already gone away (common after a
   crashed/restarted backend; the 4-tuple names who is still knocking).
 
-## 2. `sock_snapshot` — point-in-time per-socket TCP iterator (datasource `mep_socksnap`)
+## 2. `sock_snapshot` — point-in-time per-socket TCP iterator (datasource `ebpf_proxy_socksnap`)
 
 A one-pass walk of live TCP sockets (`iter/tcp`) — the "what does this connection
 look like RIGHT NOW" view, independent of whether any event is firing. Fields:

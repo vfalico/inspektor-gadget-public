@@ -4,7 +4,7 @@ Most tracers answer "what happened?". These two answer the harder questions
 "what SHOULD have happened but DIDN'T?" (`absence_assert`) and "what is the
 aggregate shape of this flow?" (`per_key_rollup`) — without shipping every event.
 
-## 1. `absence_assert` — proof that a periodic write stopped (datasource `mep_absence`)
+## 1. `absence_assert` — proof that a periodic write stopped (datasource `ebpf_proxy_absence`)
 
 A keepalive, SSE stream, heartbeat, or health-ping is *supposed* to write on the
 socket every N ms. When it silently stops, a normal tracer shows **nothing** — and

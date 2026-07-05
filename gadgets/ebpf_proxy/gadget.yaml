@@ -1,4 +1,4 @@
-name: mcp ebpf proxy
+name: ebpf_proxy
 description: |
   Single multi-capability, read-only kernel+GPU observation gadget that exposes
   generic eBPF tracing to MCP clients through ig-mcp-server as ONE MCP tool. The
@@ -34,7 +34,7 @@ description: |
                         whole window even when alloc/free traffic is quiet.
     - cuda_smutil : STANDING per-PID GPU COMPUTE (SM) utilization via NVML
                         (snapshot %); the recent_sm_util / reserved_unused_bytes idle-VRAM fields are
-                        on cuda_memsnapshot (mep_memsnap), not here. Orthogonal to cuda_memsnapshot's VRAM
+                        on cuda_memsnapshot (ebpf_proxy_memsnap), not here. Orthogonal to cuda_memsnapshot's VRAM
                         gauge — shows whether each PID is actually DRIVING the
                         SMs or merely holding memory while idle (smUtil/memUtil).
     - cuda_profile : GPU launch/sync/memcpy + grid/block dims, stream, size.
@@ -73,8 +73,8 @@ description: |
   For everything kernel/driver/GPU-resident, the capabilities above DO apply —
   this boundary note only prevents dead-end loops on app-internal telemetry.
 homepageURL: https://inspektor-gadget.io/
-documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/mcp_ebpf_proxy
-sourceURL: 'https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/mcp_ebpf_proxy'
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/ebpf_proxy
+sourceURL: 'https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/ebpf_proxy'
 datasources:
   blk_events:
     fields:
@@ -355,7 +355,7 @@ datasources:
           description: Bytes this PID currently RESERVES on the GPU right now (standing
             snapshot, not a delta) — compare against its active working set (reservation
             vs. what is actually used)
-  mep_coverage:
+  ebpf_proxy_coverage:
     annotations:
       description: 'attach-confirmation / coverage feedback: one row emitted
         per run for the enriched/GPU capabilities, describing what was actually
@@ -382,7 +382,7 @@ datasources:
             from attach-failed, and documents the NVML per-PID structural-empty
             case for the cuda_memsnapshot/cuda_smutil capabilities.
 
-  mep:
+  ebpf_proxy:
     fields:
       arg_str:
         annotations:
@@ -470,7 +470,7 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
-  mep_blk:
+  ebpf_proxy_blk:
     fields:
       bytes:
         annotations:
@@ -505,7 +505,7 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
-  mep_cuda:
+  ebpf_proxy_cuda:
     fields:
       is_runtime:
         annotations:
@@ -534,7 +534,7 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
-  mep_cuprof:
+  ebpf_proxy_cuprof:
     fields:
       bx:
         annotations:
@@ -576,7 +576,7 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
-  mep_fs:
+  ebpf_proxy_fs:
     fields:
       count:
         annotations:
@@ -621,7 +621,7 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
-  mep_heap:
+  ebpf_proxy_heap:
     fields:
       heap_op_raw:
         annotations:
@@ -644,7 +644,7 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
-  mep_irq:
+  ebpf_proxy_irq:
     fields:
       duration_ns:
         annotations:
@@ -661,7 +661,7 @@ datasources:
         annotations:
           value.unit: "count"
           description: 'Softirq vector (0=HI 1=TIMER 2=NET_TX 3=NET_RX 4=BLOCK 6=TASKLET 7=SCHED 9=RCU)'
-  mep_lock:
+  ebpf_proxy_lock:
     fields:
       addr:
         annotations:
@@ -688,7 +688,7 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
-  mep_memsnap:
+  ebpf_proxy_memsnap:
     fields:
       dev_free:
         annotations:
@@ -738,7 +738,7 @@ datasources:
           value.unit: "bytes"
           value.semantics: "instantaneous_snapshot"
           description: 'Bytes this PID currently RESERVES on the GPU right now (standing snapshot, not a delta) — compare against its active working set (reservation vs. what is actually used)'
-  mep_mm:
+  ebpf_proxy_mm:
     fields:
       duration_ns:
         annotations:
@@ -758,7 +758,7 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
-  mep_net:
+  ebpf_proxy_net:
     fields:
       bytes:
         annotations:
@@ -806,7 +806,7 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
-  mep_runq:
+  ebpf_proxy_runq:
     fields:
       cpu:
         annotations:
@@ -823,7 +823,7 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
-  mep_smutil:
+  ebpf_proxy_smutil:
     fields:
       mem_util:
         annotations:
@@ -837,7 +837,7 @@ datasources:
         annotations:
           value.unit: "percent"
           value.semantics: "interval_averaged_5s"
-          description: 'Percent of GPU SM (compute) capacity this PID is actively using right now (0-100). Pair with cuda_memsnapshot.used_gpu_mem: a PID with large used_gpu_mem but sm_util near 0 holds VRAM without doing compute work. NOTE: the idle-VRAM cross-product fields recent_sm_util / reserved_unused_bytes live on the cuda_memsnapshot datasource (mep_memsnap), NOT on mep_smutil — filter/group_by those THERE.'
+          description: 'Percent of GPU SM (compute) capacity this PID is actively using right now (0-100). Pair with cuda_memsnapshot.used_gpu_mem: a PID with large used_gpu_mem but sm_util near 0 holds VRAM without doing compute work. NOTE: the idle-VRAM cross-product fields recent_sm_util / reserved_unused_bytes live on the cuda_memsnapshot datasource (ebpf_proxy_memsnap), NOT on ebpf_proxy_smutil — filter/group_by those THERE.'
       smu_pid:
         annotations:
           description: 'PID whose GPU compute utilization this row reports (from the NVML per-process utilization table)'
@@ -847,7 +847,7 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column for wall-clock.'
-  mep_sockpair:
+  ebpf_proxy_sockpair:
     fields:
       down_saddr:
         annotations:
@@ -896,7 +896,7 @@ datasources:
         annotations:
           columns.hidden: "true"
           description: 'Correlation time (upstream connect return), raw ktime ns.'
-  mep_sockstate:
+  ebpf_proxy_sockstate:
     fields:
       ss_op:
         annotations:
@@ -943,7 +943,7 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column.'
-  mep_absence:
+  ebpf_proxy_absence:
     fields:
       verdict:
         annotations:
@@ -990,7 +990,7 @@ datasources:
         annotations:
           columns.width: "8"
           description: 'Writes seen while the socket was in a closing state (write-after-peer-FIN shape) -> FAIL_AFTER_FIN'
-  mep_socksnap:
+  ebpf_proxy_socksnap:
     fields:
       saddr:
         annotations:
@@ -1049,7 +1049,7 @@ datasources:
         annotations:
           columns.hidden: "true"
           description: '[sock_snapshot] tp->lsndtime (raw) -- last data-send timestamp, for idle-duration reasoning. Full sockets only.'
-  mep_timer:
+  ebpf_proxy_timer:
     fields:
       timestamp_raw:
         annotations:
@@ -1081,7 +1081,7 @@ datasources:
       timer_ptr:
         annotations:
           description: 'hrtimer kernel address — the arm<->fire correlation key; also the epfd handle on epoll_ctl rows.'
-  mep_sys:
+  ebpf_proxy_sys:
     fields:
       arg0:
         annotations:
@@ -1446,7 +1446,7 @@ params:
         path, bytes, latency, and syscall return code/errno; supports fs_op=fault|filp_open
         to isolate FAILING opens such as openat->ENOENT from read/write noise), mm_trace
         (page-fault + direct reclaim), irq_trace (softirq service time), block_io
-        (per-request block latency), runq_lat (scheduler run-queue latency), sock_state (TCP connection-lifecycle tracer via sock/inet_sock_set_state: emits old->new state + 4-tuple on EVERY transition, so SYN_SENT->CLOSE with no ESTABLISHED = refused and ESTABLISHED->CLOSE_WAIT = peer sent FIN first; PLUS affirmative inbound/outbound RST via tcp_reset (reset_dir=1 received) and tcp_v4_send_reset (reset_dir=2 sent), where sk_null=1 flags a kernel RST for a socket that no longer exists (stale/deleted endpoint); datasource mep_sockstate, no attach target). sock_snapshot (point-in-time walk of EVERY live TCP socket via the in-kernel iter/tcp iterator: current state + srtt/rto + retransmit-backoff + send/recv queue depths + in-flight bytes, i.e. ss(8)-in-eBPF; datasource mep_socksnap, no attach target) complements the event families with "what does this connection look like RIGHT NOW" -- e.g. an ESTABLISHED socket with a large & growing sndq_bytes and retransmits>0 is a peer that stopped ACKing. NOTE on the NVML per-PID capabilities (cuda_memsnapshot/cuda_smutil): per-process GPU accounting (nvmlDeviceGetComputeRunningProcesses / GetProcessUtilization) needs an active CUDA context and sufficient permission, and is frequently STRUCTURALLY EMPTY inside a containerized pod — gpu_pid=0 / used_gpu_mem=0 for proc rows is EXPECTED there and is NOT an error or an attach failure. When proc rows are empty, read the device-wide rows (dev_total/dev_used/dev_free) as the authoritative VRAM signal instead of re-querying. A one-row mep_coverage record is emitted each run listing the attached targets + matched pid filter so attached-but-idle is distinguishable from attach-failed. absence_assert (proof-of-ABSENCE: walks EVERY live TCP socket via iter/tcp and cross-references the per_key_rollup net_rollup write history to return a per-flow PASS/FAIL verdict -- arm with absence_period_ns (nanoseconds, e.g. 15000000000 for 15s) and optional absence_jitter_ns: a flow silent for longer than period+jitter => FAIL_SILENT (the expected periodic write, e.g. an SSE/keepalive, never fired), a write during peer-FIN teardown => FAIL_AFTER_FIN; unarmed (period=0) emits observational INFO rows; datasource mep_absence, needs --host, pair with net_trace so writes are recorded).'
+        (per-request block latency), runq_lat (scheduler run-queue latency), sock_state (TCP connection-lifecycle tracer via sock/inet_sock_set_state: emits old->new state + 4-tuple on EVERY transition, so SYN_SENT->CLOSE with no ESTABLISHED = refused and ESTABLISHED->CLOSE_WAIT = peer sent FIN first; PLUS affirmative inbound/outbound RST via tcp_reset (reset_dir=1 received) and tcp_v4_send_reset (reset_dir=2 sent), where sk_null=1 flags a kernel RST for a socket that no longer exists (stale/deleted endpoint); datasource ebpf_proxy_sockstate, no attach target). sock_snapshot (point-in-time walk of EVERY live TCP socket via the in-kernel iter/tcp iterator: current state + srtt/rto + retransmit-backoff + send/recv queue depths + in-flight bytes, i.e. ss(8)-in-eBPF; datasource ebpf_proxy_socksnap, no attach target) complements the event families with "what does this connection look like RIGHT NOW" -- e.g. an ESTABLISHED socket with a large & growing sndq_bytes and retransmits>0 is a peer that stopped ACKing. NOTE on the NVML per-PID capabilities (cuda_memsnapshot/cuda_smutil): per-process GPU accounting (nvmlDeviceGetComputeRunningProcesses / GetProcessUtilization) needs an active CUDA context and sufficient permission, and is frequently STRUCTURALLY EMPTY inside a containerized pod — gpu_pid=0 / used_gpu_mem=0 for proc rows is EXPECTED there and is NOT an error or an attach failure. When proc rows are empty, read the device-wide rows (dev_total/dev_used/dev_free) as the authoritative VRAM signal instead of re-querying. A one-row ebpf_proxy_coverage record is emitted each run listing the attached targets + matched pid filter so attached-but-idle is distinguishable from attach-failed. absence_assert (proof-of-ABSENCE: walks EVERY live TCP socket via iter/tcp and cross-references the per_key_rollup net_rollup write history to return a per-flow PASS/FAIL verdict -- arm with absence_period_ns (nanoseconds, e.g. 15000000000 for 15s) and optional absence_jitter_ns: a flow silent for longer than period+jitter => FAIL_SILENT (the expected periodic write, e.g. an SSE/keepalive, never fired), a write during peer-FIN teardown => FAIL_AFTER_FIN; unarmed (period=0) emits observational INFO rows; datasource ebpf_proxy_absence, needs --host, pair with net_trace so writes are recorded).'
       possibleValues:
       - attach
       - attach_uprobe

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# mep-doctor: verify prereqs for running MEP via the ig CLI (no MCP server).
+# ebpf-proxy-doctor: verify prereqs for running eBPF Proxy via the ig CLI (no MCP server).
 set -u
-IMG="${MEP_IMAGE:-mcp_ebpf_proxy:mep}"
+IMG="${EBPF_PROXY_IMAGE:-ebpf_proxy:latest}"
 ok(){ echo "  OK  $*"; }; bad(){ echo " MISS $*"; }
-echo "== MEP prereq check =="
-[ "$(id -u)" = 0 ] || echo "  note: run MEP with sudo (needs CAP_BPF+CAP_PERFMON or root)"
+echo "== eBPF Proxy prereq check =="
+[ "$(id -u)" = 0 ] || echo "  note: run eBPF Proxy with sudo (needs CAP_BPF+CAP_PERFMON or root)"
 command -v ig >/dev/null && ok "ig: $(ig version 2>/dev/null | head -1)" || bad "ig not on PATH — see references/install.md"
 [ -r /sys/kernel/btf/vmlinux ] && ok "BTF present" || bad "no BTF — CO-RE gadgets need /sys/kernel/btf/vmlinux"
 [ -r /proc/kallsyms ] && ok "kallsyms readable" || echo "  note: kallsyms restricted (kptr_restrict) — run as root"

@@ -1,8 +1,8 @@
 ---
-name: mep-ebpf-debug
+name: ebpf-proxy-debug
 description: >-
   Use to diagnose Linux runtime and proxy/mesh problems by tracing the kernel and
-  userspace with MEP, a single read-only eBPF gadget run through the `ig` CLI or
+  userspace with eBPF Proxy, a single read-only eBPF gadget run through the `ig` CLI or
   over MCP (NO rebuild). Trigger when a process, proxy, or service misbehaves and
   you need ground-truth kernel evidence: failing/ENOENT config opens, fd or memory
   leaks, mutex/lock stalls, TCP resets vs refused connects, retransmits/slow
@@ -24,13 +24,13 @@ description: >-
 license: Apache-2.0
 metadata:
   version: "2.0.0"
-  homepage: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/mcp_ebpf_proxy
+  homepage: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/ebpf_proxy
 ---
 
-# MEP — Multi-capability eBPF debug (CLI or MCP, no rebuild)
+# eBPF Proxy — Multi-capability eBPF debug (CLI or MCP, no rebuild)
 
-MEP (`mcp_ebpf_proxy`) is ONE read-only Inspektor Gadget gadget that retargets at
-runtime. You pick a `capability`; MEP's WASM control plane enables only that
+eBPF Proxy (`ebpf_proxy`) is ONE read-only Inspektor Gadget gadget that retargets at
+runtime. You pick a `capability`; eBPF Proxy's WASM control plane enables only that
 capability's eBPF programs and populates in-kernel filter maps. Run it directly
 with `ig`, or drive it from an agent over MCP (see `references/mcp-server.md`).
 Every capability is read-only — it observes, it never modifies the target.
@@ -38,17 +38,17 @@ Every capability is read-only — it observes, it never modifies the target.
 ## 0. Golden invocation
 
 ```bash
-sudo ig run mcp_ebpf_proxy:mep --verify-image=false \
+sudo ig run ebpf_proxy:latest --verify-image=false \
     --capability=<CAP> [params] --timeout=<seconds> -o json
 ```
 
 - `--verify-image=false` is required for a locally-built/unsigned image (else `ig`
   fails with `pulling signing information ... 401 unauthorized`).
-- Every run also emits ONE `mep_coverage` record — read it FIRST (section 4).
+- Every run also emits ONE `ebpf_proxy_coverage` record — read it FIRST (section 4).
 - Prefer `-o json`; process identity is nested under `proc` (`proc.comm`,
   `proc.pid`). `-o columns` flattens to `COMM`/`PID` with a per-datasource header.
 
-If `ig` is missing or the image isn't built, run `scripts/mep-doctor.sh`. Full
+If `ig` is missing or the image isn't built, run `scripts/ebpf-proxy-doctor.sh`. Full
 install/build recipe: `references/install.md`. MCP driving: `references/mcp-server.md`.
 
 ## 1. Symptom → capability decision map (start here)
@@ -84,7 +84,7 @@ just to learn "which connection". See `references/connection-identity.md`.
 | RCA a specific KERNEL function | `attach --function=<sym> --mode=kprobe_kretprobe` | capabilities.md |
 | RCA a specific USERSPACE lib function | `attach_uprobe --target=<lib>:<sym>` | capabilities.md |
 | "what kernel symbols can I attach to?" | `list_attachable --filter=<pfx> --max=<n> --type=t` | capabilities.md |
-| GPU VRAM leak / residency / SM utilization | see the `mep-gpu-debug` skill | — |
+| GPU VRAM leak / residency / SM utilization | see the `ebpf-proxy-gpu-debug` skill | — |
 
 Full field-by-field catalog: `references/capabilities.md`.
 Runnable one-liner per capability with REAL output: `references/verified-runs.md`.
@@ -94,11 +94,11 @@ Runnable one-liner per capability with REAL output: `references/verified-runs.md
 1. **Plan.** Map symptom → capability above. Get target `PID` (`pgrep -f <name>`).
    Unknown symbol? Run `list_attachable` first. Proxy/mesh? Read
    `references/connection-identity.md` — the inline 4-tuple usually removes a step.
-2. **Run.** Use `scripts/mep-run.sh <cap> [--pid N] [params]` (adds
+2. **Run.** Use `scripts/ebpf-proxy-run.sh <cap> [--pid N] [params]` (adds
    `--verify-image=false`, a default `--timeout`, `-o json`, summarizer), or the
    golden invocation, or drive over MCP (`references/mcp-server.md`).
-3. **Interpret.** `scripts/mep-summarize.py` separates `mep_coverage` from events,
-   resolves `proc.*`, and ranks files/ports/return-codes. Read `mep_coverage`
+3. **Interpret.** `scripts/ebpf-proxy-summarize.py` separates `ebpf_proxy_coverage` from events,
+   resolves `proc.*`, and ranks files/ports/return-codes. Read `ebpf_proxy_coverage`
    FIRST (section 4). For socket lifecycle, read state transitions not proc.
 4. **Fix.** Translate evidence → fix, re-run the SAME capability to confirm the
    signal is gone. For `absence_assert`, a PASS verdict IS the confirmation.
@@ -113,7 +113,7 @@ High-rate capabilities flood if unfiltered. Narrow IN-KERNEL before widening:
   `absence_assert` are point-in-time walks (one pass, not a firehose).
 - Always pass `--pid` and a short `--timeout` first; widen only if idle.
 
-## 4. Reading `mep_coverage` (the most important row)
+## 4. Reading `ebpf_proxy_coverage` (the most important row)
 
 Each run emits one record: `capability`, `attached_targets`, `attached_count`,
 `pid_filter`, `note`. Decision rule:

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 The Inspektor Gadget authors
 
-// WASM control plane for mcp_ebpf_proxy — a single multi-capability gadget.
+// WASM control plane for ebpf_proxy — a single multi-capability gadget.
 //
 // the MCP client picks a `capability`; gadgetPreStart() enables only that
 // capability's eBPF programs (rewriting programs.<name>.attach_to to the chosen
@@ -12,11 +12,11 @@
 // because gadgetPreStart runs AFTER the eBPF object is loaded (rodata frozen),
 // so the runtime values travel through maps rather than const-volatile globals.
 //
-//	capability = attach -> mep_kprobe / mep_kretprobe (retargeted)
-//	capability = attach_uprobe -> mep_uprobe / mep_uretprobe (retargeted to path:sym)
-//	capability = trace_syscall -> mep_sys_enter / mep_sys_exit + filter maps
+//	capability = attach -> ebpf_proxy_kprobe / ebpf_proxy_kretprobe (retargeted)
+//	capability = attach_uprobe -> ebpf_proxy_uprobe / ebpf_proxy_uretprobe (retargeted to path:sym)
+//	capability = trace_syscall -> ebpf_proxy_sys_enter / ebpf_proxy_sys_exit + filter maps
 //	capability = cuda_memtrace -> CUDA driver+runtime alloc/free uprobes
-//	capability = list_attachable -> mep_ksym (iter/ksym), name/type via rodata
+//	capability = list_attachable -> ebpf_proxy_ksym (iter/ksym), name/type via rodata
 //
 // READ-ONLY control plane: it only validates input, sets config, populates
 // filter maps and stamps output columns. It performs no host-FS or network IO.
@@ -39,18 +39,18 @@ const maxUprobeTargetLen = 384
 
 // eBPF program section names (must match SEC()/func names in program.bpf.c).
 const (
-	progKprobe    = "mep_kprobe"
-	progKretprobe = "mep_kretprobe"
-	progSysEnter  = "mep_sys_enter"
-	progSysExit   = "mep_sys_exit"
-	progDeath     = "mep_death_probe"
-	progKsym      = "mep_ksym"
+	progKprobe    = "ebpf_proxy_kprobe"
+	progKretprobe = "ebpf_proxy_kretprobe"
+	progSysEnter  = "ebpf_proxy_sys_enter"
+	progSysExit   = "ebpf_proxy_sys_exit"
+	progDeath     = "ebpf_proxy_death_probe"
+	progKsym      = "ebpf_proxy_ksym"
 
 	// attach_uprobe: generic retargetable userspace uprobe/uretprobe.
-	progUprobe    = "mep_uprobe"
-	progUretprobe = "mep_uretprobe"
-	progSocksnap  = "mep_socksnap"
-	progAbsence   = "mep_absence"
+	progUprobe    = "ebpf_proxy_uprobe"
+	progUretprobe = "ebpf_proxy_uretprobe"
+	progSocksnap  = "ebpf_proxy_socksnap"
+	progAbsence   = "ebpf_proxy_absence"
 )
 
 // cudaPrograms are the fixed CUDA alloc/free uprobes for the cuda_memtrace
@@ -58,14 +58,14 @@ const (
 // (resolved by IG's uprobetracer via the target process ld.so.cache), so they
 // are enabled with "" (no attach_to rewrite) — exactly like the tracepoints.
 var cudaPrograms = []string{
-	"mep_cu_alloc", "mep_cu_alloc_ret",
-	"mep_cu_alloc_async", "mep_cu_alloc_async_ret",
-	"mep_cu_free", "mep_cu_free_ret",
-	"mep_cu_free_async", "mep_cu_free_async_ret",
-	"mep_cudart_alloc", "mep_cudart_alloc_ret",
-	"mep_cudart_alloc_async", "mep_cudart_alloc_async_ret",
-	"mep_cudart_free", "mep_cudart_free_ret",
-	"mep_cudart_free_async", "mep_cudart_free_async_ret",
+	"ebpf_proxy_cu_alloc", "ebpf_proxy_cu_alloc_ret",
+	"ebpf_proxy_cu_alloc_async", "ebpf_proxy_cu_alloc_async_ret",
+	"ebpf_proxy_cu_free", "ebpf_proxy_cu_free_ret",
+	"ebpf_proxy_cu_free_async", "ebpf_proxy_cu_free_async_ret",
+	"ebpf_proxy_cudart_alloc", "ebpf_proxy_cudart_alloc_ret",
+	"ebpf_proxy_cudart_alloc_async", "ebpf_proxy_cudart_alloc_async_ret",
+	"ebpf_proxy_cudart_free", "ebpf_proxy_cudart_free_ret",
+	"ebpf_proxy_cudart_free_async", "ebpf_proxy_cudart_free_async_ret",
 }
 
 // memsnapPrograms are the NVML per-PID standing-residency uprobes for the
@@ -74,15 +74,15 @@ var cudaPrograms = []string{
 // "libnvidia-ml.so.1" base-name does not resolve via the traced process
 // ld.so.cache for IG's uprobetracer (verified: base-name=0 hits, abs=hits).
 var memsnapPrograms = []string{
-	"mep_memsnap_procs_enter", "mep_memsnap_procs_ret",
-	"mep_memsnap_dev_enter", "mep_memsnap_dev_ret",
+	"ebpf_proxy_memsnap_procs_enter", "ebpf_proxy_memsnap_procs_ret",
+	"ebpf_proxy_memsnap_dev_enter", "ebpf_proxy_memsnap_dev_ret",
 }
 
 // smutilPrograms are the NVML per-PID SM/compute-utilization uprobes for the
 // cuda_smutil capability. Like memsnapPrograms they are RETARGETED to the
 // absolute libnvidia-ml.so.1 path at preStart (base-name does not resolve).
 var smutilPrograms = []string{
-	"mep_smutil_enter", "mep_smutil_ret",
+	"ebpf_proxy_smutil_enter", "ebpf_proxy_smutil_ret",
 }
 
 // ---------------------------------------------------------------------------
@@ -94,87 +94,87 @@ var smutilPrograms = []string{
 
 // cuda_profile: GPU activity (launch dims, sync duration, H2D/D2H bytes).
 var cudaProfilePrograms = []string{
-	"mep_cuprof_launch", "mep_cuprof_launch_ex",
-	"mep_cuprof_streamsync", "mep_cuprof_streamsync_ret",
-	"mep_cuprof_ctxsync", "mep_cuprof_ctxsync_ret",
-	"mep_cuprof_h2d", "mep_cuprof_h2d_async",
-	"mep_cuprof_d2h", "mep_cuprof_d2h_async",
+	"ebpf_proxy_cuprof_launch", "ebpf_proxy_cuprof_launch_ex",
+	"ebpf_proxy_cuprof_streamsync", "ebpf_proxy_cuprof_streamsync_ret",
+	"ebpf_proxy_cuprof_ctxsync", "ebpf_proxy_cuprof_ctxsync_ret",
+	"ebpf_proxy_cuprof_h2d", "ebpf_proxy_cuprof_h2d_async",
+	"ebpf_proxy_cuprof_d2h", "ebpf_proxy_cuprof_d2h_async",
 }
 
 // lock_trace: userspace mutex/cond contention (blocked-wait duration).
 var lockTracePrograms = []string{
-	"mep_lock_mutex", "mep_lock_mutex_ret",
-	"mep_lock_cond", "mep_lock_cond_ret",
-	"mep_lock_condt", "mep_lock_condt_ret",
-	"mep_lock_futex_enter", "mep_lock_futex_exit", // directive-22126: kernel futex(WAIT) contention hook
+	"ebpf_proxy_lock_mutex", "ebpf_proxy_lock_mutex_ret",
+	"ebpf_proxy_lock_cond", "ebpf_proxy_lock_cond_ret",
+	"ebpf_proxy_lock_condt", "ebpf_proxy_lock_condt_ret",
+	"ebpf_proxy_lock_futex_enter", "ebpf_proxy_lock_futex_exit", // directive-22126: kernel futex(WAIT) contention hook
 }
 
 // heap_profile: libc allocator churn/leak (malloc/calloc/realloc/free).
 var heapProfilePrograms = []string{
-	"mep_heap_malloc", "mep_heap_malloc_ret",
-	"mep_heap_calloc", "mep_heap_calloc_ret",
-	"mep_heap_realloc", "mep_heap_realloc_ret",
-	"mep_heap_free",
+	"ebpf_proxy_heap_malloc", "ebpf_proxy_heap_malloc_ret",
+	"ebpf_proxy_heap_calloc", "ebpf_proxy_heap_calloc_ret",
+	"ebpf_proxy_heap_realloc", "ebpf_proxy_heap_realloc_ret",
+	"ebpf_proxy_heap_free",
 	// host-visible kernel tracepoints (libc uprobes are container-scoped and
 	// miss host workloads — these capture brk()/anon-mmap heap growth in the
 	// target's own process context, attributed via the shared filter_pid gate).
-	"mep_heap_brk", "mep_heap_mmap",
+	"ebpf_proxy_heap_brk", "ebpf_proxy_heap_mmap",
 }
 
 // net_trace: networking (tcp connect 4-tuple+errno, retransmit, sendmsg bytes).
 var netTracePrograms = []string{
-	"mep_net_connect", "mep_net_connect_ret",
-	"mep_net_retransmit", "mep_net_sendmsg",
-	"mep_sockpair_accept",
+	"ebpf_proxy_net_connect", "ebpf_proxy_net_connect_ret",
+	"ebpf_proxy_net_retransmit", "ebpf_proxy_net_sendmsg",
+	"ebpf_proxy_sockpair_accept",
 }
 
 // sock_state: TCP connection-lifecycle visibility (sock_state).
-// sock_state — mep_sock_set_state: sock/inet_sock_set_state tracepoint, every
+// sock_state — ebpf_proxy_sock_set_state: sock/inet_sock_set_state tracepoint, every
 // old->new TCP transition for the 4-tuple. (sock_state extends this
 // list with the tcp_reset RST/FIN probes in a follow-up commit.)
 var sockStatePrograms = []string{
-	"mep_sock_set_state",
+	"ebpf_proxy_sock_set_state",
 	// sock_state — affirmative inbound/outbound RST + FIN detection.
-	"mep_tcp_reset", "mep_tcp_send_reset",
+	"ebpf_proxy_tcp_reset", "ebpf_proxy_tcp_send_reset",
 }
 
 // fs_trace: filesystem (vfs_read/write byte counts, vfs_open result).
 var fsTracePrograms = []string{
-	"mep_fs_read", "mep_fs_read_ret",
-	"mep_fs_write", "mep_fs_write_ret",
-	"mep_fs_open", "mep_fs_open_ret",
-	"mep_fs_filp_open", "mep_fs_filp_open_ret",
+	"ebpf_proxy_fs_read", "ebpf_proxy_fs_read_ret",
+	"ebpf_proxy_fs_write", "ebpf_proxy_fs_write_ret",
+	"ebpf_proxy_fs_open", "ebpf_proxy_fs_open_ret",
+	"ebpf_proxy_fs_filp_open", "ebpf_proxy_fs_filp_open_ret",
 }
 
 // mm_trace: memory management (page faults + direct-reclaim duration).
 var mmTracePrograms = []string{
-	"mep_mm_fault",
-	"mep_mm_reclaim", "mep_mm_reclaim_ret",
+	"ebpf_proxy_mm_fault",
+	"ebpf_proxy_mm_reclaim", "ebpf_proxy_mm_reclaim_ret",
 }
 
 // irq_trace: drivers/IRQ (softirq entry->exit service duration per vector).
 var irqTracePrograms = []string{
-	"mep_irq_entry", "mep_irq_exit",
+	"ebpf_proxy_irq_entry", "ebpf_proxy_irq_exit",
 }
 
 // epoll_timer epoll_timer — event-loop causal chain (timerfd/hrtimer arm+fire,
 // epoll_ctl interest incl EPOLLRDHUP, epoll_wait enter/exit nready).
 var epollTimerPrograms = []string{
-	"mep_timer_timerfd",
-	"mep_timer_epoll_ctl",
-	"mep_timer_epoll_pwait_enter", "mep_timer_epoll_wait_enter",
-	"mep_timer_epoll_pwait_exit", "mep_timer_epoll_wait_exit",
-	"mep_timer_hrtimer_start", "mep_timer_hrtimer_expire",
+	"ebpf_proxy_timer_timerfd",
+	"ebpf_proxy_timer_epoll_ctl",
+	"ebpf_proxy_timer_epoll_pwait_enter", "ebpf_proxy_timer_epoll_wait_enter",
+	"ebpf_proxy_timer_epoll_pwait_exit", "ebpf_proxy_timer_epoll_wait_exit",
+	"ebpf_proxy_timer_hrtimer_start", "ebpf_proxy_timer_hrtimer_expire",
 }
 
 // block_io: block layer (per-request dev/sector/bytes/rw + issue->done latency).
 var blockIoPrograms = []string{
-	"mep_blk_start", "mep_blk_done",
+	"ebpf_proxy_blk_start", "ebpf_proxy_blk_done",
 }
 
 // runq_lat: scheduler (run-queue wait: enqueue -> on-cpu latency).
 var runqLatPrograms = []string{
-	"mep_runq_enqueue", "mep_runq_switch",
+	"ebpf_proxy_runq_enqueue", "ebpf_proxy_runq_switch",
 }
 
 // enrichedFamilies groups the new fixed-program capabilities for allPrograms
@@ -229,7 +229,7 @@ var validatedFunc string
 // --- attach-confirmation / coverage feedback --------------------------
 //
 // A capability's PreStart records WHAT it attached here, and gadgetStart emits a
-// single mep_coverage record so the MCP client can distinguish "attached but the
+// single ebpf_proxy_coverage record so the MCP client can distinguish "attached but the
 // workload produced no events" from "attach failed / wrong target". Without this
 // an empty result is ambiguous and a caller wastes cycles re-trying.
 var (
@@ -241,7 +241,7 @@ var (
 )
 
 // recordCoverage is called at the end of each successful PreStart path to
-// capture what was attached, for the one-time mep_coverage emit in gadgetStart.
+// capture what was attached, for the one-time ebpf_proxy_coverage emit in gadgetStart.
 func recordCoverage(capability string, targets []string, progCount int, pid uint64, note string) {
 	covCapability = capability
 	covTargets = targets
@@ -250,7 +250,7 @@ func recordCoverage(capability string, targets []string, progCount int, pid uint
 	covNote = note
 }
 
-// coverageDS is the mep_coverage datasource handle, created in gadgetInit and
+// coverageDS is the ebpf_proxy_coverage datasource handle, created in gadgetInit and
 // emitted once in gadgetStart. Zero value means "not registered" (we skip emit).
 var (
 	coverageDS      api.DataSource
@@ -322,7 +322,7 @@ var (
 func fsOpFilterValue() (uint64, bool) {
 	v, err := api.GetParamValue("fs_op", 32)
 	if err != nil {
-		api.Errorf("mcp_ebpf_proxy[fs_trace]: reading fs_op param: %s", err)
+		api.Errorf("ebpf_proxy[fs_trace]: reading fs_op param: %s", err)
 		return 0, false
 	}
 	switch v {
@@ -341,7 +341,7 @@ func fsOpFilterValue() (uint64, bool) {
 	case "close", "release", "filp_close":
 		return 6, true // FS_FILTER_CLOSE — the filp_close release side; pair with open for fd-leak balance
 	default:
-		api.Errorf("mcp_ebpf_proxy[fs_trace]: invalid fs_op %q; choose one of all, read, write, open, filp_open, fault, close. Use fs_op=fault (or filp_open) to isolate failing opens (e.g. openat -> ENOENT) without the high-volume read/write noise; use fs_op=close to isolate the filp_close releases for an open-minus-close fd-leak balance", v)
+		api.Errorf("ebpf_proxy[fs_trace]: invalid fs_op %q; choose one of all, read, write, open, filp_open, fault, close. Use fs_op=fault (or filp_open) to isolate failing opens (e.g. openat -> ENOENT) without the high-volume read/write noise; use fs_op=close to isolate the filp_close releases for an open-minus-close fd-leak balance", v)
 		return 0, false
 	}
 }
@@ -356,7 +356,7 @@ func fsOpFilterValue() (uint64, bool) {
 func cudaOpFilterValue() (uint64, bool) {
 	v, err := api.GetParamValue("cuda_op", 32)
 	if err != nil {
-		api.Errorf("mcp_ebpf_proxy[cuda_profile]: reading cuda_op param: %s", err)
+		api.Errorf("ebpf_proxy[cuda_profile]: reading cuda_op param: %s", err)
 		return 0, false
 	}
 	switch v {
@@ -373,7 +373,7 @@ func cudaOpFilterValue() (uint64, bool) {
 	case "d2h", "dtoh", "device_to_host":
 		return 5, true
 	default:
-		api.Errorf("mcp_ebpf_proxy[cuda_profile]: invalid cuda_op %q; choose one of all, launch, sync, copy, h2d, d2h. Use cuda_op=copy (or h2d) to isolate the PCIe host<->device transfer rows — which carry the byte volume proving a copy/PCIe bottleneck — from the high-rate cuLaunchKernel stream that would otherwise truncate them out of the result", v)
+		api.Errorf("ebpf_proxy[cuda_profile]: invalid cuda_op %q; choose one of all, launch, sync, copy, h2d, d2h. Use cuda_op=copy (or h2d) to isolate the PCIe host<->device transfer rows — which carry the byte volume proving a copy/PCIe bottleneck — from the high-rate cuLaunchKernel stream that would otherwise truncate them out of the result", v)
 		return 0, false
 	}
 }
@@ -383,7 +383,7 @@ func cudaOpFilterValue() (uint64, bool) {
 func readPidParam(tag string) (uint64, bool) {
 	pidStr, err := api.GetParamValue("pid", 32)
 	if err != nil {
-		api.Errorf("mcp_ebpf_proxy[%s]: reading pid param: %s", tag, err)
+		api.Errorf("ebpf_proxy[%s]: reading pid param: %s", tag, err)
 		return 0, false
 	}
 	if pidStr == "" {
@@ -391,7 +391,7 @@ func readPidParam(tag string) (uint64, bool) {
 	}
 	pv, err := strconv.ParseUint(pidStr, 10, 32)
 	if err != nil {
-		api.Errorf("mcp_ebpf_proxy[%s]: invalid pid %q (must be a non-negative integer)", tag, pidStr)
+		api.Errorf("ebpf_proxy[%s]: invalid pid %q (must be a non-negative integer)", tag, pidStr)
 		return 0, false
 	}
 	return pv, true
@@ -486,18 +486,18 @@ func gadgetPreStart() int32 {
 	case "heap_profile":
 		return preStartFixed("heap_profile", heapProfilePrograms)
 	case "net_trace":
-		// Co-attach the item-12a inbound-RST hook (mep_tcp_reset) so the
+		// Co-attach the item-12a inbound-RST hook (ebpf_proxy_tcp_reset) so the
 		// net_rollup datasource's rst_count actually populates here. Note: 
 		// tcp_v4_connect's kretprobe returns retval=0/SYN_SENT on a refused
 		// connect (the refusal RST is delivered asynchronously in softirq),
-		// so the net family itself never sees the RST — only mep_tcp_reset
+		// so the net family itself never sees the RST — only ebpf_proxy_tcp_reset
 		// does. Without this co-attach rst_count would be structurally
 		// always-0 under net_trace (a misleading dead column). The reset hook
 		// is idempotent across families (enableExact de-dups), and its
 		// net_rollup_rst() bump is LOOKUP-ONLY so it can only annotate a flow
 		// the net programs are already tracking.
 		return preStartFixed("net_trace",
-			append(append([]string{}, netTracePrograms...), "mep_tcp_reset"))
+			append(append([]string{}, netTracePrograms...), "ebpf_proxy_tcp_reset"))
 	case "sock_state":
 		return preStartFixed("sock_state", sockStatePrograms)
 	case "fs_trace":
@@ -515,7 +515,7 @@ func gadgetPreStart() int32 {
 	case "list_attachable":
 		return preStartListAttachable()
 	default:
-		api.Errorf("mcp_ebpf_proxy: invalid capability %q; NEXT STEP: choose one of CORE{attach, attach_uprobe, trace_syscall, list_attachable} or ENRICHED{cuda_memtrace, cuda_profile, lock_trace, heap_profile, net_trace, sock_state, fs_trace, mm_trace, irq_trace, block_io, runq_lat, cuda_smutil}. See capability_catalog.json for when-to-use of each", capability)
+		api.Errorf("ebpf_proxy: invalid capability %q; NEXT STEP: choose one of CORE{attach, attach_uprobe, trace_syscall, list_attachable} or ENRICHED{cuda_memtrace, cuda_profile, lock_trace, heap_profile, net_trace, sock_state, fs_trace, mm_trace, irq_trace, block_io, runq_lat, cuda_smutil}. See capability_catalog.json for when-to-use of each", capability)
 		return 1
 	}
 }
@@ -525,11 +525,11 @@ func gadgetPreStart() int32 {
 func preStartAttach() int32 {
 	function, err := api.GetParamValue("function", 256)
 	if err != nil {
-		api.Errorf("mcp_ebpf_proxy: reading function param: %s", err)
+		api.Errorf("ebpf_proxy: reading function param: %s", err)
 		return 1
 	}
 	if function == "" {
-		api.Errorf("mcp_ebpf_proxy[attach]: the `function` param is required (a kernel symbol such as do_unlinkat); NEXT STEP: call capability=list_attachable to discover one")
+		api.Errorf("ebpf_proxy[attach]: the `function` param is required (a kernel symbol such as do_unlinkat); NEXT STEP: call capability=list_attachable to discover one")
 		return 1
 	}
 
@@ -537,16 +537,16 @@ func preStartAttach() int32 {
 	// used as a kallsyms lookup key and the kprobe attach target. Constrain it
 	// to the kernel-symbol grammar BEFORE either use.
 	if len(function) > maxFuncLen {
-		api.Errorf("mcp_ebpf_proxy[attach]: invalid function %q: longer than %d bytes", function, maxFuncLen)
+		api.Errorf("ebpf_proxy[attach]: invalid function %q: longer than %d bytes", function, maxFuncLen)
 		return 1
 	}
 	if c := function[0]; !(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
-		api.Errorf("mcp_ebpf_proxy[attach]: invalid function %q: must start with a letter or '_'", function)
+		api.Errorf("ebpf_proxy[attach]: invalid function %q: must start with a letter or '_'", function)
 		return 1
 	}
 	for i := 0; i < len(function); i++ {
 		if !validSymbolChar(function[i]) {
-			api.Errorf("mcp_ebpf_proxy[attach]: invalid function %q: char %q not allowed (use only [A-Za-z0-9_.])", function, string(function[i]))
+			api.Errorf("ebpf_proxy[attach]: invalid function %q: char %q not allowed (use only [A-Za-z0-9_.])", function, string(function[i]))
 			return 1
 		}
 	}
@@ -564,15 +564,15 @@ func preStartAttach() int32 {
 	wanted, ok := modePrograms[mode]
 	if !ok {
 		if futureModes[mode] {
-			api.Errorf("mcp_ebpf_proxy[attach]: mode %q not yet supported; use kprobe, kretprobe or kprobe_kretprobe (fentry/fexit need BTF set_attach_target, a planned enhancement)", mode)
+			api.Errorf("ebpf_proxy[attach]: mode %q not yet supported; use kprobe, kretprobe or kprobe_kretprobe (fentry/fexit need BTF set_attach_target, a planned enhancement)", mode)
 			return 1
 		}
-		api.Errorf("mcp_ebpf_proxy[attach]: invalid mode %q (want kprobe, kretprobe or kprobe_kretprobe)", mode)
+		api.Errorf("ebpf_proxy[attach]: invalid mode %q (want kprobe, kretprobe or kprobe_kretprobe)", mode)
 		return 1
 	}
 
 	if !api.KallsymsSymbolExists(function) {
-		api.Errorf("mcp_ebpf_proxy[attach]: kernel symbol %q not found in /proc/kallsyms; NEXT STEP: call capability=list_attachable (optionally filter=<name-prefix>, type=t) to enumerate valid kprobe-able symbols, then retry attach with an exact name", function)
+		api.Errorf("ebpf_proxy[attach]: kernel symbol %q not found in /proc/kallsyms; NEXT STEP: call capability=list_attachable (optionally filter=<name-prefix>, type=t) to enumerate valid kprobe-able symbols, then retry attach with an exact name", function)
 		return 1
 	}
 
@@ -583,7 +583,7 @@ func preStartAttach() int32 {
 	enableExact(keep) // sys_enter/sys_exit/ksym get the sentinel
 
 	validatedFunc = function
-	api.Infof("mcp_ebpf_proxy[attach]: mode=%s attaching %d program(s) to %q", mode, len(wanted), function)
+	api.Infof("ebpf_proxy[attach]: mode=%s attaching %d program(s) to %q", mode, len(wanted), function)
 	return 0
 }
 
@@ -603,15 +603,15 @@ func preStartAttach() int32 {
 func preStartAttachUprobe() int32 {
 	target, err := api.GetParamValue("target", 512)
 	if err != nil {
-		api.Errorf("mcp_ebpf_proxy[attach_uprobe]: reading target param: %s", err)
+		api.Errorf("ebpf_proxy[attach_uprobe]: reading target param: %s", err)
 		return 1
 	}
 	if target == "" {
-		api.Errorf("mcp_ebpf_proxy[attach_uprobe]: the `target` param is required, form <lib-or-path>:<symbol> (e.g. libc:malloc or /usr/lib/.../libcuda.so.1:cuMemAlloc_v2); NOTE: for CUDA prefer the enriched capability=cuda_memtrace (leaks) or capability=cuda_profile (launch/sync) which pre-wire the correct symbols")
+		api.Errorf("ebpf_proxy[attach_uprobe]: the `target` param is required, form <lib-or-path>:<symbol> (e.g. libc:malloc or /usr/lib/.../libcuda.so.1:cuMemAlloc_v2); NOTE: for CUDA prefer the enriched capability=cuda_memtrace (leaks) or capability=cuda_profile (launch/sync) which pre-wire the correct symbols")
 		return 1
 	}
 	if len(target) > maxUprobeTargetLen {
-		api.Errorf("mcp_ebpf_proxy[attach_uprobe]: invalid target %q: longer than %d bytes", target, maxUprobeTargetLen)
+		api.Errorf("ebpf_proxy[attach_uprobe]: invalid target %q: longer than %d bytes", target, maxUprobeTargetLen)
 		return 1
 	}
 
@@ -626,7 +626,7 @@ func preStartAttachUprobe() int32 {
 		}
 	}
 	if colon <= 0 || colon == len(target)-1 {
-		api.Errorf("mcp_ebpf_proxy[attach_uprobe]: invalid target %q: expected <lib-or-path>:<symbol> with both parts non-empty", target)
+		api.Errorf("ebpf_proxy[attach_uprobe]: invalid target %q: expected <lib-or-path>:<symbol> with both parts non-empty", target)
 		return 1
 	}
 	lib := target[:colon]
@@ -636,12 +636,12 @@ func preStartAttachUprobe() int32 {
 	// attach: [A-Za-z0-9_.], leading letter/underscore). This blocks attempts
 	// to smuggle a second ':' or shell/path metacharacters into the symbol.
 	if c := symbol[0]; !(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
-		api.Errorf("mcp_ebpf_proxy[attach_uprobe]: invalid symbol %q: must start with a letter or '_'", symbol)
+		api.Errorf("ebpf_proxy[attach_uprobe]: invalid symbol %q: must start with a letter or '_'", symbol)
 		return 1
 	}
 	for i := 0; i < len(symbol); i++ {
 		if !validSymbolChar(symbol[i]) {
-			api.Errorf("mcp_ebpf_proxy[attach_uprobe]: invalid symbol %q: char %q not allowed (use only [A-Za-z0-9_.])", symbol, string(symbol[i]))
+			api.Errorf("ebpf_proxy[attach_uprobe]: invalid symbol %q: char %q not allowed (use only [A-Za-z0-9_.])", symbol, string(symbol[i]))
 			return 1
 		}
 	}
@@ -650,7 +650,7 @@ func preStartAttachUprobe() int32 {
 	// path by uprobetracer, never passed to a shell, but constrain it anyway.
 	for i := 0; i < len(lib); i++ {
 		if !validLibChar(lib[i]) {
-			api.Errorf("mcp_ebpf_proxy[attach_uprobe]: invalid library/path %q: char %q not allowed", lib, string(lib[i]))
+			api.Errorf("ebpf_proxy[attach_uprobe]: invalid library/path %q: char %q not allowed", lib, string(lib[i]))
 			return 1
 		}
 	}
@@ -664,7 +664,7 @@ func preStartAttachUprobe() int32 {
 	}
 	wanted, ok := uprobeModePrograms[mode]
 	if !ok {
-		api.Errorf("mcp_ebpf_proxy[attach_uprobe]: invalid mode %q (want uprobe, uretprobe or uprobe_uretprobe)", mode)
+		api.Errorf("ebpf_proxy[attach_uprobe]: invalid mode %q (want uprobe, uretprobe or uprobe_uretprobe)", mode)
 		return 1
 	}
 
@@ -682,12 +682,12 @@ func preStartAttachUprobe() int32 {
 	// host-uprobe recipe: callers use IG/MCP host mode to attach to host
 	// processes. Because host mode is intentionally broad, publish the MCP client's
 	// pid selector into filter_pid and flip enabled in gadgetStart(); the BPF
-	// mep_uprobe/mep_uretprobe programs consult mep_proc_wanted() before
+	// ebpf_proxy_uprobe/ebpf_proxy_uretprobe programs consult ebpf_proxy_proc_wanted() before
 	// reserving/submitting an event. pid=0 keeps the legacy host-wide behavior.
 	enrichedFilterPid = pid
 	enrichedActive = true
 	validatedFunc = symbol // stamp the symbol onto every emitted event
-	api.Infof("mcp_ebpf_proxy[attach_uprobe]: mode=%s attaching %d program(s) to %q (lib=%q symbol=%q, pid filter=%d; use --host / operator.localmanager.host=true for host processes)", mode, len(wanted), target, lib, symbol, pid)
+	api.Infof("ebpf_proxy[attach_uprobe]: mode=%s attaching %d program(s) to %q (lib=%q symbol=%q, pid filter=%d; use --host / operator.localmanager.host=true for host processes)", mode, len(wanted), target, lib, symbol, pid)
 	return 0
 }
 
@@ -718,9 +718,9 @@ func preStartAbsence() int32 {
 	// additively enable the iterator program (preStartFixed uses enableExact,
 	// which REPLACES the keep-set, so the iterator must be folded into the
 	// same programs slice rather than enabled in a second call).
-	progs := append(append([]string{progAbsence}, netTracePrograms...), "mep_tcp_reset")
+	progs := append(append([]string{progAbsence}, netTracePrograms...), "ebpf_proxy_tcp_reset")
 	rc := preStartFixed("absence_assert", progs)
-	api.Infof("mcp_ebpf_proxy[absence_assert]: walking live TCP sockets + recording net writes for expected-write absence verdict (needs --host; set absence_period_ns to arm)")
+	api.Infof("ebpf_proxy[absence_assert]: walking live TCP sockets + recording net writes for expected-write absence verdict (needs --host; set absence_period_ns to arm)")
 	recordCoverage("absence_assert", progs, len(progs), enrichedFilterPid,
 		"iter/tcp absence walk co-attached with the net family so net_rollup write-history exists to assert against. verdict=NO_HISTORY now means genuinely no writes seen on a live flow (not a missing-capability artifact). Needs --host. Empty result = no live TCP sockets in this netns.")
 	return rc
@@ -738,7 +738,7 @@ func preStartCudaMemtrace() int32 {
 	}
 	enrichedFilterPid = pid
 	enrichedActive = true
-	api.Infof("mcp_ebpf_proxy[cuda_memtrace]: tracing CUDA driver+runtime alloc/free (%d uprobes), pid filter=%d", len(cudaPrograms), pid)
+	api.Infof("ebpf_proxy[cuda_memtrace]: tracing CUDA driver+runtime alloc/free (%d uprobes), pid filter=%d", len(cudaPrograms), pid)
 	return 0
 }
 
@@ -752,10 +752,10 @@ func preStartCudaMemtrace() int32 {
 func preStartCudaMemsnapshot() int32 {
 	const nvml = "/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
 	retarget := map[string]string{
-		"mep_memsnap_procs_enter": nvml + ":nvmlDeviceGetComputeRunningProcesses_v3",
-		"mep_memsnap_procs_ret":   nvml + ":nvmlDeviceGetComputeRunningProcesses_v3",
-		"mep_memsnap_dev_enter":   nvml + ":nvmlDeviceGetMemoryInfo_v2",
-		"mep_memsnap_dev_ret":     nvml + ":nvmlDeviceGetMemoryInfo_v2",
+		"ebpf_proxy_memsnap_procs_enter": nvml + ":nvmlDeviceGetComputeRunningProcesses_v3",
+		"ebpf_proxy_memsnap_procs_ret":   nvml + ":nvmlDeviceGetComputeRunningProcesses_v3",
+		"ebpf_proxy_memsnap_dev_enter":   nvml + ":nvmlDeviceGetMemoryInfo_v2",
+		"ebpf_proxy_memsnap_dev_ret":     nvml + ":nvmlDeviceGetMemoryInfo_v2",
 	}
 	enableExact(retarget)
 	pid, ok := readPidParam("cuda_memsnapshot")
@@ -764,7 +764,7 @@ func preStartCudaMemsnapshot() int32 {
 	}
 	enrichedFilterPid = pid
 	enrichedActive = true
-	api.Infof("mcp_ebpf_proxy[cuda_memsnapshot]: standing GPU residency via NVML uprobes (%d progs) at %s, pid filter=%d", len(memsnapPrograms), nvml, pid)
+	api.Infof("ebpf_proxy[cuda_memsnapshot]: standing GPU residency via NVML uprobes (%d progs) at %s, pid filter=%d", len(memsnapPrograms), nvml, pid)
 	recordCoverage("cuda_memsnapshot", memsnapPrograms, len(memsnapPrograms), pid,
 		"per-PID GPU residency via NVML running-process table. If gpu_pid=0 / used_gpu_mem=0 for proc rows, that is STRUCTURALLY EXPECTED in a containerized pod without an active CUDA context or with NVML PID-namespace restrictions (nvmlDeviceGetComputeRunningProcesses returns no per-proc entries) — do NOT loop re-querying; treat device rows (dev_used/dev_free/dev_total) as the authoritative VRAM signal instead. Empty proc rows here != attach failure: these uprobes only fire when an NVML consumer (nvidia-smi/dcgm/accounting daemon) calls the probed symbol.")
 	return 0
@@ -782,8 +782,8 @@ func preStartCudaMemsnapshot() int32 {
 func preStartCudaSmutil() int32 {
 	const nvml = "/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
 	retarget := map[string]string{
-		"mep_smutil_enter": nvml + ":nvmlDeviceGetProcessUtilization",
-		"mep_smutil_ret":   nvml + ":nvmlDeviceGetProcessUtilization",
+		"ebpf_proxy_smutil_enter": nvml + ":nvmlDeviceGetProcessUtilization",
+		"ebpf_proxy_smutil_ret":   nvml + ":nvmlDeviceGetProcessUtilization",
 	}
 	enableExact(retarget)
 	pid, ok := readPidParam("cuda_smutil")
@@ -792,7 +792,7 @@ func preStartCudaSmutil() int32 {
 	}
 	enrichedFilterPid = pid
 	enrichedActive = true
-	api.Infof("mcp_ebpf_proxy[cuda_smutil]: per-PID SM/compute utilization via NVML uprobes (%d progs) at %s, pid filter=%d", len(smutilPrograms), nvml, pid)
+	api.Infof("ebpf_proxy[cuda_smutil]: per-PID SM/compute utilization via NVML uprobes (%d progs) at %s, pid filter=%d", len(smutilPrograms), nvml, pid)
 	recordCoverage("cuda_smutil", smutilPrograms, len(smutilPrograms), pid,
 		"per-PID SM/compute utilization via NVML uprobes; these only fire when an NVML consumer calls nvmlDeviceGetProcessUtilization. No rows can mean either (a) no NVML consumer ran during the window, or (b) no PID used the SMs. Cross-check with cuda_memsnapshot recent_sm_util to reconcile: a PID holding used_gpu_mem with smUtil==0 is reserved-but-idle. Empty != attach failure.")
 	return 0
@@ -834,7 +834,7 @@ func preStartFixed(name string, programs []string) int32 {
 		}
 		enrichedFsOp = fsop
 		if fsop != 0 {
-			api.Infof("mcp_ebpf_proxy[fs_trace]: fs_op filter=%d (1=read 2=write 3=open 4=filp_open 5=fault)", fsop)
+			api.Infof("ebpf_proxy[fs_trace]: fs_op filter=%d (1=read 2=write 3=open 4=filp_open 5=fault)", fsop)
 		}
 	}
 	// cuda_profile exposes a parallel op-class filter (filter_cuda_op) so the
@@ -849,13 +849,13 @@ func preStartFixed(name string, programs []string) int32 {
 		}
 		enrichedCudaOp = cop
 		if cop != 0 {
-			api.Infof("mcp_ebpf_proxy[cuda_profile]: cuda_op filter=%d (1=launch 2=sync 3=copy 4=h2d 5=d2h)", cop)
+			api.Infof("ebpf_proxy[cuda_profile]: cuda_op filter=%d (1=launch 2=sync 3=copy 4=h2d 5=d2h)", cop)
 		}
 	}
 	if pid != 0 {
-		api.Infof("mcp_ebpf_proxy[%s]: enabling %d program(s), pid filter=%d", name, len(programs), pid)
+		api.Infof("ebpf_proxy[%s]: enabling %d program(s), pid filter=%d", name, len(programs), pid)
 	} else {
-		api.Infof("mcp_ebpf_proxy[%s]: enabling %d enriched-family program(s) (all pids)", name, len(programs))
+		api.Infof("ebpf_proxy[%s]: enabling %d enriched-family program(s) (all pids)", name, len(programs))
 	}
 	recordCoverage(name, programs, len(programs), pid,
 		"enriched family attached at its SEC-default targets. An empty result means the workload produced no matching events in the window (attached-but-idle), NOT an attach failure — widen duration or pid filter rather than re-selecting the capability.")
@@ -867,7 +867,7 @@ func preStartFixed(name string, programs []string) int32 {
 func preStartTraceSyscall() int32 {
 	syscall, err := api.GetParamValue("syscall", 64)
 	if err != nil {
-		api.Errorf("mcp_ebpf_proxy[trace_syscall]: reading syscall param: %s", err)
+		api.Errorf("ebpf_proxy[trace_syscall]: reading syscall param: %s", err)
 		return 1
 	}
 
@@ -875,7 +875,7 @@ func preStartTraceSyscall() int32 {
 	if syscall != "" {
 		id, err := api.GetSyscallID(syscall)
 		if err != nil || id < 0 {
-			api.Errorf("mcp_ebpf_proxy[trace_syscall]: unknown syscall %q (use a name such as openat, execve, kill); NOTE: for socket/connection detail prefer capability=net_trace (decoded daddr/dport/retransmit) over raw trace_syscall", syscall)
+			api.Errorf("ebpf_proxy[trace_syscall]: unknown syscall %q (use a name such as openat, execve, kill); NOTE: for socket/connection detail prefer capability=net_trace (decoded daddr/dport/retransmit) over raw trace_syscall", syscall)
 			return 1
 		}
 		nr = uint64(id)
@@ -883,14 +883,14 @@ func preStartTraceSyscall() int32 {
 
 	pidStr, err := api.GetParamValue("pid", 32)
 	if err != nil {
-		api.Errorf("mcp_ebpf_proxy[trace_syscall]: reading pid param: %s", err)
+		api.Errorf("ebpf_proxy[trace_syscall]: reading pid param: %s", err)
 		return 1
 	}
 	var pid uint64
 	if pidStr != "" {
 		p, err := strconv.ParseUint(pidStr, 10, 32)
 		if err != nil {
-			api.Errorf("mcp_ebpf_proxy[trace_syscall]: invalid pid %q (must be a non-negative integer)", pidStr)
+			api.Errorf("ebpf_proxy[trace_syscall]: invalid pid %q (must be a non-negative integer)", pidStr)
 			return 1
 		}
 		pid = p
@@ -909,9 +909,9 @@ func preStartTraceSyscall() int32 {
 	enableExact(map[string]string{progSysEnter: "", progSysExit: "", progDeath: ""})
 
 	if syscall == "" {
-		api.Infof("mcp_ebpf_proxy[trace_syscall]: tracing ALL syscalls pid=%d", pid)
+		api.Infof("ebpf_proxy[trace_syscall]: tracing ALL syscalls pid=%d", pid)
 	} else {
-		api.Infof("mcp_ebpf_proxy[trace_syscall]: tracing syscall=%s(nr=%d) pid=%d", syscall, nr, pid)
+		api.Infof("ebpf_proxy[trace_syscall]: tracing syscall=%s(nr=%d) pid=%d", syscall, nr, pid)
 	}
 	return 0
 }
@@ -919,12 +919,12 @@ func preStartTraceSyscall() int32 {
 func putFilter(mapName string, value uint64) int32 {
 	m, err := api.GetMap(mapName)
 	if err != nil {
-		api.Errorf("mcp_ebpf_proxy[trace_syscall]: getting map %s: %s", mapName, err)
+		api.Errorf("ebpf_proxy[trace_syscall]: getting map %s: %s", mapName, err)
 		return 1
 	}
 	var key uint32 = 0
 	if err := m.Put(key, value); err != nil {
-		api.Errorf("mcp_ebpf_proxy[trace_syscall]: writing map %s: %s", mapName, err)
+		api.Errorf("ebpf_proxy[trace_syscall]: writing map %s: %s", mapName, err)
 		return 1
 	}
 	return 0
@@ -936,7 +936,7 @@ func preStartSockSnapshot() int32 {
 	// iter/tcp: keep the SEC-default attach target (no kprobe/tp sentinel),
 	// disable every other program. Mirrors preStartListAttachable (iter/ksym).
 	enableExact(map[string]string{progSocksnap: ""})
-	api.Infof("mcp_ebpf_proxy[sock_snapshot]: snapshotting live TCP sockets (ss-in-eBPF)")
+	api.Infof("ebpf_proxy[sock_snapshot]: snapshotting live TCP sockets (ss-in-eBPF)")
 	return 0
 }
 
@@ -946,9 +946,9 @@ func preStartListAttachable() int32 {
 	// populates them directly from the MCP call at load time -- they are NOT in
 	// the WASM param namespace and must not be read here. This control-plane
 	// step only has to enable the ksym iterator and disable everything else
-	// (keep mep_ksym's SEC-default iter/ksym attach target).
+	// (keep ebpf_proxy_ksym's SEC-default iter/ksym attach target).
 	enableExact(map[string]string{progKsym: ""})
-	api.Infof("mcp_ebpf_proxy[list_attachable]: enumerating kallsyms")
+	api.Infof("ebpf_proxy[list_attachable]: enumerating kallsyms")
 	return 0
 }
 
@@ -965,7 +965,7 @@ func gadgetStart() int32 {
 	// here, mirroring the in-tree traceloop gadget.
 	if enrichedActive {
 		// Enriched process-context families consult filter_pid + the enabled
-		// ready-gate (mep_proc_wanted). Publish filter_pid FIRST, then flip
+		// ready-gate (ebpf_proxy_proc_wanted). Publish filter_pid FIRST, then flip
 		// enabled LAST so no event is emitted while the pid filter is still the
 		// zero-initialised "any pid" -- this closes the startup leak race for the
 		// high-rate kernel families (fs_trace/mm_trace/net_trace).
@@ -1010,9 +1010,9 @@ func gadgetInit() int32 {
 	// Only the `attach` datasource has a per-event `func` column to stamp. The
 	// other datasources are self-describing (syscall name / symbol name come
 	// from the event itself), so init is a no-op for them.
-	ds, err := api.GetDataSource("mep")
+	ds, err := api.GetDataSource("ebpf_proxy")
 	if err != nil {
-		// Not fatal: trace_syscall / list_attachable runs do not register "mep".
+		// Not fatal: trace_syscall / list_attachable runs do not register "ebpf_proxy".
 		// Still register the coverage datasource so those capabilities also emit
 		// an attach-confirmation record.
 		registerCoverageDataSource()
@@ -1031,10 +1031,10 @@ func gadgetInit() int32 {
 	return 0
 }
 
-// registerCoverageDataSource creates the one-row mep_coverage datasource used by
+// registerCoverageDataSource creates the one-row ebpf_proxy_coverage datasource used by
 // Best-effort: any failure just leaves coverageReady=false (no emit).
 func registerCoverageDataSource() {
-	cds, err := api.NewDataSource("mep_coverage", api.DataSourceTypeSingle)
+	cds, err := api.NewDataSource("ebpf_proxy_coverage", api.DataSourceTypeSingle)
 	if err != nil {
 		return
 	}

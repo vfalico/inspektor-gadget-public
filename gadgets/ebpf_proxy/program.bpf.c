@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0
 // Copyright (c) 2025 The Inspektor Gadget authors
 
-// mcp_ebpf_proxy: a single, multi-capability, READ-ONLY kernel-observation
+// ebpf_proxy: a single, multi-capability, READ-ONLY kernel-observation
 // gadget that exposes generic eBPF/kernel observation to MCP clients through
-// ig-mcp-server as ONE MCP tool (gadget_mcp_ebpf_proxy). the MCP client selects a
+// ig-mcp-server as ONE MCP tool (gadget_ebpf_proxy). the MCP client selects a
 // `capability` at call time; the WASM control plane (go/program.go) enables
 // only that capability's programs and disables the rest with the
 // gadget_program_disabled sentinel (checked before the program-type switch in
 // pkg/operators/ebpf/attach.go, so it disables kprobe, tracepoint and iter
 // programs uniformly).
 //
-// capability = attach -> mep_kprobe / mep_kretprobe (datasource: events)
-// capability = attach_uprobe -> mep_uprobe / mep_uretprobe (datasource: events)
-// capability = trace_syscall -> mep_sys_enter / mep_sys_exit (datasource: syscalls)
-// capability = cuda_memtrace -> mep_cu_* / mep_cudart_* (datasource: cuda_events)
-// capability = list_attachable -> mep_ksym (iter/ksym) (datasource: symbols)
+// capability = attach -> ebpf_proxy_kprobe / ebpf_proxy_kretprobe (datasource: events)
+// capability = attach_uprobe -> ebpf_proxy_uprobe / ebpf_proxy_uretprobe (datasource: events)
+// capability = trace_syscall -> ebpf_proxy_sys_enter / ebpf_proxy_sys_exit (datasource: syscalls)
+// capability = cuda_memtrace -> ebpf_proxy_cu_* / ebpf_proxy_cudart_* (datasource: cuda_events)
+// capability = list_attachable -> ebpf_proxy_ksym (iter/ksym) (datasource: symbols)
 //
 // READ-ONLY: only observes registers, raw-tracepoint context and the kallsyms
 // iterator. NEVER calls bpf_override_return(), bpf_send_signal() or any writer.
@@ -44,12 +44,12 @@
 #define AF_INET6 10
 #endif
 
-struct mep_sockid { __u32 saddr, daddr; __u16 sport, dport; __u8 sk_state, sk_family; };
+struct ebpf_proxy_sockid { __u32 saddr, daddr; __u16 sport, dport; __u8 sk_state, sk_family; };
 
 // Decode 4-tuple + TCP state from a struct sock*. SAFE on a garbage pointer:
 // the skc_family gate (AF_INET/AF_INET6) rejects non-sockets, leaving
 // sk_family=0 ("arg was not an inet socket").
-static __always_inline void mep_decode_sk(struct sock *sk, struct mep_sockid *id)
+static __always_inline void ebpf_proxy_decode_sk(struct sock *sk, struct ebpf_proxy_sockid *id)
 {
 	id->saddr = id->daddr = 0; id->sport = id->dport = 0;
 	id->sk_state = 0; id->sk_family = 0;
@@ -68,7 +68,7 @@ static __always_inline void mep_decode_sk(struct sock *sk, struct mep_sockid *id
 
 // Resolve struct file* -> struct sock* (NULL if not a socket). Validates the
 // socket->file back-pointer to reject a file whose private_data is not a socket.
-static __always_inline struct sock *mep_sock_from_file(struct file *file)
+static __always_inline struct sock *ebpf_proxy_sock_from_file(struct file *file)
 {
 	if (!file)
 		return 0;
@@ -85,7 +85,7 @@ static __always_inline struct sock *mep_sock_from_file(struct file *file)
 // (kept byte-identical to the proven first-cut programs)
 // ===========================================================================
 
-enum mep_phase {
+enum ebpf_proxy_phase {
 	enter,	// kprobe / sys_enter
 	ret,	// kretprobe / sys_exit
 };
@@ -94,7 +94,7 @@ struct event {
 	gadget_timestamp timestamp_raw;
 	struct gadget_process proc;
 
-	enum mep_phase phase_raw;
+	enum ebpf_proxy_phase phase_raw;
 	// func is filled by the WASM enricher with the validated symbol name; kept
 	// as a fixed buffer so the column exists in the datasource schema.
 	char func[40];
@@ -132,9 +132,9 @@ struct event {
 };
 
 GADGET_TRACER_MAP(events, 1024 * 256);
-GADGET_TRACER(mep, events, event);
+GADGET_TRACER(ebpf_proxy, events, event);
 
-static __always_inline struct event *mep_new(enum mep_phase phase)
+static __always_inline struct event *ebpf_proxy_new(enum ebpf_proxy_phase phase)
 {
 	struct event *e = gadget_reserve_buf(&events, sizeof(*e));
 	if (!e)
@@ -152,10 +152,10 @@ static __always_inline struct event *mep_new(enum mep_phase phase)
 	return e;
 }
 
-SEC("kprobe/mep_dummy")
-int BPF_KPROBE(mep_kprobe)
+SEC("kprobe/ebpf_proxy_dummy")
+int BPF_KPROBE(ebpf_proxy_kprobe)
 {
-	struct event *e = mep_new(enter);
+	struct event *e = ebpf_proxy_new(enter);
 	if (!e)
 		return 0;
 	e->arg0 = (__u64)PT_REGS_PARM1(ctx);
@@ -164,17 +164,17 @@ int BPF_KPROBE(mep_kprobe)
 	e->arg3 = (__u64)PT_REGS_PARM4(ctx);
 	e->arg4 = (__u64)PT_REGS_PARM5(ctx);
 	// [per_conn_identity attach] stamp the 4-tuple+state if arg0 is a sock.
-	{ struct mep_sockid _id; mep_decode_sk((struct sock *)e->arg0, &_id);
+	{ struct ebpf_proxy_sockid _id; ebpf_proxy_decode_sk((struct sock *)e->arg0, &_id);
 	  e->saddr = _id.saddr; e->daddr = _id.daddr; e->sport = _id.sport;
 	  e->dport = _id.dport; e->sk_state = _id.sk_state; e->sk_family = _id.sk_family; }
 	gadget_submit_buf(ctx, &events, e, sizeof(*e));
 	return 0;
 }
 
-SEC("kretprobe/mep_dummy")
-int BPF_KRETPROBE(mep_kretprobe, long retval)
+SEC("kretprobe/ebpf_proxy_dummy")
+int BPF_KRETPROBE(ebpf_proxy_kretprobe, long retval)
 {
-	struct event *e = mep_new(ret);
+	struct event *e = ebpf_proxy_new(ret);
 	if (!e)
 		return 0;
 	e->retval = (__s64)retval;
@@ -193,7 +193,7 @@ int BPF_KRETPROBE(mep_kretprobe, long retval)
 // WHY a connect failed (refused vs unreachable vs timed-out vs still-in-flight)
 // without memorising errno numbers. Auto-decoded by IG from BTF
 // (err_class_raw -> "errc_refused").
-enum mep_errclass {
+enum ebpf_proxy_errclass {
 	errc_ok,		// retval >= 0
 	errc_inprogress,	// EINPROGRESS/EAGAIN -- async connect in flight (normal)
 	errc_refused,		// ECONNREFUSED -- peer up, port closed (RST)
@@ -208,7 +208,7 @@ struct syscall_event {
 	struct gadget_process proc;
 
 	gadget_syscall syscall_nr_raw;	// type triggers IG formatter -> decoded `syscall` field
-	enum mep_phase phase_raw;
+	enum ebpf_proxy_phase phase_raw;
 	__u64 arg0;
 	__u64 arg1;
 	__u64 arg2;
@@ -228,16 +228,16 @@ struct syscall_event {
 	__u16 dport;		// remote port (host order)
 	__u8  sk_state;		// TCP state (1=ESTABLISHED,8=CLOSE_WAIT,...); 0 if unresolved
 	__u8  sk_family;	// 2=AF_INET,10=AF_INET6; 0 if fd is not an inet socket
-	// [errno_decode] classified failure mode of retval (see enum mep_errclass).
+	// [errno_decode] classified failure mode of retval (see enum ebpf_proxy_errclass).
 	gadget_errno err_raw;		// positive errno (0 on success); IG symbolises name
-	enum mep_errclass err_class_raw;
+	enum ebpf_proxy_errclass err_class_raw;
 };
 
 GADGET_TRACER_MAP(syscalls, 1024 * 256);
-GADGET_TRACER(mep_sys, syscalls, syscall_event);
+GADGET_TRACER(ebpf_proxy_sys, syscalls, syscall_event);
 
 // [errno_decode] Map a syscall retval to (positive errno, failure class).
-static __always_inline enum mep_errclass mep_classify_errno(__s64 ret, __u32 *err_out)
+static __always_inline enum ebpf_proxy_errclass ebpf_proxy_classify_errno(__s64 ret, __u32 *err_out)
 {
 	if (ret >= 0) { *err_out = 0; return errc_ok; }
 	__u32 e = (__u32)(-ret);
@@ -267,23 +267,23 @@ static __always_inline enum mep_errclass mep_classify_errno(__s64 ret, __u32 *er
 // sched_process_exit probe pairs this with the exit code so an MCP client can answer
 // "did this process die BECAUSE of that refused connect?" (a process that died after a refused dependency connect). Keyed by
 // tgid; overwritten by each new failure; consumed+deleted at exit.
-struct mep_sockfail {
+struct ebpf_proxy_sockfail {
 	__u64 ts;		// boot-ns of the failure
 	__u32 err;		// positive errno
 	__u32 nr;		// syscall nr that failed (42=connect,...)
 	__u32 saddr, daddr;
 	__u16 sport, dport;
-	__u8  err_class;	// enum mep_errclass
+	__u8  err_class;	// enum ebpf_proxy_errclass
 	__u8  sk_family;
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 4096);
 	__type(key, __u32);		// tgid
-	__type(value, struct mep_sockfail);
+	__type(value, struct ebpf_proxy_sockfail);
 } last_sockfail SEC(".maps");
 
-#define MEP_ANY_SYSCALL 0xffffffffULL
+#define EBPF_PROXY_ANY_SYSCALL 0xffffffffULL
 
 // 1-entry arrays populated by WASM gadgetPreStart() via GetMap().Put().
 struct {
@@ -316,7 +316,7 @@ struct {
 // per-task scratch: remember the syscall nr + enter timestamp seen at enter so
 // sys_exit can match it arch-independently (avoids reading orig_ax at exit) AND
 // compute the per-call duration.
-struct mep_sysactive {
+struct ebpf_proxy_sysactive {
 	__u64 nr; __u64 ts;
 	// [per_conn_identity] cache the enter-time socket identity so the exit row
 	// (which carries retval/duration) is stamped with the SAME 4-tuple+state.
@@ -326,17 +326,17 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 4096);
 	__type(key, __u64);	// pid_tgid
-	__type(value, struct mep_sysactive);	// nr + enter ts
+	__type(value, struct ebpf_proxy_sysactive);	// nr + enter ts
 } active_syscall SEC(".maps");
 
-static __always_inline bool mep_sys_wanted(__u64 nr)
+static __always_inline bool ebpf_proxy_sys_wanted(__u64 nr)
 {
 	__u32 k = 0;
 	__u64 *on = bpf_map_lookup_elem(&enabled, &k);
 	if (!on || *on == 0)
 		return false;	// filters not fully published yet -> drop
 	__u64 *want_nr = bpf_map_lookup_elem(&filter_syscall, &k);
-	if (want_nr && *want_nr != MEP_ANY_SYSCALL && *want_nr != nr)
+	if (want_nr && *want_nr != EBPF_PROXY_ANY_SYSCALL && *want_nr != nr)
 		return false;
 
 	__u64 *want_pid = bpf_map_lookup_elem(&filter_pid, &k);
@@ -359,7 +359,7 @@ static __always_inline bool mep_sys_wanted(__u64 nr)
 // reclaim), so bpf_get_current_pid_tgid() identifies the subject under test.
 // System-wide families (irq_trace/block_io/runq_lat) fire in softirq/scheduler
 // context where current!=subject and are intentionally NOT gated by this.
-static __always_inline bool mep_proc_wanted(void)
+static __always_inline bool ebpf_proxy_proc_wanted(void)
 {
 	__u32 k = 0;
 	// Ready-gate: enabled defaults to 0 at load and is flipped to 1 by the WASM
@@ -386,7 +386,7 @@ static __always_inline bool mep_proc_wanted(void)
 // mismatch leaves the identity zeroed. Best-effort + read-only; a failed walk
 // (bad fd, closed race, non-inet) simply yields sk_family==0.
 
-static __always_inline void mep_resolve_sock_fd(int fd, struct mep_sockid *id)
+static __always_inline void ebpf_proxy_resolve_sock_fd(int fd, struct ebpf_proxy_sockid *id)
 {
 	id->saddr = id->daddr = 0; id->sport = id->dport = 0;
 	id->sk_state = 0; id->sk_family = 0;
@@ -410,7 +410,7 @@ static __always_inline void mep_resolve_sock_fd(int fd, struct mep_sockid *id)
 	struct file *file = NULL;
 	bpf_probe_read_kernel(&file, sizeof(file), fd_array + fd);
 	// shared decode: file -> sock -> 4-tuple + state (per_conn_identity primitives).
-	mep_decode_sk(mep_sock_from_file(file), id);
+	ebpf_proxy_decode_sk(ebpf_proxy_sock_from_file(file), id);
 }
 
 // [per_conn_identity/errno_decode] Read the INTENDED destination from a
@@ -418,7 +418,7 @@ static __always_inline void mep_resolve_sock_fd(int fd, struct mep_sockid *id)
 // daddr:dport even when the fd-resolved sock has no peer yet — i.e. on a
 // connect that is about to fail (ECONNREFUSED/EHOSTUNREACH) the row still names
 // the endpoint the process tried to reach. AF_INET only; best-effort user read.
-static __always_inline void mep_read_uaddr_dest(__u64 uaddr, __u32 *daddr, __u16 *dport)
+static __always_inline void ebpf_proxy_read_uaddr_dest(__u64 uaddr, __u32 *daddr, __u16 *dport)
 {
 	if (!uaddr)
 		return;
@@ -434,7 +434,7 @@ static __always_inline void mep_read_uaddr_dest(__u64 uaddr, __u32 *daddr, __u16
 // x86_64 socket-relevant syscalls whose arg0 is an fd worth resolving. Kept
 // tight so the fd-table walk only runs on connection-carrying calls, not on
 // the whole syscall firehose.
-static __always_inline bool mep_is_sockcall(__u64 nr)
+static __always_inline bool ebpf_proxy_is_sockcall(__u64 nr)
 {
 	switch (nr) {
 	case 0:   // read
@@ -455,16 +455,16 @@ static __always_inline bool mep_is_sockcall(__u64 nr)
 }
 
 SEC("raw_tracepoint/sys_enter")
-int mep_sys_enter(struct bpf_raw_tracepoint_args *ctx)
+int ebpf_proxy_sys_enter(struct bpf_raw_tracepoint_args *ctx)
 {
 	// ctx->args[0] = struct pt_regs *, ctx->args[1] = long syscall id
 	__u64 nr = (__u64)ctx->args[1];
-	if (!mep_sys_wanted(nr))
+	if (!ebpf_proxy_sys_wanted(nr))
 		return 0;
 
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u64 now = bpf_ktime_get_boot_ns();
-	struct mep_sysactive act = { .nr = nr, .ts = now };
+	struct ebpf_proxy_sysactive act = { .nr = nr, .ts = now };
 	bpf_map_update_elem(&active_syscall, &pid_tgid, &act, BPF_ANY);
 
 	struct syscall_event *e = gadget_reserve_buf(&syscalls, sizeof(*e));
@@ -487,17 +487,17 @@ int mep_sys_enter(struct bpf_raw_tracepoint_args *ctx)
 	// [per_conn_identity] resolve fd(arg0) -> 4-tuple+state for socket syscalls,
 	// stamp this enter row AND cache it for the matching exit row.
 	e->saddr = e->daddr = 0; e->sport = e->dport = 0; e->sk_state = e->sk_family = 0;
-	if (mep_is_sockcall(nr)) {
-		struct mep_sockid id;
-		mep_resolve_sock_fd((int)e->arg0, &id);
+	if (ebpf_proxy_is_sockcall(nr)) {
+		struct ebpf_proxy_sockid id;
+		ebpf_proxy_resolve_sock_fd((int)e->arg0, &id);
 		// connect(2): dest sockaddr is arg1; sendto(2): arg4. Fill the intended
 		// destination from userspace when the sock has no peer yet (pre/failed
 		// connect) so the row names WHO the process tried to reach.
 		if (id.daddr == 0) {
 			if (nr == 42)       // connect
-				mep_read_uaddr_dest(e->arg1, &id.daddr, &id.dport);
+				ebpf_proxy_read_uaddr_dest(e->arg1, &id.daddr, &id.dport);
 			else if (nr == 44)  // sendto
-				mep_read_uaddr_dest(e->arg4, &id.daddr, &id.dport);
+				ebpf_proxy_read_uaddr_dest(e->arg4, &id.daddr, &id.dport);
 			if (id.daddr && id.sk_family == 0)
 				id.sk_family = AF_INET;	// mark as inet even if fd-walk missed
 		}
@@ -505,7 +505,7 @@ int mep_sys_enter(struct bpf_raw_tracepoint_args *ctx)
 		e->sport = id.sport; e->dport = id.dport;
 		e->sk_state = id.sk_state; e->sk_family = id.sk_family;
 		if (id.sk_family) {
-			struct mep_sysactive *ap = bpf_map_lookup_elem(&active_syscall, &pid_tgid);
+			struct ebpf_proxy_sysactive *ap = bpf_map_lookup_elem(&active_syscall, &pid_tgid);
 			if (ap) {
 				ap->saddr = id.saddr; ap->daddr = id.daddr;
 				ap->sport = id.sport; ap->dport = id.dport;
@@ -518,18 +518,18 @@ int mep_sys_enter(struct bpf_raw_tracepoint_args *ctx)
 }
 
 SEC("raw_tracepoint/sys_exit")
-int mep_sys_exit(struct bpf_raw_tracepoint_args *ctx)
+int ebpf_proxy_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 {
 	// ctx->args[1] = long ret. Recover nr from the per-task scratch recorded
 	// at enter; absence means this syscall was filtered out at enter.
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct mep_sysactive *ap = bpf_map_lookup_elem(&active_syscall, &pid_tgid);
+	struct ebpf_proxy_sysactive *ap = bpf_map_lookup_elem(&active_syscall, &pid_tgid);
 	if (!ap)
 		return 0;
 	__u64 nr = ap->nr;
 	__u64 enter_ts = ap->ts;
 	// [per_conn_identity] copy cached socket identity out BEFORE deleting.
-	struct mep_sockid xid = { .saddr = ap->saddr, .daddr = ap->daddr,
+	struct ebpf_proxy_sockid xid = { .saddr = ap->saddr, .daddr = ap->daddr,
 		.sport = ap->sport, .dport = ap->dport,
 		.sk_state = ap->sk_state, .sk_family = ap->sk_family };
 	bpf_map_delete_elem(&active_syscall, &pid_tgid);
@@ -547,7 +547,7 @@ int mep_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 	// [errno_decode] classify the failure mode (refused/unreachable/timed-out).
 	{
 		__u32 _errno = 0;
-		e->err_class_raw = mep_classify_errno(e->retval, &_errno);
+		e->err_class_raw = ebpf_proxy_classify_errno(e->retval, &_errno);
 		e->err_raw = _errno;
 	}
 	// per-call wall-clock — no manual enter/ret correlation needed.
@@ -560,9 +560,9 @@ int mep_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 	// [errno_decode/causal death] remember a FAILED socket syscall for this
 	// process so a later exit can be attributed to it. Skip the benign
 	// EINPROGRESS async-connect path (not a real failure).
-	if (e->retval < 0 && e->err_class_raw != errc_inprogress && mep_is_sockcall(nr)) {
+	if (e->retval < 0 && e->err_class_raw != errc_inprogress && ebpf_proxy_is_sockcall(nr)) {
 		__u32 _tgid = pid_tgid >> 32;
-		struct mep_sockfail _rec = {
+		struct ebpf_proxy_sockfail _rec = {
 			.ts = now, .err = e->err_raw, .nr = (__u32)nr,
 			.saddr = e->saddr, .daddr = e->daddr,
 			.sport = e->sport, .dport = e->dport,
@@ -578,12 +578,12 @@ int mep_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 // ===========================================================================
 // capability: attach_uprobe -- runtime-retargetable uprobe/uretprobe on an
 // arbitrary userspace symbol. Mirrors `attach` (kprobe) but for user space.
-// The WASM control plane rewrites programs.mep_uprobe.attach_to (and
-//.mep_uretprobe) to "<lib-or-abs-path>:<symbol>", e.g.
+// The WASM control plane rewrites programs.ebpf_proxy_uprobe.attach_to (and
+//.ebpf_proxy_uretprobe) to "<lib-or-abs-path>:<symbol>", e.g.
 // /usr/lib/x86_64-linux-gnu/libssl.so.3:SSL_read (absolute path), or
 // libc:malloc (library name; resolved
 // via the target's /etc/ld.so.cache by IG's uprobetracer). The SEC default
-// below is a harmless self-reference ("ig:__mep_uprobe_dummy") so the object
+// below is a harmless self-reference ("ig:__ebpf_proxy_uprobe_dummy") so the object
 // loads even when this capability is disabled; the real target always arrives
 // through the attach_to config override (pkg/operators/ebpf/attach.go:50).
 // READ-ONLY: only reads the probed function's argument registers + return.
@@ -593,13 +593,13 @@ int mep_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 // count (enter++ / return--), which gives automatic enter<->return pairing and
 // a per-tid recursion-depth signal. entry_sp is reserved for stack_watermark
 // (stack_watermark) and initialised here so the two items share one map.
-struct mep_uctx { __u32 depth; __u64 entry_sp; __u8 alarmed; };
+struct ebpf_proxy_uctx { __u32 depth; __u64 entry_sp; __u8 alarmed; };
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
 	__type(key, __u32);
-	__type(value, struct mep_uctx);
-} mep_uctx_map SEC(".maps");
+	__type(value, struct ebpf_proxy_uctx);
+} ebpf_proxy_uctx_map SEC(".maps");
 
 // [stack_watermark] one-shot alarm threshold in BYTES of stack consumed since
 // the outermost uprobe entry. 0 (default) disables the alarm (stack_used is
@@ -626,17 +626,17 @@ GADGET_PARAM(uprobe_str_len_arg);
 const volatile __u32 uprobe_fd_arg = 0xff;
 GADGET_PARAM(uprobe_fd_arg);
 
-SEC("uprobe/__mep_uprobe_dummy")
-int BPF_UPROBE(mep_uprobe)
+SEC("uprobe/__ebpf_proxy_uprobe_dummy")
+int BPF_UPROBE(ebpf_proxy_uprobe)
 {
 	/* host-uprobe recipe: host mode attaches to all host processes that
 	 * map the target inode. Gate the emitted event stream by filter_pid so
 	 * --host --pid=<target-host-pid> yields target-PID rows only, not ambient
 	 * host malloc/cuda noise. The WASM control plane publishes filter_pid and
 	 * flips enabled last (ready gate) in gadgetStart(). */
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
-	struct event *e = mep_new(enter);
+	struct event *e = ebpf_proxy_new(enter);
 	if (!e)
 		return 0;
 	e->arg0 = (__u64)PT_REGS_PARM1(ctx);
@@ -674,8 +674,8 @@ int BPF_UPROBE(mep_uprobe)
 	// so an attach-family sock* decode, if any, is not clobbered).
 	if (uprobe_fd_arg <= 4) {
 		__u64 fargs[8] = { e->arg0, e->arg1, e->arg2, e->arg3, e->arg4, 0, 0, 0 };
-		struct mep_sockid _id;
-		mep_resolve_sock_fd((int)fargs[uprobe_fd_arg & 7], &_id);
+		struct ebpf_proxy_sockid _id;
+		ebpf_proxy_resolve_sock_fd((int)fargs[uprobe_fd_arg & 7], &_id);
 		if (_id.sk_family) {
 			e->saddr = _id.saddr; e->daddr = _id.daddr;
 			e->sport = _id.sport; e->dport = _id.dport;
@@ -689,20 +689,20 @@ int BPF_UPROBE(mep_uprobe)
 	{
 		__u32 tid = (__u32)bpf_get_current_pid_tgid();
 		__u64 sp = PT_REGS_SP(ctx);
-		struct mep_uctx *u = bpf_map_lookup_elem(&mep_uctx_map, &tid);
+		struct ebpf_proxy_uctx *u = bpf_map_lookup_elem(&ebpf_proxy_uctx_map, &tid);
 		// [stack_watermark] Detect the OUTERMOST frame by stack GEOMETRY, not by
 		// the uretprobe unwind count. On x86-64 the stack grows DOWN, so a deeper
 		// frame always has a strictly lower SP than its caller. If we have no
 		// context OR the current SP has risen back to/above the stored chain base
 		// (u->entry_sp), the previous chain has fully unwound and this is a fresh
 		// outermost call -- even if some uretprobes were MISSED (which would
-		// otherwise leave mep_uctx->depth drifting upward across chains, the
+		// otherwise leave ebpf_proxy_uctx->depth drifting upward across chains, the
 		// call_depth=21162 bug). Re-anchor: reset depth=1 and re-stamp entry_sp to
 		// this SP so call_depth is bounded per chain and stack_used is measured
 		// from the true current base, never a stale one.
 		if (!u || sp >= u->entry_sp) {
-			struct mep_uctx nu = { .depth = 1, .entry_sp = sp, .alarmed = 0 };
-			bpf_map_update_elem(&mep_uctx_map, &tid, &nu, BPF_ANY);
+			struct ebpf_proxy_uctx nu = { .depth = 1, .entry_sp = sp, .alarmed = 0 };
+			bpf_map_update_elem(&ebpf_proxy_uctx_map, &tid, &nu, BPF_ANY);
 			e->call_depth = 1;
 			e->stack_used = 0;
 		} else {
@@ -722,24 +722,24 @@ int BPF_UPROBE(mep_uprobe)
 	return 0;
 }
 
-SEC("uretprobe/__mep_uprobe_dummy")
-int BPF_URETPROBE(mep_uretprobe, long retval)
+SEC("uretprobe/__ebpf_proxy_uprobe_dummy")
+int BPF_URETPROBE(ebpf_proxy_uretprobe, long retval)
 {
-	/* Same host-PID gate as mep_uprobe: keep entry/return attribution symmetric. */
-	if (!mep_proc_wanted())
+	/* Same host-PID gate as ebpf_proxy_uprobe: keep entry/return attribution symmetric. */
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
-	struct event *e = mep_new(ret);
+	struct event *e = ebpf_proxy_new(ret);
 	if (!e)
 		return 0;
 	e->retval = (__s64)retval;
 	// [uprobe_pairing] pair this return to the entry depth, then unwind.
 	{
 		__u32 tid = (__u32)bpf_get_current_pid_tgid();
-		struct mep_uctx *u = bpf_map_lookup_elem(&mep_uctx_map, &tid);
+		struct ebpf_proxy_uctx *u = bpf_map_lookup_elem(&ebpf_proxy_uctx_map, &tid);
 		if (u) {
 			e->call_depth = u->depth;	// depth of the frame we are LEAVING
 			if (u->depth <= 1)
-				bpf_map_delete_elem(&mep_uctx_map, &tid);
+				bpf_map_delete_elem(&ebpf_proxy_uctx_map, &tid);
 			else
 				u->depth -= 1;
 		}
@@ -782,7 +782,7 @@ struct cuda_event {
 };
 
 GADGET_TRACER_MAP(cuda_events, 1024 * 256);
-GADGET_TRACER(mep_cuda, cuda_events, cuda_event);
+GADGET_TRACER(ebpf_proxy_cuda, cuda_events, cuda_event);
 
 #define CUDA_MAX_ENTRIES 10240
 
@@ -857,7 +857,7 @@ static __always_inline int cuda_alloc_enter(void *pending_map, __u64 ptr_loc,
 {
 	/* host-PID attribution: host CUDA uprobes attach broadly, so
 	 * reject non-target host processes before staging per-tid pending state. */
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	__u32 tid = cuda_tid();
 	struct cuda_pending p = {};
@@ -884,7 +884,7 @@ static __always_inline int cuda_alloc_exit(void *ctx, void *pending_map,
 	if (ptr_loc)
 		bpf_probe_read_user(&ptr, sizeof(ptr), (void *)ptr_loc);
 
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct cuda_event *e = gadget_reserve_buf(&cuda_events, sizeof(*e));
 	if (!e)
@@ -919,7 +919,7 @@ static __always_inline int cuda_free_enter(void *freeing_map, __u64 ptr)
 {
 	/* Same target-PID gate as alloc enter: no ambient host frees in target-only
 	 * captures. */
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	__u32 tid = cuda_tid();
 	bpf_map_update_elem(freeing_map, &tid, &ptr, BPF_ANY);
@@ -952,7 +952,7 @@ static __always_inline int cuda_free_exit(void *ctx, void *freeing_map,
 		size = *sp;
 	bpf_map_delete_elem(sizes_map, &k);
 
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct cuda_event *e = gadget_reserve_buf(&cuda_events, sizeof(*e));
 	if (!e)
@@ -971,52 +971,52 @@ static __always_inline int cuda_free_exit(void *ctx, void *freeing_map,
 // ---- libcuda (driver API) : cuMemAlloc_v2 / cuMemFree_v2 -------------------
 // CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize)
 SEC("uprobe/libcuda:cuMemAlloc_v2")
-int BPF_UPROBE(mep_cu_alloc, void **dptr, size_t bytesize)
+int BPF_UPROBE(ebpf_proxy_cu_alloc, void **dptr, size_t bytesize)
 {
 	return cuda_alloc_enter(&cuda_driver_pending, (__u64)dptr, (__u64)bytesize);
 }
 
 SEC("uretprobe/libcuda:cuMemAlloc_v2")
-int BPF_URETPROBE(mep_cu_alloc_ret, long ret)
+int BPF_URETPROBE(ebpf_proxy_cu_alloc_ret, long ret)
 {
 	return cuda_alloc_exit(ctx, &cuda_driver_pending, &cuda_driver_sizes, 0, ret);
 }
 
 // CUresult cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream s)
 SEC("uprobe/libcuda:cuMemAllocAsync")
-int BPF_UPROBE(mep_cu_alloc_async, void **dptr, size_t bytesize)
+int BPF_UPROBE(ebpf_proxy_cu_alloc_async, void **dptr, size_t bytesize)
 {
 	return cuda_alloc_enter(&cuda_driver_pending, (__u64)dptr, (__u64)bytesize);
 }
 
 SEC("uretprobe/libcuda:cuMemAllocAsync")
-int BPF_URETPROBE(mep_cu_alloc_async_ret, long ret)
+int BPF_URETPROBE(ebpf_proxy_cu_alloc_async_ret, long ret)
 {
 	return cuda_alloc_exit(ctx, &cuda_driver_pending, &cuda_driver_sizes, 0, ret);
 }
 
 // CUresult cuMemFree_v2(CUdeviceptr dptr)
 SEC("uprobe/libcuda:cuMemFree_v2")
-int BPF_UPROBE(mep_cu_free, u64 dptr)
+int BPF_UPROBE(ebpf_proxy_cu_free, u64 dptr)
 {
 	return cuda_free_enter(&cuda_driver_freeing, (__u64)dptr);
 }
 
 SEC("uretprobe/libcuda:cuMemFree_v2")
-int BPF_URETPROBE(mep_cu_free_ret, long ret)
+int BPF_URETPROBE(ebpf_proxy_cu_free_ret, long ret)
 {
 	return cuda_free_exit(ctx, &cuda_driver_freeing, &cuda_driver_sizes, 0, ret);
 }
 
 // CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream)
 SEC("uprobe/libcuda:cuMemFreeAsync")
-int BPF_UPROBE(mep_cu_free_async, u64 dptr)
+int BPF_UPROBE(ebpf_proxy_cu_free_async, u64 dptr)
 {
 	return cuda_free_enter(&cuda_driver_freeing, (__u64)dptr);
 }
 
 SEC("uretprobe/libcuda:cuMemFreeAsync")
-int BPF_URETPROBE(mep_cu_free_async_ret, long ret)
+int BPF_URETPROBE(ebpf_proxy_cu_free_async_ret, long ret)
 {
 	return cuda_free_exit(ctx, &cuda_driver_freeing, &cuda_driver_sizes, 0, ret);
 }
@@ -1024,52 +1024,52 @@ int BPF_URETPROBE(mep_cu_free_async_ret, long ret)
 // ---- libcudart (runtime API) : cudaMalloc / cudaFree ----------------------
 // cudaError_t cudaMalloc(void **devPtr, size_t size)
 SEC("uprobe/libcudart:cudaMalloc")
-int BPF_UPROBE(mep_cudart_alloc, void **devPtr, size_t size)
+int BPF_UPROBE(ebpf_proxy_cudart_alloc, void **devPtr, size_t size)
 {
 	return cuda_alloc_enter(&cuda_runtime_pending, (__u64)devPtr, (__u64)size);
 }
 
 SEC("uretprobe/libcudart:cudaMalloc")
-int BPF_URETPROBE(mep_cudart_alloc_ret, long ret)
+int BPF_URETPROBE(ebpf_proxy_cudart_alloc_ret, long ret)
 {
 	return cuda_alloc_exit(ctx, &cuda_runtime_pending, &cuda_runtime_sizes, 1, ret);
 }
 
 // cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t s)
 SEC("uprobe/libcudart:cudaMallocAsync")
-int BPF_UPROBE(mep_cudart_alloc_async, void **devPtr, size_t size)
+int BPF_UPROBE(ebpf_proxy_cudart_alloc_async, void **devPtr, size_t size)
 {
 	return cuda_alloc_enter(&cuda_runtime_pending, (__u64)devPtr, (__u64)size);
 }
 
 SEC("uretprobe/libcudart:cudaMallocAsync")
-int BPF_URETPROBE(mep_cudart_alloc_async_ret, long ret)
+int BPF_URETPROBE(ebpf_proxy_cudart_alloc_async_ret, long ret)
 {
 	return cuda_alloc_exit(ctx, &cuda_runtime_pending, &cuda_runtime_sizes, 1, ret);
 }
 
 // cudaError_t cudaFree(void *devPtr)
 SEC("uprobe/libcudart:cudaFree")
-int BPF_UPROBE(mep_cudart_free, u64 devPtr)
+int BPF_UPROBE(ebpf_proxy_cudart_free, u64 devPtr)
 {
 	return cuda_free_enter(&cuda_runtime_freeing, (__u64)devPtr);
 }
 
 SEC("uretprobe/libcudart:cudaFree")
-int BPF_URETPROBE(mep_cudart_free_ret, long ret)
+int BPF_URETPROBE(ebpf_proxy_cudart_free_ret, long ret)
 {
 	return cuda_free_exit(ctx, &cuda_runtime_freeing, &cuda_runtime_sizes, 1, ret);
 }
 
 // cudaError_t cudaFreeAsync(void *devPtr, cudaStream_t stream)
 SEC("uprobe/libcudart:cudaFreeAsync")
-int BPF_UPROBE(mep_cudart_free_async, u64 devPtr)
+int BPF_UPROBE(ebpf_proxy_cudart_free_async, u64 devPtr)
 {
 	return cuda_free_enter(&cuda_runtime_freeing, (__u64)devPtr);
 }
 
 SEC("uretprobe/libcudart:cudaFreeAsync")
-int BPF_URETPROBE(mep_cudart_free_async_ret, long ret)
+int BPF_URETPROBE(ebpf_proxy_cudart_free_async_ret, long ret)
 {
 	return cuda_free_exit(ctx, &cuda_runtime_freeing, &cuda_runtime_sizes, 1, ret);
 }
@@ -1113,11 +1113,11 @@ struct ksym_entry {
 	char module[56];
 };
 
-GADGET_ITER(symbols, ksym_entry, mep_ksym);
+GADGET_ITER(symbols, ksym_entry, ebpf_proxy_ksym);
 
 // Bounded prefix match (covers the dominant "vfs_*"/"tcp_*" discovery pattern).
 // Empty filter matches everything. `name` is a bounded stack copy.
-static __always_inline bool mep_name_prefix(const char *name)
+static __always_inline bool ebpf_proxy_name_prefix(const char *name)
 {
 	if (ksym_filter[0] == '\0')
 		return true;
@@ -1133,7 +1133,7 @@ static __always_inline bool mep_name_prefix(const char *name)
 }
 
 SEC("iter/ksym")
-int mep_ksym(struct bpf_iter__ksym *ctx)
+int ebpf_proxy_ksym(struct bpf_iter__ksym *ctx)
 {
 	struct seq_file *seq = ctx->meta->seq;
 	struct kallsym_iter *iter = ctx->ksym;
@@ -1158,7 +1158,7 @@ int mep_ksym(struct bpf_iter__ksym *ctx)
 			return 0;
 	}
 
-	if (!mep_name_prefix(entry.name))
+	if (!ebpf_proxy_name_prefix(entry.name))
 		return 0;
 
 	// Skip GCC/LTO optimizer-clone symbols (".constprop.N", ".isra.N", ".cold",
@@ -1209,7 +1209,7 @@ int mep_ksym(struct bpf_iter__ksym *ctx)
 // touching tcp_sock detail on them would be a memory-safety bug -- they emit the
 // 4-tuple + state with detail zeroed and sock_kind marking which kind it was.
 struct socksnap_entry {
-	__u32 saddr;		// local IPv4 (network order, like mep_sockstate.saddr)
+	__u32 saddr;		// local IPv4 (network order, like ebpf_proxy_sockstate.saddr)
 	__u32 daddr;		// remote IPv4 (network order)
 	__u16 sport;		// local port (host order)
 	__u16 dport;		// remote port (host order)
@@ -1227,10 +1227,10 @@ struct socksnap_entry {
 	__u64 last_snd_ts;	// [full] tp->lsndtime -- for "idle for N" reasoning
 };
 
-GADGET_ITER(mep_socksnap, socksnap_entry, mep_socksnap);
+GADGET_ITER(ebpf_proxy_socksnap, socksnap_entry, ebpf_proxy_socksnap);
 
 SEC("iter/tcp")
-int mep_socksnap(struct bpf_iter__tcp *ctx)
+int ebpf_proxy_socksnap(struct bpf_iter__tcp *ctx)
 {
 	struct sock_common *skc = ctx->sk_common;
 	struct seq_file *seq = ctx->meta->seq;
@@ -1320,7 +1320,7 @@ struct cuprof_event {
 };
 
 GADGET_TRACER_MAP(cuprof_events, 1024 * 256);
-GADGET_TRACER(mep_cuprof, cuprof_events, cuprof_event);
+GADGET_TRACER(ebpf_proxy_cuprof, cuprof_events, cuprof_event);
 
 // per-tid scratch carrying the sync call's entry timestamp so the uretprobe can
 // compute its wall-clock duration. Keyed by tid because concurrent host threads
@@ -1381,7 +1381,7 @@ static __always_inline bool cuprof_emit_wanted(enum cuprof_op op)
 
 static __always_inline struct cuprof_event *cuprof_new(enum cuprof_op op)
 {
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	if (!cuprof_emit_wanted(op))
 		return 0;
@@ -1404,7 +1404,7 @@ static __always_inline struct cuprof_event *cuprof_new(enum cuprof_op op)
 // CUstream s, void **params, void **extra)
 // Args: PARM2..PARM7 carry the 6 grid/block dims (PARM1 = the function handle).
 SEC("uprobe/libcuda:cuLaunchKernel")
-int BPF_UPROBE(mep_cuprof_launch)
+int BPF_UPROBE(ebpf_proxy_cuprof_launch)
 {
 	struct cuprof_event *e = cuprof_new(cuprof_launch);
 	if (!e)
@@ -1431,7 +1431,7 @@ int BPF_UPROBE(mep_cuprof_launch)
 // launch event (dims read from the config struct: gridDimX/Y/Z then
 // blockDimX/Y/Z are the first 6 uints of CUlaunchConfig).
 SEC("uprobe/libcuda:cuLaunchKernelEx")
-int BPF_UPROBE(mep_cuprof_launch_ex, void *cfg)
+int BPF_UPROBE(ebpf_proxy_cuprof_launch_ex, void *cfg)
 {
 	struct cuprof_event *e = cuprof_new(cuprof_launch);
 	if (!e)
@@ -1474,14 +1474,14 @@ static __always_inline int cuprof_sync_exit_fn(void *ctx, long ret)
 }
 
 SEC("uprobe/libcuda:cuStreamSynchronize")
-int BPF_UPROBE(mep_cuprof_streamsync) { return cuprof_sync_enter_fn(); }
+int BPF_UPROBE(ebpf_proxy_cuprof_streamsync) { return cuprof_sync_enter_fn(); }
 SEC("uretprobe/libcuda:cuStreamSynchronize")
-int BPF_URETPROBE(mep_cuprof_streamsync_ret, long ret) { return cuprof_sync_exit_fn(ctx, ret); }
+int BPF_URETPROBE(ebpf_proxy_cuprof_streamsync_ret, long ret) { return cuprof_sync_exit_fn(ctx, ret); }
 
 SEC("uprobe/libcuda:cuCtxSynchronize")
-int BPF_UPROBE(mep_cuprof_ctxsync) { return cuprof_sync_enter_fn(); }
+int BPF_UPROBE(ebpf_proxy_cuprof_ctxsync) { return cuprof_sync_enter_fn(); }
 SEC("uretprobe/libcuda:cuCtxSynchronize")
-int BPF_URETPROBE(mep_cuprof_ctxsync_ret, long ret) { return cuprof_sync_exit_fn(ctx, ret); }
+int BPF_URETPROBE(ebpf_proxy_cuprof_ctxsync_ret, long ret) { return cuprof_sync_exit_fn(ctx, ret); }
 
 // ---- memcpy: record direction + byteCount ----------------------------------
 // CUresult cuMemcpyHtoD_v2(CUdeviceptr dst, const void *src, size_t ByteCount)
@@ -1489,7 +1489,7 @@ int BPF_URETPROBE(mep_cuprof_ctxsync_ret, long ret) { return cuprof_sync_exit_fn
 // CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr dst, const void *src,
 // size_t ByteCount, CUstream s) -> PARM3
 SEC("uprobe/libcuda:cuMemcpyHtoD_v2")
-int BPF_UPROBE(mep_cuprof_h2d, u64 dst, void *src, u64 bytes)
+int BPF_UPROBE(ebpf_proxy_cuprof_h2d, u64 dst, void *src, u64 bytes)
 {
 	struct cuprof_event *e = cuprof_new(cuprof_memcpy_h2d);
 	if (!e) return 0;
@@ -1498,7 +1498,7 @@ int BPF_UPROBE(mep_cuprof_h2d, u64 dst, void *src, u64 bytes)
 	return 0;
 }
 SEC("uprobe/libcuda:cuMemcpyHtoDAsync_v2")
-int BPF_UPROBE(mep_cuprof_h2d_async, u64 dst, void *src, u64 bytes)
+int BPF_UPROBE(ebpf_proxy_cuprof_h2d_async, u64 dst, void *src, u64 bytes)
 {
 	struct cuprof_event *e = cuprof_new(cuprof_memcpy_h2d);
 	if (!e) return 0;
@@ -1508,7 +1508,7 @@ int BPF_UPROBE(mep_cuprof_h2d_async, u64 dst, void *src, u64 bytes)
 }
 // CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr src, size_t ByteCount)
 SEC("uprobe/libcuda:cuMemcpyDtoH_v2")
-int BPF_UPROBE(mep_cuprof_d2h, void *dst, u64 src, u64 bytes)
+int BPF_UPROBE(ebpf_proxy_cuprof_d2h, void *dst, u64 src, u64 bytes)
 {
 	struct cuprof_event *e = cuprof_new(cuprof_memcpy_d2h);
 	if (!e) return 0;
@@ -1517,7 +1517,7 @@ int BPF_UPROBE(mep_cuprof_d2h, void *dst, u64 src, u64 bytes)
 	return 0;
 }
 SEC("uprobe/libcuda:cuMemcpyDtoHAsync_v2")
-int BPF_UPROBE(mep_cuprof_d2h_async, void *dst, u64 src, u64 bytes)
+int BPF_UPROBE(ebpf_proxy_cuprof_d2h_async, void *dst, u64 src, u64 bytes)
 {
 	struct cuprof_event *e = cuprof_new(cuprof_memcpy_d2h);
 	if (!e) return 0;
@@ -1559,7 +1559,7 @@ struct lock_event {
 };
 
 GADGET_TRACER_MAP(lock_events, 1024 * 256);
-GADGET_TRACER(mep_lock, lock_events, lock_event);
+GADGET_TRACER(ebpf_proxy_lock, lock_events, lock_event);
 
 // per-tid scratch carrying (entry ts, lock addr) from uprobe -> uretprobe.
 struct lock_pending {
@@ -1612,7 +1612,7 @@ static __always_inline int lock_exit(void *ctx, long ret)
 	enum lock_op op = p->op;
 	bpf_map_delete_elem(&lock_pending_map, &tid);
 
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct lock_event *e = gadget_reserve_buf(&lock_events, sizeof(*e));
 	if (!e)
@@ -1636,17 +1636,17 @@ static __always_inline int lock_exit(void *ctx, long ret)
 
 // int pthread_mutex_lock(pthread_mutex_t *mutex) — PARM1 = &mutex
 SEC("uprobe/libc:pthread_mutex_lock")
-int BPF_UPROBE(mep_lock_mutex, void *mutex)
+int BPF_UPROBE(ebpf_proxy_lock_mutex, void *mutex)
 {
 	return lock_enter(lock_mutex_wait, (__u64)mutex);
 }
 SEC("uretprobe/libc:pthread_mutex_lock")
-int BPF_URETPROBE(mep_lock_mutex_ret, long ret) { return lock_exit(ctx, ret); }
+int BPF_URETPROBE(ebpf_proxy_lock_mutex_ret, long ret) { return lock_exit(ctx, ret); }
 
 // pthread_mutex_unlock(&m) — releaser clears the holder for addr so a
 // later waiter does not mis-attribute its block to a stale owner.
 SEC("uprobe/libc:pthread_mutex_unlock")
-int BPF_UPROBE(mep_lock_unlock, void *mutex)
+int BPF_UPROBE(ebpf_proxy_lock_unlock, void *mutex)
 {
 	__u64 addr = (__u64)mutex;
 	__u32 zero = 0;
@@ -1656,36 +1656,36 @@ int BPF_UPROBE(mep_lock_unlock, void *mutex)
 
 // int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) — PARM1 = &cond
 SEC("uprobe/libc:pthread_cond_wait")
-int BPF_UPROBE(mep_lock_cond, void *cond)
+int BPF_UPROBE(ebpf_proxy_lock_cond, void *cond)
 {
 	return lock_enter(lock_cond_wait, (__u64)cond);
 }
 SEC("uretprobe/libc:pthread_cond_wait")
-int BPF_URETPROBE(mep_lock_cond_ret, long ret) { return lock_exit(ctx, ret); }
+int BPF_URETPROBE(ebpf_proxy_lock_cond_ret, long ret) { return lock_exit(ctx, ret); }
 
 SEC("uprobe/libc:pthread_cond_timedwait")
-int BPF_UPROBE(mep_lock_condt, void *cond)
+int BPF_UPROBE(ebpf_proxy_lock_condt, void *cond)
 {
 	return lock_enter(lock_cond_wait, (__u64)cond);
 }
 SEC("uretprobe/libc:pthread_cond_timedwait")
-int BPF_URETPROBE(mep_lock_condt_ret, long ret) { return lock_exit(ctx, ret); }
+int BPF_URETPROBE(ebpf_proxy_lock_condt_ret, long ret) { return lock_exit(ctx, ret); }
 
 // ---------------------------------------------------------------------------
 // lock_trace EXPANSION (directive-22124/22126): kernel futex(FUTEX_WAIT*) hook.
 // pthread mutex/cond CONTENTION blocks in the kernel via the futex syscall. The
 // libc uprobes above can miss waits when the target's libc symbol fails to
 // resolve or attaches after the contention burst; the futex syscall ALWAYS runs
-// in the contending thread's OWN process context, so mep_proc_wanted() (the
+// in the contending thread's OWN process context, so ebpf_proxy_proc_wanted() (the
 // shared filter_pid gate) attributes it to the subject deterministically. We
 // time only the BLOCKING wait ops (FUTEX_WAIT / FUTEX_WAIT_BITSET); wakes and
 // requeues are instantaneous and excluded. addr = uaddr groups waits per lock.
 // READ-ONLY: pure syscall-arg + return observation. Uses a DEDICATED pending
 // map so a contended mutex's inner futex cannot clobber the uprobe pending slot.
 // ---------------------------------------------------------------------------
-#define MEP_FUTEX_WAIT		0
-#define MEP_FUTEX_WAIT_BITSET	9
-#define MEP_FUTEX_CMD_MASK	0x7f	// strip FUTEX_PRIVATE_FLAG|FUTEX_CLOCK_REALTIME
+#define EBPF_PROXY_FUTEX_WAIT		0
+#define EBPF_PROXY_FUTEX_WAIT_BITSET	9
+#define EBPF_PROXY_FUTEX_CMD_MASK	0x7f	// strip FUTEX_PRIVATE_FLAG|FUTEX_CLOCK_REALTIME
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -1695,10 +1695,10 @@ struct {
 } lock_futex_pending_map SEC(".maps");
 
 SEC("tracepoint/syscalls/sys_enter_futex")
-int mep_lock_futex_enter(struct trace_event_raw_sys_enter *ctx)
+int ebpf_proxy_lock_futex_enter(struct trace_event_raw_sys_enter *ctx)
 {
-	int cmd = (int)ctx->args[1] & MEP_FUTEX_CMD_MASK;
-	if (cmd != MEP_FUTEX_WAIT && cmd != MEP_FUTEX_WAIT_BITSET)
+	int cmd = (int)ctx->args[1] & EBPF_PROXY_FUTEX_CMD_MASK;
+	if (cmd != EBPF_PROXY_FUTEX_WAIT && cmd != EBPF_PROXY_FUTEX_WAIT_BITSET)
 		return 0;
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct lock_pending p = {};
@@ -1716,7 +1716,7 @@ int mep_lock_futex_enter(struct trace_event_raw_sys_enter *ctx)
 }
 
 SEC("tracepoint/syscalls/sys_exit_futex")
-int mep_lock_futex_exit(struct trace_event_raw_sys_exit *ctx)
+int ebpf_proxy_lock_futex_exit(struct trace_event_raw_sys_exit *ctx)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct lock_pending *p = bpf_map_lookup_elem(&lock_futex_pending_map, &tid);
@@ -1726,7 +1726,7 @@ int mep_lock_futex_exit(struct trace_event_raw_sys_exit *ctx)
 	__u64 addr = p->addr;
 	bpf_map_delete_elem(&lock_futex_pending_map, &tid);
 
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct lock_event *e = gadget_reserve_buf(&lock_events, sizeof(*e));
 	if (!e)
@@ -1776,7 +1776,7 @@ struct heap_event {
 };
 
 GADGET_TRACER_MAP(heap_events, 1024 * 256);
-GADGET_TRACER(mep_heap, heap_events, heap_event);
+GADGET_TRACER(ebpf_proxy_heap, heap_events, heap_event);
 
 // per-tid scratch carrying (op, size, old_ptr) from alloc uprobe -> uretprobe.
 struct heap_pending {
@@ -1814,7 +1814,7 @@ static __always_inline int heap_alloc_exit(void *ctx, long ret)
 	__u64 old_ptr = p->old_ptr;
 	bpf_map_delete_elem(&heap_pending_map, &tid);
 
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct heap_event *e = gadget_reserve_buf(&heap_events, sizeof(*e));
 	if (!e)
@@ -1831,38 +1831,38 @@ static __always_inline int heap_alloc_exit(void *ctx, long ret)
 
 // void *malloc(size_t size) — PARM1 = size
 SEC("uprobe/libc:malloc")
-int BPF_UPROBE(mep_heap_malloc, u64 size)
+int BPF_UPROBE(ebpf_proxy_heap_malloc, u64 size)
 {
 	return heap_alloc_enter(heap_malloc, size, 0);
 }
 SEC("uretprobe/libc:malloc")
-int BPF_URETPROBE(mep_heap_malloc_ret, long ret) { return heap_alloc_exit(ctx, ret); }
+int BPF_URETPROBE(ebpf_proxy_heap_malloc_ret, long ret) { return heap_alloc_exit(ctx, ret); }
 
 // void *calloc(size_t nmemb, size_t size) — bytes = nmemb*size
 SEC("uprobe/libc:calloc")
-int BPF_UPROBE(mep_heap_calloc, u64 nmemb, u64 size)
+int BPF_UPROBE(ebpf_proxy_heap_calloc, u64 nmemb, u64 size)
 {
 	return heap_alloc_enter(heap_calloc, nmemb * size, 0);
 }
 SEC("uretprobe/libc:calloc")
-int BPF_URETPROBE(mep_heap_calloc_ret, long ret) { return heap_alloc_exit(ctx, ret); }
+int BPF_URETPROBE(ebpf_proxy_heap_calloc_ret, long ret) { return heap_alloc_exit(ctx, ret); }
 
 // void *realloc(void *ptr, size_t size) — PARM1 = old ptr, PARM2 = size
 SEC("uprobe/libc:realloc")
-int BPF_UPROBE(mep_heap_realloc, u64 old_ptr, u64 size)
+int BPF_UPROBE(ebpf_proxy_heap_realloc, u64 old_ptr, u64 size)
 {
 	return heap_alloc_enter(heap_realloc, size, old_ptr);
 }
 SEC("uretprobe/libc:realloc")
-int BPF_URETPROBE(mep_heap_realloc_ret, long ret) { return heap_alloc_exit(ctx, ret); }
+int BPF_URETPROBE(ebpf_proxy_heap_realloc_ret, long ret) { return heap_alloc_exit(ctx, ret); }
 
 // void free(void *ptr) — PARM1 = ptr; emit immediately (no return value)
 SEC("uprobe/libc:free")
-int BPF_UPROBE(mep_heap_free, u64 ptr)
+int BPF_UPROBE(ebpf_proxy_heap_free, u64 ptr)
 {
 	if (ptr == 0)	// free(NULL) is a no-op
 		return 0;
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct heap_event *e = gadget_reserve_buf(&heap_events, sizeof(*e));
 	if (!e)
@@ -1886,13 +1886,13 @@ int BPF_UPROBE(mep_heap_free, u64 ptr)
 // rows for it (proven: `attach_uprobe libc:malloc --pid=<host-pid>` returned 36
 // rows, ALL from containerd-shim/dcgm-exporter, none from the host leaker pid).
 // The brk()/mmap() syscalls ALWAYS run in the allocating thread's OWN process
-// context, so mep_proc_wanted() (the shared filter_pid gate) attributes them to
+// context, so ebpf_proxy_proc_wanted() (the shared filter_pid gate) attributes them to
 // the host subject deterministically — exactly the idiom the lock_trace futex
 // tracepoint uses to escape the same uprobe-scoping fragility. READ-ONLY: pure
 // syscall return/arg observation. These complement (do not replace) the libc
 // uprobes, which still serve containerized targets.
 // ---------------------------------------------------------------------------
-#define MEP_MAP_ANONYMOUS 0x20	// linux/mman.h MAP_ANONYMOUS (x86_64)
+#define EBPF_PROXY_MAP_ANONYMOUS 0x20	// linux/mman.h MAP_ANONYMOUS (x86_64)
 
 // per-tgid heap (program break) high-water, to emit only GROWTH deltas. LRU so
 // a flood of short-lived pids can never exhaust it.
@@ -1908,7 +1908,7 @@ struct {
 // the per-tgid high-water and emit one heap_brk_grow event carrying the byte
 // delta whenever it climbs — the classic host-RAM leak/churn signature.
 SEC("tracepoint/syscalls/sys_exit_brk")
-int mep_heap_brk(struct trace_event_raw_sys_exit *ctx)
+int ebpf_proxy_heap_brk(struct trace_event_raw_sys_exit *ctx)
 {
 	__u64 newbrk = (__u64)ctx->ret;
 	if (newbrk == 0)
@@ -1919,7 +1919,7 @@ int mep_heap_brk(struct trace_event_raw_sys_exit *ctx)
 	bpf_map_update_elem(&heap_brk_map, &tgid, &newbrk, BPF_ANY);
 	if (prev == 0 || newbrk <= prev)	// first sighting or shrink: record only
 		return 0;
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct heap_event *e = gadget_reserve_buf(&heap_events, sizeof(*e));
 	if (!e)
@@ -1938,7 +1938,7 @@ int mep_heap_brk(struct trace_event_raw_sys_exit *ctx)
 // and come straight from anonymous mmap. We record anonymous, non-file-backed
 // mappings (the heap-relevant ones) with their requested length.
 SEC("tracepoint/syscalls/sys_enter_mmap")
-int mep_heap_mmap(struct trace_event_raw_sys_enter *ctx)
+int ebpf_proxy_heap_mmap(struct trace_event_raw_sys_enter *ctx)
 {
 	__u64 len   = (__u64)ctx->args[1];
 	__u64 flags = (__u64)ctx->args[3];
@@ -1947,10 +1947,10 @@ int mep_heap_mmap(struct trace_event_raw_sys_enter *ctx)
 	// preserved (a (long) cast would make -1 look like +4294967295 and wrongly
 	// classify every anon mapping as file-backed).
 	int   fd    = (int)ctx->args[4];
-	if (!(flags & MEP_MAP_ANONYMOUS)) {	// file-backed mapping (fd>=0): page-cache / address-space signal
+	if (!(flags & EBPF_PROXY_MAP_ANONYMOUS)) {	// file-backed mapping (fd>=0): page-cache / address-space signal
 		if (fd < 0 || len == 0)
 			return 0;
-		if (!mep_proc_wanted())
+		if (!ebpf_proxy_proc_wanted())
 			return 0;
 		struct heap_event *fe = gadget_reserve_buf(&heap_events, sizeof(*fe));
 		if (!fe)
@@ -1968,7 +1968,7 @@ int mep_heap_mmap(struct trace_event_raw_sys_enter *ctx)
 		return 0;
 	if (len == 0)
 		return 0;
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct heap_event *e = gadget_reserve_buf(&heap_events, sizeof(*e));
 	if (!e)
@@ -2027,7 +2027,7 @@ struct net_event {
 };
 
 GADGET_TRACER_MAP(net_events, 1024 * 256);
-GADGET_TRACER(mep_net, net_events, net_event);
+GADGET_TRACER(ebpf_proxy_net, net_events, net_event);
 
 // ============================================================================
 // [sockpair_correlate] sockpair_correlate — link a proxy's DOWNSTREAM (accepted) socket to
@@ -2048,29 +2048,29 @@ struct sockpair_event {
 	gadget_duration accept_to_connect_ns;	// accept -> upstream-connect gap
 };
 GADGET_TRACER_MAP(sockpairs, 1024 * 64);
-GADGET_TRACER(mep_sockpair, sockpairs, sockpair_event);
+GADGET_TRACER(ebpf_proxy_sockpair, sockpairs, sockpair_event);
 
-struct mep_pending_accept { struct mep_sockid down; __u64 ts; };
+struct ebpf_proxy_pending_accept { struct ebpf_proxy_sockid down; __u64 ts; };
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 4096);
 	__type(key, __u32);		// tid
-	__type(value, struct mep_pending_accept);
+	__type(value, struct ebpf_proxy_pending_accept);
 } sockpair_pending SEC(".maps");
 
 // inet_csk_accept returns the newly-accepted child struct sock* (the
 // downstream connection). Stash its 4-tuple keyed by the accepting tid.
 SEC("kretprobe/inet_csk_accept")
-int BPF_KRETPROBE(mep_sockpair_accept, struct sock *child)
+int BPF_KRETPROBE(ebpf_proxy_sockpair_accept, struct sock *child)
 {
-	if (!child || !mep_proc_wanted())
+	if (!child || !ebpf_proxy_proc_wanted())
 		return 0;
-	struct mep_sockid id;
-	mep_decode_sk(child, &id);
+	struct ebpf_proxy_sockid id;
+	ebpf_proxy_decode_sk(child, &id);
 	if (id.sk_family != AF_INET)	// v4 correlation
 		return 0;
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
-	struct mep_pending_accept p = { .down = id, .ts = bpf_ktime_get_boot_ns() };
+	struct ebpf_proxy_pending_accept p = { .down = id, .ts = bpf_ktime_get_boot_ns() };
 	bpf_map_update_elem(&sockpair_pending, &tid, &p, BPF_ANY);
 	return 0;
 }
@@ -2082,15 +2082,15 @@ int BPF_KRETPROBE(mep_sockpair_accept, struct sock *child)
 // a connect to a stale/dead endpoint:
 // it aligns "connect to 10.x" against the destination POD, not an opaque IP.
 //
-// Scoped to mep_net ONLY: every net event is definitionally an inet socket op
+// Scoped to ebpf_proxy_net ONLY: every net event is definitionally an inet socket op
 // (tcp_*/udp_* kprobes), so version is ALWAYS 4. We set version=4 even when
 // daddr==0 (unresolved) -> formats as 0.0.0.0 -> KubeIPResolver GetPodByIp
 // returns nil -> row emitted unenriched (NO drop). Putting this type on a
-// datasource that also carries non-socket rows (mep_sys open/read of a file)
+// datasource that also carries non-socket rows (ebpf_proxy_sys open/read of a file)
 // makes the l4endpoint formatter error "unknown IP version: 0" and DROP the row
 // (EmitAndRelease -> processEvent Warnf+continue). v4-only mirrors the
 // pre-existing v4-only daddr field (v6 is a separate enhancement).
-static __always_inline void mep_fill_net_ep(struct net_event *e)
+static __always_inline void ebpf_proxy_fill_net_ep(struct net_event *e)
 {
 	__builtin_memset(&e->dst_endpoint, 0, sizeof(e->dst_endpoint));
 	e->dst_endpoint.addr_raw.v4 = e->daddr;		// network order (matches.v4)
@@ -2130,7 +2130,7 @@ struct net_rollup_val {
 	__u64 bytes_sum;	// total bytes moved (sendmsg/udp size); 0-byte pings visible as count>1,bytes_sum==0
 	__u64 retrans_count;	// net_retransmit ops on this flow (loss/blackhole signal)
 	__u64 rst_count;	// inbound RSTs on this flow. Populated whenever the
-				// mep_tcp_reset hook is co-attached (always under sock_state;
+				// ebpf_proxy_tcp_reset hook is co-attached (always under sock_state;
 				// and under net_trace via the net_trace keep-set co-attach)
 				// so a refused/aborted connect shows rst_count>0 here.
 	__u64 closing_evts;	// net events seen while tcp_state was a closing state (CLOSE_WAIT/FIN_WAIT*/LAST_ACK/CLOSING) -- write-after-peer-FIN shape
@@ -2147,7 +2147,7 @@ struct {
 
 // [absence_assert] absence_lw_map: a DEDICATED persistent mirror of the per-flow write
 // history, keyed identically to net_rollup_map. Written by net_rollup_update,
-// read ONLY by the mep_absence iter/tcp walk. It is intentionally NOT wrapped in
+// read ONLY by the ebpf_proxy_absence iter/tcp walk. It is intentionally NOT wrapped in
 // a GADGET_MAPITER: per_key_rollup's net_rollup MAPITER is fetched on its own cycle, so a
 // co-resident iter/tcp snapshot can observe net_rollup_map at a point where the
 // per_key_rollup datasource lifecycle has not (re)published this flow. A dedicated map
@@ -2274,7 +2274,7 @@ static __always_inline void net_decode_sk(struct net_event *e, struct sock *sk)
 
 static __always_inline struct net_event *net_new(enum net_op op)
 {
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct net_event *e = gadget_reserve_buf(&net_events, sizeof(*e));
 	if (!e) return 0;
@@ -2287,7 +2287,7 @@ static __always_inline struct net_event *net_new(enum net_op op)
 }
 
 SEC("kprobe/tcp_v4_connect")
-int BPF_KPROBE(mep_net_connect, struct sock *sk)
+int BPF_KPROBE(ebpf_proxy_net_connect, struct sock *sk)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct net_connect_ctx c = { .skp = (__u64)sk, .ts = bpf_ktime_get_boot_ns() };
@@ -2295,7 +2295,7 @@ int BPF_KPROBE(mep_net_connect, struct sock *sk)
 	return 0;
 }
 SEC("kretprobe/tcp_v4_connect")
-int BPF_KRETPROBE(mep_net_connect_ret, int ret)
+int BPF_KRETPROBE(ebpf_proxy_net_connect_ret, int ret)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct net_connect_ctx *c = bpf_map_lookup_elem(&net_connect_sk, &tid);
@@ -2312,12 +2312,12 @@ int BPF_KRETPROBE(mep_net_connect_ret, int ret)
 	e->tcp_state = BPF_CORE_READ(sk, __sk_common.skc_state);
 	e->connect_latency_ns = bpf_ktime_get_boot_ns() - t0;
 	net_rollup_update(e);
-	mep_fill_net_ep(e);
+	ebpf_proxy_fill_net_ep(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	// [sockpair_correlate] if this worker recently accepted a downstream conn, pair it with
 	// this upstream connect (same tid = same proxy worker servicing both legs).
 	{
-		struct mep_pending_accept *pa = bpf_map_lookup_elem(&sockpair_pending, &tid);
+		struct ebpf_proxy_pending_accept *pa = bpf_map_lookup_elem(&sockpair_pending, &tid);
 		if (pa) {
 			struct sockpair_event *sp = gadget_reserve_buf(&sockpairs, sizeof(*sp));
 			if (sp) {
@@ -2326,7 +2326,7 @@ int BPF_KRETPROBE(mep_net_connect_ret, int ret)
 				sp->down_saddr = pa->down.saddr; sp->down_daddr = pa->down.daddr;
 				sp->down_sport = pa->down.sport; sp->down_dport = pa->down.dport;
 				sp->down_state = pa->down.sk_state;
-				struct mep_sockid uid; mep_decode_sk(sk, &uid);
+				struct ebpf_proxy_sockid uid; ebpf_proxy_decode_sk(sk, &uid);
 				sp->up_saddr = uid.saddr; sp->up_daddr = uid.daddr;
 				sp->up_sport = uid.sport; sp->up_dport = uid.dport;
 				sp->up_state = uid.sk_state; sp->up_retval = ret;
@@ -2341,7 +2341,7 @@ int BPF_KRETPROBE(mep_net_connect_ret, int ret)
 }
 
 SEC("kprobe/tcp_retransmit_skb")
-int BPF_KPROBE(mep_net_retransmit, struct sock *sk)
+int BPF_KPROBE(ebpf_proxy_net_retransmit, struct sock *sk)
 {
 	struct net_event *e = net_new(net_retransmit);
 	if (!e) return 0;
@@ -2352,20 +2352,20 @@ int BPF_KPROBE(mep_net_retransmit, struct sock *sk)
 	e->retrans_out = BPF_CORE_READ(icsk, icsk_retransmits);
 	e->tcp_state   = BPF_CORE_READ(sk, __sk_common.skc_state);
 	net_rollup_update(e);
-	mep_fill_net_ep(e);
+	ebpf_proxy_fill_net_ep(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
 
 SEC("kprobe/tcp_sendmsg")
-int BPF_KPROBE(mep_net_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
+int BPF_KPROBE(ebpf_proxy_net_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
 {
 	struct net_event *e = net_new(net_sendmsg);
 	if (!e) return 0;
 	net_decode_sk(e, sk);
 	e->bytes = size;
 	net_rollup_update(e);
-	mep_fill_net_ep(e);
+	ebpf_proxy_fill_net_ep(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
@@ -2377,27 +2377,27 @@ int BPF_KPROBE(mep_net_sendmsg, struct sock *sk, struct msghdr *msg, size_t size
 // stub-resolver query, so skc_daddr/skc_dport are populated) and the byte
 // count, giving the MCP client direct visibility of the :53 request/response pair.
 SEC("kprobe/udp_sendmsg")
-int BPF_KPROBE(mep_net_udp_send, struct sock *sk, struct msghdr *msg, size_t size)
+int BPF_KPROBE(ebpf_proxy_net_udp_send, struct sock *sk, struct msghdr *msg, size_t size)
 {
 	struct net_event *e = net_new(net_udp_send);
 	if (!e) return 0;
 	net_decode_sk(e, sk);
 	e->bytes = size;
 	net_rollup_update(e);
-	mep_fill_net_ep(e);
+	ebpf_proxy_fill_net_ep(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
 
 SEC("kprobe/udp_recvmsg")
-int BPF_KPROBE(mep_net_udp_recv, struct sock *sk, struct msghdr *msg, size_t size)
+int BPF_KPROBE(ebpf_proxy_net_udp_recv, struct sock *sk, struct msghdr *msg, size_t size)
 {
 	struct net_event *e = net_new(net_udp_recv);
 	if (!e) return 0;
 	net_decode_sk(e, sk);
 	e->bytes = size;
 	net_rollup_update(e);
-	mep_fill_net_ep(e);
+	ebpf_proxy_fill_net_ep(e);
 	gadget_submit_buf(ctx, &net_events, e, sizeof(*e));
 	return 0;
 }
@@ -2427,7 +2427,7 @@ struct sockstate_event {
 };
 
 GADGET_TRACER_MAP(sockstate_events, 1024 * 256);
-GADGET_TRACER(mep_sockstate, sockstate_events, sockstate_event);
+GADGET_TRACER(ebpf_proxy_sockstate, sockstate_events, sockstate_event);
 
 static __always_inline struct sockstate_event *sockstate_new(enum sockstate_op op)
 {
@@ -2446,7 +2446,7 @@ static __always_inline struct sockstate_event *sockstate_new(enum sockstate_op o
 // softirq context (passive SYN_RECV->ESTABLISHED etc.), so it is NOT proc-gated
 // — the MCP client scopes by 4-tuple. TCP-only (protocol==IPPROTO_TCP==6).
 SEC("tracepoint/sock/inet_sock_set_state")
-int mep_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
+int ebpf_proxy_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 {
 	if (ctx->protocol != 6)	// IPPROTO_TCP
 		return 0;
@@ -2466,7 +2466,7 @@ int mep_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 
 // Inbound RST: inbound RST RECEIVED on an existing socket (reset_dir=1).
 SEC("kprobe/tcp_reset")
-int BPF_KPROBE(mep_tcp_reset, struct sock *sk)
+int BPF_KPROBE(ebpf_proxy_tcp_reset, struct sock *sk)
 {
 	struct sockstate_event *e = sockstate_new(ss_reset_rx);
 	if (!e) return 0;
@@ -2496,7 +2496,7 @@ int BPF_KPROBE(mep_tcp_reset, struct sock *sk)
 // 4-tuple is recovered from the offending inbound skb so the row still names
 // which remote endpoint got the RST.
 SEC("kprobe/tcp_v4_send_reset")
-int BPF_KPROBE(mep_tcp_send_reset, const struct sock *sk, struct sk_buff *skb)
+int BPF_KPROBE(ebpf_proxy_tcp_send_reset, const struct sock *sk, struct sk_buff *skb)
 {
 	struct sockstate_event *e = sockstate_new(ss_reset_tx);
 	if (!e) return 0;
@@ -2533,7 +2533,7 @@ int BPF_KPROBE(mep_tcp_send_reset, const struct sock *sk, struct sk_buff *skb)
 // [errno_decode / causal death linkage] sched:sched_process_exit
 // When a process that trace_syscall was watching EXITS, pair its exit code
 // with the LAST failed socket syscall it made (last_sockfail). The emitted
-// mep_death row answers the dependency-death question directly: "pid 1234 exited
+// ebpf_proxy_death row answers the dependency-death question directly: "pid 1234 exited
 // (code=1) 3.2ms after connect(10.0.0.5:8080) failed ECONNREFUSED" -- causal
 // dependency-death, not a guess. Only fires for the group leader (pid==tgid)
 // and only when a failure was recorded, so it inherits trace_syscall's pid
@@ -2544,7 +2544,7 @@ struct death_event {
 	struct gadget_process proc;
 	__s32 exit_code;		// task->exit_code (>>8 = status, &0x7f = signal)
 	gadget_errno last_err_raw;	// errno of the last failed socket syscall
-	enum mep_errclass last_err_class_raw;
+	enum ebpf_proxy_errclass last_err_class_raw;
 	__u32 last_nr;			// which syscall failed (42=connect)
 	gadget_duration gap_ns;		// exit_ts - fail_ts (how soon after the failure)
 	__u32 saddr, daddr;		// intended peer of the failed syscall
@@ -2552,17 +2552,17 @@ struct death_event {
 	__u8  sk_family;
 };
 GADGET_TRACER_MAP(death_events, 64 * 1024);
-GADGET_TRACER(mep_death, death_events, death_event);
+GADGET_TRACER(ebpf_proxy_death, death_events, death_event);
 
 SEC("tracepoint/sched/sched_process_exit")
-int mep_death_probe(void *ctx)
+int ebpf_proxy_death_probe(void *ctx)
 {
 	__u64 pt = bpf_get_current_pid_tgid();
 	__u32 tgid = pt >> 32;
 	__u32 pid  = (__u32)pt;
 	if (pid != tgid)		// only the group leader's exit == process death
 		return 0;
-	struct mep_sockfail *f = bpf_map_lookup_elem(&last_sockfail, &tgid);
+	struct ebpf_proxy_sockfail *f = bpf_map_lookup_elem(&last_sockfail, &tgid);
 	if (!f)				// process made no failed socket call -- silent
 		return 0;
 
@@ -2574,7 +2574,7 @@ int mep_death_probe(void *ctx)
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	e->exit_code = BPF_CORE_READ(task, exit_code);
 	e->last_err_raw = f->err;
-	e->last_err_class_raw = (enum mep_errclass)f->err_class;
+	e->last_err_class_raw = (enum ebpf_proxy_errclass)f->err_class;
 	e->last_nr = f->nr;
 	e->gap_ns = (now > f->ts) ? (now - f->ts) : 0;
 	e->saddr = f->saddr; e->daddr = f->daddr;
@@ -2609,9 +2609,9 @@ struct fs_event {
 };
 
 GADGET_TRACER_MAP(fs_events, 1024 * 256);
-GADGET_TRACER(mep_fs, fs_events, fs_event);
+GADGET_TRACER(ebpf_proxy_fs, fs_events, fs_event);
 
-struct fs_pending { enum fs_op op; __u64 count; char name[128]; struct mep_sockid sid; };
+struct fs_pending { enum fs_op op; __u64 count; char name[128]; struct ebpf_proxy_sockid sid; };
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
@@ -2698,7 +2698,7 @@ static __always_inline int fs_rw_enter_named(enum fs_op op, __u64 count,
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct fs_pending p = { .op = op, .count = count };
 	// [per_conn_identity fs] stash socket identity if this fd is a socket.
-	mep_decode_sk(sk, &p.sid);
+	ebpf_proxy_decode_sk(sk, &p.sid);
 	// capture the dentry leaf name (e.g. "app.conf") so fs_trace rows
 	// answer WHICH file, not just how much I/O. Bounded kernel-str read; leaf
 	// only (not full path) to stay clear of the bpf_d_path hook allowlist.
@@ -2720,9 +2720,9 @@ static __always_inline int fs_rw_exit(void *ctx, long ret)
 	struct fs_pending *p = bpf_map_lookup_elem(&fs_pending_map, &tid);
 	if (!p) return 0;
 	enum fs_op op = p->op; __u64 count = p->count;
-	struct mep_sockid sid = p->sid;
+	struct ebpf_proxy_sockid sid = p->sid;
 	bpf_map_delete_elem(&fs_pending_map, &tid);
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	if (!fs_emit_wanted(op, (__s64)ret))
 		return 0;
@@ -2742,19 +2742,19 @@ static __always_inline int fs_rw_exit(void *ctx, long ret)
 
 // ssize_t vfs_read(struct file *, char __user *, size_t count, loff_t *pos)
 SEC("kprobe/vfs_read")
-int BPF_KPROBE(mep_fs_read, struct file *f, void *buf, size_t count) { return fs_rw_enter_named(fs_read, count, BPF_CORE_READ(f, f_path.dentry), mep_sock_from_file(f)); }
+int BPF_KPROBE(ebpf_proxy_fs_read, struct file *f, void *buf, size_t count) { return fs_rw_enter_named(fs_read, count, BPF_CORE_READ(f, f_path.dentry), ebpf_proxy_sock_from_file(f)); }
 SEC("kretprobe/vfs_read")
-int BPF_KRETPROBE(mep_fs_read_ret, long ret) { return fs_rw_exit(ctx, ret); }
+int BPF_KRETPROBE(ebpf_proxy_fs_read_ret, long ret) { return fs_rw_exit(ctx, ret); }
 
 SEC("kprobe/vfs_write")
-int BPF_KPROBE(mep_fs_write, struct file *f, void *buf, size_t count) { return fs_rw_enter_named(fs_write, count, BPF_CORE_READ(f, f_path.dentry), mep_sock_from_file(f)); }
+int BPF_KPROBE(ebpf_proxy_fs_write, struct file *f, void *buf, size_t count) { return fs_rw_enter_named(fs_write, count, BPF_CORE_READ(f, f_path.dentry), ebpf_proxy_sock_from_file(f)); }
 SEC("kretprobe/vfs_write")
-int BPF_KRETPROBE(mep_fs_write_ret, long ret) { return fs_rw_exit(ctx, ret); }
+int BPF_KRETPROBE(ebpf_proxy_fs_write_ret, long ret) { return fs_rw_exit(ctx, ret); }
 
 SEC("kprobe/vfs_open")
-int BPF_KPROBE(mep_fs_open, struct path *path) { return fs_rw_enter_named(fs_open, 0, BPF_CORE_READ(path, dentry), (struct sock *)0); }
+int BPF_KPROBE(ebpf_proxy_fs_open, struct path *path) { return fs_rw_enter_named(fs_open, 0, BPF_CORE_READ(path, dentry), (struct sock *)0); }
 SEC("kretprobe/vfs_open")
-int BPF_KRETPROBE(mep_fs_open_ret, long ret) { return fs_rw_exit(ctx, ret); }
+int BPF_KRETPROBE(ebpf_proxy_fs_open_ret, long ret) { return fs_rw_exit(ctx, ret); }
 
 // int filp_close(struct file *filp, fl_owner_t id) — the VFS close that backs
 // close(2) (and close-on-exec + exit-time fd teardown). It is the RELEASE side
@@ -2763,9 +2763,9 @@ int BPF_KRETPROBE(mep_fs_open_ret, long ret) { return fs_rw_exit(ctx, ret); }
 // with no matching close). Single-shot emit — close has no diagnostic return
 // worth pairing for the balance, so no enter/ret stash is needed.
 SEC("kprobe/filp_close")
-int BPF_KPROBE(mep_fs_close, struct file *f)
+int BPF_KPROBE(ebpf_proxy_fs_close, struct file *f)
 {
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	if (!fs_emit_wanted(fs_close, 0))
 		return 0;
@@ -2783,7 +2783,7 @@ int BPF_KPROBE(mep_fs_close, struct file *f)
 	}
 	// [per_conn_identity fs] a close on a socket fd names the 4-tuple+state at
 	// teardown (e.g. close of a socket still in ESTABLISHED = abortive close).
-	{ struct mep_sockid _id; mep_decode_sk(mep_sock_from_file(f), &_id);
+	{ struct ebpf_proxy_sockid _id; ebpf_proxy_decode_sk(ebpf_proxy_sock_from_file(f), &_id);
 	  e->saddr = _id.saddr; e->daddr = _id.daddr; e->sport = _id.sport;
 	  e->dport = _id.dport; e->sk_state = _id.sk_state; e->sk_family = _id.sk_family; }
 	gadget_submit_buf(ctx, &fs_events, e, sizeof(*e));
@@ -2805,7 +2805,7 @@ struct {
 } fs_filp_pending SEC(".maps");
 
 SEC("kprobe/do_filp_open")
-int BPF_KPROBE(mep_fs_filp_open, int dfd, struct filename *pathname)
+int BPF_KPROBE(ebpf_proxy_fs_filp_open, int dfd, struct filename *pathname)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct fs_filp_pend p = {};
@@ -2814,14 +2814,14 @@ int BPF_KPROBE(mep_fs_filp_open, int dfd, struct filename *pathname)
 	return 0;
 }
 SEC("kretprobe/do_filp_open")
-int BPF_KRETPROBE(mep_fs_filp_open_ret, long ret)
+int BPF_KRETPROBE(ebpf_proxy_fs_filp_open_ret, long ret)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct fs_filp_pend *p = bpf_map_lookup_elem(&fs_filp_pending, &tid);
 	if (!p) return 0;
 	__u64 name_ptr = p->name_ptr;
 	bpf_map_delete_elem(&fs_filp_pending, &tid);
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	// emit ONLY failing opens: ERR_PTR range [-4095, -1]
 	if (ret >= 0 || ret < -4095)
@@ -2859,7 +2859,7 @@ struct mm_event {
 };
 
 GADGET_TRACER_MAP(mm_events, 1024 * 256);
-GADGET_TRACER(mep_mm, mm_events, mm_event);
+GADGET_TRACER(ebpf_proxy_mm, mm_events, mm_event);
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -2869,9 +2869,9 @@ struct {
 } mm_reclaim_enter SEC(".maps");
 
 SEC("kprobe/handle_mm_fault")
-int BPF_KPROBE(mep_mm_fault)
+int BPF_KPROBE(ebpf_proxy_mm_fault)
 {
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct mm_event *e = gadget_reserve_buf(&mm_events, sizeof(*e));
 	if (!e) return 0;
@@ -2883,7 +2883,7 @@ int BPF_KPROBE(mep_mm_fault)
 }
 
 SEC("kprobe/try_to_free_pages")
-int BPF_KPROBE(mep_mm_reclaim)
+int BPF_KPROBE(ebpf_proxy_mm_reclaim)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	__u64 ts = bpf_ktime_get_boot_ns();
@@ -2891,14 +2891,14 @@ int BPF_KPROBE(mep_mm_reclaim)
 	return 0;
 }
 SEC("kretprobe/try_to_free_pages")
-int BPF_KRETPROBE(mep_mm_reclaim_ret, long ret)
+int BPF_KRETPROBE(ebpf_proxy_mm_reclaim_ret, long ret)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	__u64 *tsp = bpf_map_lookup_elem(&mm_reclaim_enter, &tid);
 	if (!tsp) return 0;
 	__u64 dur = bpf_ktime_get_boot_ns() - *tsp;
 	bpf_map_delete_elem(&mm_reclaim_enter, &tid);
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct mm_event *e = gadget_reserve_buf(&mm_events, sizeof(*e));
 	if (!e) return 0;
@@ -2917,7 +2917,7 @@ int BPF_KRETPROBE(mep_mm_reclaim_ret, long ret)
 // global try_to_free_pages() misses on a big-RAM host. Same mm_reclaim event/field
 // shape so the consumer sees one coherent "direct reclaim" signal regardless of path.
 SEC("kprobe/try_to_free_mem_cgroup_pages")
-int BPF_KPROBE(mep_mm_memcg_reclaim)
+int BPF_KPROBE(ebpf_proxy_mm_memcg_reclaim)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	__u64 ts = bpf_ktime_get_boot_ns();
@@ -2925,14 +2925,14 @@ int BPF_KPROBE(mep_mm_memcg_reclaim)
 	return 0;
 }
 SEC("kretprobe/try_to_free_mem_cgroup_pages")
-int BPF_KRETPROBE(mep_mm_memcg_reclaim_ret, long ret)
+int BPF_KRETPROBE(ebpf_proxy_mm_memcg_reclaim_ret, long ret)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	__u64 *tsp = bpf_map_lookup_elem(&mm_reclaim_enter, &tid);
 	if (!tsp) return 0;
 	__u64 dur = bpf_ktime_get_boot_ns() - *tsp;
 	bpf_map_delete_elem(&mm_reclaim_enter, &tid);
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct mm_event *e = gadget_reserve_buf(&mm_events, sizeof(*e));
 	if (!e) return 0;
@@ -2956,7 +2956,7 @@ struct irq_event {
 };
 
 GADGET_TRACER_MAP(irq_events, 1024 * 256);
-GADGET_TRACER(mep_irq, irq_events, irq_event);
+GADGET_TRACER(ebpf_proxy_irq, irq_events, irq_event);
 
 // per-cpu scratch: softirq runs with preemption disabled so entry/exit are on
 // the same CPU and cannot nest for the same vec; key by cpu.
@@ -2968,7 +2968,7 @@ struct {
 } irq_enter_ts SEC(".maps");
 
 SEC("tracepoint/irq/softirq_entry")
-int mep_irq_entry(struct trace_event_raw_softirq *ctx)
+int ebpf_proxy_irq_entry(struct trace_event_raw_softirq *ctx)
 {
 	__u32 z = 0;
 	__u64 ts = bpf_ktime_get_boot_ns();
@@ -2976,7 +2976,7 @@ int mep_irq_entry(struct trace_event_raw_softirq *ctx)
 	return 0;
 }
 SEC("tracepoint/irq/softirq_exit")
-int mep_irq_exit(struct trace_event_raw_softirq *ctx)
+int ebpf_proxy_irq_exit(struct trace_event_raw_softirq *ctx)
 {
 	__u32 z = 0;
 	__u64 *tsp = bpf_map_lookup_elem(&irq_enter_ts, &z);
@@ -2998,9 +2998,9 @@ int mep_irq_exit(struct trace_event_raw_softirq *ctx)
 // read()/write() syscall: an MCP client seeing high throughput but few rw syscalls
 // finds the work here. count = number of ops submitted in this call.
 SEC("ksyscall/io_uring_enter")
-int BPF_KSYSCALL(mep_fs_io_uring_enter, unsigned int fd, unsigned int to_submit, unsigned int min_complete, unsigned int flags)
+int BPF_KSYSCALL(ebpf_proxy_fs_io_uring_enter, unsigned int fd, unsigned int to_submit, unsigned int min_complete, unsigned int flags)
 {
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct fs_event *e = gadget_reserve_buf(&fs_events, sizeof(*e));
 	if (!e)
@@ -3016,9 +3016,9 @@ int BPF_KSYSCALL(mep_fs_io_uring_enter, unsigned int fd, unsigned int to_submit,
 }
 
 SEC("ksyscall/io_submit")
-int BPF_KSYSCALL(mep_fs_io_submit, long aio_ctx, long nr, void *iocbpp)
+int BPF_KSYSCALL(ebpf_proxy_fs_io_submit, long aio_ctx, long nr, void *iocbpp)
 {
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct fs_event *e = gadget_reserve_buf(&fs_events, sizeof(*e));
 	if (!e)
@@ -3052,7 +3052,7 @@ struct blk_event {
 };
 
 GADGET_TRACER_MAP(blk_events, 1024 * 256);
-GADGET_TRACER(mep_blk, blk_events, blk_event);
+GADGET_TRACER(ebpf_proxy_blk, blk_events, blk_event);
 
 struct blk_start { __u64 ts; struct gadget_process proc; __u64 depth; };
 struct {
@@ -3079,7 +3079,7 @@ struct {
 // on 6.17 and absent from kallsyms, so we use the BTF tracepoints — the same
 // attach points the in-tree top_blockio gadget uses.)
 SEC("tp_btf/block_io_start")
-int BPF_PROG(mep_blk_start, struct request *rq)
+int BPF_PROG(ebpf_proxy_blk_start, struct request *rq)
 {
 	struct blk_start s = {};
 	s.ts = bpf_ktime_get_boot_ns();
@@ -3096,7 +3096,7 @@ int BPF_PROG(mep_blk_start, struct request *rq)
 }
 
 SEC("tp_btf/block_io_done")
-int BPF_PROG(mep_blk_done, struct request *rq)
+int BPF_PROG(ebpf_proxy_blk_done, struct request *rq)
 {
 	__u64 key = (__u64)rq;
 	struct blk_start *s = bpf_map_lookup_elem(&blk_inflight, &key);
@@ -3149,7 +3149,7 @@ struct runq_event {
 };
 
 GADGET_TRACER_MAP(runq_events, 1024 * 256);
-GADGET_TRACER(mep_runq, runq_events, runq_event);
+GADGET_TRACER(ebpf_proxy_runq, runq_events, runq_event);
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -3160,7 +3160,7 @@ struct {
 
 // void ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,...)
 SEC("kprobe/ttwu_do_activate")
-int BPF_KPROBE(mep_runq_enqueue, void *rq, struct task_struct *p)
+int BPF_KPROBE(ebpf_proxy_runq_enqueue, void *rq, struct task_struct *p)
 {
 	__u32 pid = BPF_CORE_READ(p, pid);
 	if (pid == 0) return 0;
@@ -3170,7 +3170,7 @@ int BPF_KPROBE(mep_runq_enqueue, void *rq, struct task_struct *p)
 }
 
 SEC("tracepoint/sched/sched_switch")
-int mep_runq_switch(struct trace_event_raw_sched_switch *ctx)
+int ebpf_proxy_runq_switch(struct trace_event_raw_sched_switch *ctx)
 {
 	__u32 next_pid = ctx->next_pid;
 	if (next_pid == 0) return 0;
@@ -3264,7 +3264,7 @@ struct memsnap_event {
 };
 
 GADGET_TRACER_MAP(memsnap_events, 1024 * 64);
-GADGET_TRACER(mep_memsnap, memsnap_events, memsnap_event);
+GADGET_TRACER(ebpf_proxy_memsnap, memsnap_events, memsnap_event);
 
 // per-tid stash of the NVML output-buffer pointers captured on uprobe entry
 struct memsnap_ctx {
@@ -3296,7 +3296,7 @@ struct {
 // int nvmlDeviceGetComputeRunningProcesses_v3(dev, unsigned int *count,
 // nvmlProcessInfo_v3_t *infos)
 SEC("uprobe/libnvidia-ml:nvmlDeviceGetComputeRunningProcesses_v3")
-int BPF_UPROBE(mep_memsnap_procs_enter, void *dev, void *count, void *infos)
+int BPF_UPROBE(ebpf_proxy_memsnap_procs_enter, void *dev, void *count, void *infos)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct memsnap_ctx c = {};
@@ -3308,7 +3308,7 @@ int BPF_UPROBE(mep_memsnap_procs_enter, void *dev, void *count, void *infos)
 
 // ---- on return: walk the filled array, emit one row per holding PID --------
 SEC("uretprobe/libnvidia-ml:nvmlDeviceGetComputeRunningProcesses_v3")
-int BPF_URETPROBE(mep_memsnap_procs_ret, long ret)
+int BPF_URETPROBE(ebpf_proxy_memsnap_procs_ret, long ret)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct memsnap_ctx *c = bpf_map_lookup_elem(&memsnap_pending, &tid);
@@ -3332,7 +3332,7 @@ int BPF_URETPROBE(mep_memsnap_procs_ret, long ret)
 	if (n > MEMSNAP_MAX_PROCS)
 		n = MEMSNAP_MAX_PROCS;
 
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 
 	#pragma unroll
@@ -3386,7 +3386,7 @@ int BPF_URETPROBE(mep_memsnap_procs_ret, long ret)
 
 // ---- device-wide gauge: nvmlDeviceGetMemoryInfo_v2(dev, nvmlMemory_v2_t*) ---
 SEC("uprobe/libnvidia-ml:nvmlDeviceGetMemoryInfo_v2")
-int BPF_UPROBE(mep_memsnap_dev_enter, void *dev, void *mem)
+int BPF_UPROBE(ebpf_proxy_memsnap_dev_enter, void *dev, void *mem)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	__u64 memp = (__u64)mem;
@@ -3395,7 +3395,7 @@ int BPF_UPROBE(mep_memsnap_dev_enter, void *dev, void *mem)
 }
 
 SEC("uretprobe/libnvidia-ml:nvmlDeviceGetMemoryInfo_v2")
-int BPF_URETPROBE(mep_memsnap_dev_ret, long ret)
+int BPF_URETPROBE(ebpf_proxy_memsnap_dev_ret, long ret)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	__u64 *memp = bpf_map_lookup_elem(&memsnap_mem_pending, &tid);
@@ -3406,7 +3406,7 @@ int BPF_URETPROBE(mep_memsnap_dev_ret, long ret)
 
 	if (ret != 0 || !mem)
 		return 0;
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 
 	// nvmlMemory_v2_t: version@0, total@8, reserved@16, free@24, used@32
@@ -3486,7 +3486,7 @@ struct smutil_event {
 };
 
 GADGET_TRACER_MAP(smutil_events, 1024 * 64);
-GADGET_TRACER(mep_smutil, smutil_events, smutil_event);
+GADGET_TRACER(ebpf_proxy_smutil, smutil_events, smutil_event);
 
 // per-tid stash of the NVML output-buffer pointers captured on uprobe entry
 struct smutil_ctx {
@@ -3510,7 +3510,7 @@ struct {
 // ---- capture output pointers on entry --------------------------------------
 // nvmlDeviceGetProcessUtilization(dev, utilization*, count*, lastSeenTs)
 SEC("uprobe/libnvidia-ml:nvmlDeviceGetProcessUtilization")
-int BPF_UPROBE(mep_smutil_enter, void *dev, void *utilization, void *count)
+int BPF_UPROBE(ebpf_proxy_smutil_enter, void *dev, void *utilization, void *count)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct smutil_ctx c = {};
@@ -3522,7 +3522,7 @@ int BPF_UPROBE(mep_smutil_enter, void *dev, void *utilization, void *count)
 
 // ---- on return: walk the filled array, emit one row per PID ----------------
 SEC("uretprobe/libnvidia-ml:nvmlDeviceGetProcessUtilization")
-int BPF_URETPROBE(mep_smutil_ret, long ret)
+int BPF_URETPROBE(ebpf_proxy_smutil_ret, long ret)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct smutil_ctx *c = bpf_map_lookup_elem(&smutil_pending, &tid);
@@ -3546,7 +3546,7 @@ int BPF_URETPROBE(mep_smutil_ret, long ret)
 	if (n > SMUTIL_MAX_PROCS)
 		n = SMUTIL_MAX_PROCS;
 
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 
 	#pragma unroll
@@ -3592,7 +3592,7 @@ int BPF_URETPROBE(mep_smutil_ret, long ret)
 // "app woke on nothing" vs "kernel never armed the timer" discriminator).
 // Targets event-loop stalls: SSE/keepalive misses and timer-arm races.
 // ===========================================================================
-enum mep_timer_kind {
+enum ebpf_proxy_timer_kind {
 	timer_timerfd_set   = 1,	// app armed/disarmed a timerfd (sys_enter_timerfd_settime)
 	timer_epoll_ctl_add = 2,	// EPOLL_CTL_ADD — registered fd interest
 	timer_epoll_ctl_mod = 3,	// EPOLL_CTL_MOD
@@ -3606,7 +3606,7 @@ enum mep_timer_kind {
 struct timer_event {
 	gadget_timestamp timestamp_raw;
 	struct gadget_process proc;
-	enum mep_timer_kind kind_raw;
+	enum ebpf_proxy_timer_kind kind_raw;
 	__s32 fd;			// epoll/timer fd (epfd for wait/ctl, tfd for timerfd); -1 hrtimer
 	__s32 nready;			// epoll_wait return: #ready fds; 0 == TIMEOUT; -1 on enter row
 	__u32 ev_mask;			// epoll interest mask (EPOLLRDHUP=0x2000 => peer-close aware)
@@ -3615,13 +3615,13 @@ struct timer_event {
 	__u64 timer_ptr;		// hrtimer address (arm<->fire correlation key)
 };
 GADGET_TRACER_MAP(timer_events, 128 * 1024);
-GADGET_TRACER(mep_timer, timer_events, timer_event);
+GADGET_TRACER(ebpf_proxy_timer, timer_events, timer_event);
 
 // hrtimers armed by a wanted process, keyed by hrtimer address, so the
 // softirq-context expire tracepoint (running in the WRONG task context) can
 // still attribute the fire to the arming process AND bound emission to only
 // the target's timers instead of the whole system.
-struct mep_timer_owner {
+struct ebpf_proxy_timer_owner {
 	__u32 tgid;
 	__u64 arm_ts;
 	char  comm[16];
@@ -3630,13 +3630,13 @@ struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 8192);
 	__type(key, __u64);			// hrtimer ptr
-	__type(value, struct mep_timer_owner);
-} mep_timer_armed SEC(".maps");
+	__type(value, struct ebpf_proxy_timer_owner);
+} ebpf_proxy_timer_armed SEC(".maps");
 
 SEC("tracepoint/syscalls/sys_enter_timerfd_settime")
-int mep_timer_timerfd(struct trace_event_raw_sys_enter *ctx)
+int ebpf_proxy_timer_timerfd(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct timer_event *e = gadget_reserve_buf(&timer_events, sizeof(*e));
 	if (!e)
@@ -3664,9 +3664,9 @@ int mep_timer_timerfd(struct trace_event_raw_sys_enter *ctx)
 }
 
 SEC("tracepoint/syscalls/sys_enter_epoll_ctl")
-int mep_timer_epoll_ctl(struct trace_event_raw_sys_enter *ctx)
+int ebpf_proxy_timer_epoll_ctl(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	int op = (int)ctx->args[1];		// EPOLL_CTL_ADD=1 DEL=2 MOD=3
 	struct timer_event *e = gadget_reserve_buf(&timer_events, sizeof(*e));
@@ -3691,9 +3691,9 @@ int mep_timer_epoll_ctl(struct trace_event_raw_sys_enter *ctx)
 	return 0;
 }
 
-static __always_inline int mep_timer_wait_enter(struct trace_event_raw_sys_enter *ctx)
+static __always_inline int ebpf_proxy_timer_wait_enter(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct timer_event *e = gadget_reserve_buf(&timer_events, sizeof(*e));
 	if (!e)
@@ -3711,15 +3711,15 @@ static __always_inline int mep_timer_wait_enter(struct trace_event_raw_sys_enter
 	return 0;
 }
 SEC("tracepoint/syscalls/sys_enter_epoll_pwait")
-int mep_timer_epoll_pwait_enter(struct trace_event_raw_sys_enter *ctx)
-{ return mep_timer_wait_enter(ctx); }
+int ebpf_proxy_timer_epoll_pwait_enter(struct trace_event_raw_sys_enter *ctx)
+{ return ebpf_proxy_timer_wait_enter(ctx); }
 SEC("tracepoint/syscalls/sys_enter_epoll_wait")
-int mep_timer_epoll_wait_enter(struct trace_event_raw_sys_enter *ctx)
-{ return mep_timer_wait_enter(ctx); }
+int ebpf_proxy_timer_epoll_wait_enter(struct trace_event_raw_sys_enter *ctx)
+{ return ebpf_proxy_timer_wait_enter(ctx); }
 
-static __always_inline int mep_timer_wait_exit(struct trace_event_raw_sys_exit *ctx)
+static __always_inline int ebpf_proxy_timer_wait_exit(struct trace_event_raw_sys_exit *ctx)
 {
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	struct timer_event *e = gadget_reserve_buf(&timer_events, sizeof(*e));
 	if (!e)
@@ -3737,25 +3737,25 @@ static __always_inline int mep_timer_wait_exit(struct trace_event_raw_sys_exit *
 	return 0;
 }
 SEC("tracepoint/syscalls/sys_exit_epoll_pwait")
-int mep_timer_epoll_pwait_exit(struct trace_event_raw_sys_exit *ctx)
-{ return mep_timer_wait_exit(ctx); }
+int ebpf_proxy_timer_epoll_pwait_exit(struct trace_event_raw_sys_exit *ctx)
+{ return ebpf_proxy_timer_wait_exit(ctx); }
 SEC("tracepoint/syscalls/sys_exit_epoll_wait")
-int mep_timer_epoll_wait_exit(struct trace_event_raw_sys_exit *ctx)
-{ return mep_timer_wait_exit(ctx); }
+int ebpf_proxy_timer_epoll_wait_exit(struct trace_event_raw_sys_exit *ctx)
+{ return ebpf_proxy_timer_wait_exit(ctx); }
 
 SEC("tracepoint/timer/hrtimer_start")
-int mep_timer_hrtimer_start(struct trace_event_raw_hrtimer_start *ctx)
+int ebpf_proxy_timer_hrtimer_start(struct trace_event_raw_hrtimer_start *ctx)
 {
 	// hrtimer_start mostly fires in the ARMING task's context (from the
 	// timerfd_settime/nanosleep syscall) so the pid gate is meaningful here.
-	if (!mep_proc_wanted())
+	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	__u64 ptr = (__u64)ctx->hrtimer;
-	struct mep_timer_owner ow = {};
+	struct ebpf_proxy_timer_owner ow = {};
 	ow.tgid = bpf_get_current_pid_tgid() >> 32;
 	ow.arm_ts = bpf_ktime_get_boot_ns();
 	bpf_get_current_comm(&ow.comm, sizeof(ow.comm));
-	bpf_map_update_elem(&mep_timer_armed, &ptr, &ow, BPF_ANY);
+	bpf_map_update_elem(&ebpf_proxy_timer_armed, &ptr, &ow, BPF_ANY);
 	struct timer_event *e = gadget_reserve_buf(&timer_events, sizeof(*e));
 	if (!e)
 		return 0;
@@ -3773,13 +3773,13 @@ int mep_timer_hrtimer_start(struct trace_event_raw_hrtimer_start *ctx)
 }
 
 SEC("tracepoint/timer/hrtimer_expire_entry")
-int mep_timer_hrtimer_expire(struct trace_event_raw_hrtimer_expire_entry *ctx)
+int ebpf_proxy_timer_hrtimer_expire(struct trace_event_raw_hrtimer_expire_entry *ctx)
 {
 	// Runs in softirq: current task is NOT the owner. Correlate by the hrtimer
 	// address recorded at arm-time to (a) attribute to the correct process and
 	// (b) bound emission to only the target's timers.
 	__u64 ptr = (__u64)ctx->hrtimer;
-	struct mep_timer_owner *ow = bpf_map_lookup_elem(&mep_timer_armed, &ptr);
+	struct ebpf_proxy_timer_owner *ow = bpf_map_lookup_elem(&ebpf_proxy_timer_armed, &ptr);
 	if (!ow)
 		return 0;
 	struct timer_event *e = gadget_reserve_buf(&timer_events, sizeof(*e));
@@ -3798,7 +3798,7 @@ int mep_timer_hrtimer_expire(struct trace_event_raw_hrtimer_expire_entry *ctx)
 	e->expires_ns = (__u64)ctx->now;	// when it actually fired
 	e->timer_ptr = ptr;
 	gadget_submit_buf(ctx, &timer_events, e, sizeof(*e));
-	bpf_map_delete_elem(&mep_timer_armed, &ptr);
+	bpf_map_delete_elem(&ebpf_proxy_timer_armed, &ptr);
 	return 0;
 }
 
@@ -3819,7 +3819,7 @@ GADGET_PARAM(absence_period_ns);
 const volatile __u64 absence_jitter_ns = 0;	// allowed slop added to the period before FAIL_SILENT
 GADGET_PARAM(absence_jitter_ns);
 
-enum mep_absence_verdict {
+enum ebpf_proxy_absence_verdict {
 	ABSENCE_INFO           = 0,	// unarmed (period==0): observational row only
 	ABSENCE_PASS           = 1,	// armed: last write within period+jitter
 	ABSENCE_FAIL_SILENT    = 2,	// armed: no write for > period+jitter (expected write never fired)
@@ -3834,7 +3834,7 @@ struct absence_entry {
 	__u16 dport;			// remote port (host order)
 	__u16 family;			// AF_INET(2) / AF_INET6(10)
 	__u16 state;			// current TCP state off the live sock
-	__u8  verdict;			// enum mep_absence_verdict
+	__u8  verdict;			// enum ebpf_proxy_absence_verdict
 	__u64 expected_period_ns;	// the armed period (0 = unarmed)
 	__u64 last_write_gap_ns;	// now - last write on this flow (staleness)
 	__u64 observed_max_gap_ns;	// largest inter-write gap ever seen (net_rollup gap_max)
@@ -3844,10 +3844,10 @@ struct absence_entry {
 	__u8  dbg_nr_hit;		// DIAG: reader key hit net_rollup_map?
 };
 
-GADGET_ITER(mep_absence, absence_entry, mep_absence);
+GADGET_ITER(ebpf_proxy_absence, absence_entry, ebpf_proxy_absence);
 
 SEC("iter/tcp")
-int mep_absence(struct bpf_iter__tcp *ctx)
+int ebpf_proxy_absence(struct bpf_iter__tcp *ctx)
 {
 	struct sock_common *skc = ctx->sk_common;
 	struct seq_file *seq = ctx->meta->seq;
