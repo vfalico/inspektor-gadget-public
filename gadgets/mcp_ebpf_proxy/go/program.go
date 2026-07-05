@@ -50,6 +50,7 @@ const (
 	progUprobe    = "mep_uprobe"
 	progUretprobe = "mep_uretprobe"
 	progSocksnap  = "mep_socksnap"
+	progAbsence   = "mep_absence"
 )
 
 // cudaPrograms are the fixed CUDA alloc/free uprobes for the cuda_memtrace
@@ -187,7 +188,7 @@ var enrichedFamilies = [][]string{
 // every program in the object; any not enabled by the chosen capability is
 // disabled with the sentinel.
 var allPrograms = append([]string{
-	progKprobe, progKretprobe, progSysEnter, progSysExit, progKsym, progDeath, progSocksnap,
+	progKprobe, progKretprobe, progSysEnter, progSysExit, progKsym, progDeath, progSocksnap, progAbsence,
 	progUprobe, progUretprobe,
 }, cudaPrograms...)
 
@@ -470,6 +471,8 @@ func gadgetPreStart() int32 {
 		return preStartTraceSyscall()
 	case "sock_snapshot":
 		return preStartSockSnapshot()
+	case "absence_assert":
+		return preStartAbsence()
 	case "cuda_memtrace":
 		return preStartCudaMemtrace()
 	case "cuda_memsnapshot":
@@ -697,6 +700,32 @@ func preStartAttachUprobe() int32 {
 // rewrite is needed (enable with ""). An optional `pid` filter is accepted for
 // symmetry with trace_syscall but is applied by IG's standard process filter
 // (gadget.yaml), not by this control plane. The datasource is `cuda_events`.
+// preStartAbsence enables the absence_assert absence_assert iter/tcp walk. Like
+// sock_snapshot it takes no attach target (SEC-default iter/tcp) and no pid
+// filter (the iterator walks the host socket table -- needs --host). Arm the
+// verdict with the absence_period_ns / absence_jitter_ns GADGET_PARAMs.
+func preStartAbsence() int32 {
+	// Co-attach the net_trace family (+ the item-12a inbound-RST hook) IN THE
+	// SAME capability as the iter/tcp walk. Note: the absence verdict reads the
+	// per-flow write history in net_rollup_map, but that map is populated ONLY
+	// by the net family submit hooks. Enabling progAbsence alone would leave
+	// the map empty, degrading EVERY row to NO_HISTORY -- a structurally
+	// useless verdict (same class of single-select-capability gap fixed for
+	// per_key_rollup rst_count under net_trace). enableExact de-dups, and net_rollup's
+	// updates are the same ones net_trace already does, so this only ensures
+	// the history exists to assert against. The iter/tcp fetch still needs
+	// --host. Honor the pid filter for the net family via preStartFixed, then
+	// additively enable the iterator program (preStartFixed uses enableExact,
+	// which REPLACES the keep-set, so the iterator must be folded into the
+	// same programs slice rather than enabled in a second call).
+	progs := append(append([]string{progAbsence}, netTracePrograms...), "mep_tcp_reset")
+	rc := preStartFixed("absence_assert", progs)
+	api.Infof("mcp_ebpf_proxy[absence_assert]: walking live TCP sockets + recording net writes for expected-write absence verdict (needs --host; set absence_period_ns to arm)")
+	recordCoverage("absence_assert", progs, len(progs), enrichedFilterPid,
+		"iter/tcp absence walk co-attached with the net family so net_rollup write-history exists to assert against. verdict=NO_HISTORY now means genuinely no writes seen on a live flow (not a missing-capability artifact). Needs --host. Empty result = no live TCP sockets in this netns.")
+	return rc
+}
+
 func preStartCudaMemtrace() int32 {
 	keep := map[string]string{}
 	for _, pr := range cudaPrograms {

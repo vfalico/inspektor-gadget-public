@@ -943,6 +943,53 @@ datasources:
       timestamp_raw:
         annotations:
           description: 'Event time as raw ktime nanoseconds; prefer the formatted timestamp column.'
+  mep_absence:
+    fields:
+      verdict:
+        annotations:
+          columns.width: "14"
+          description: 'absence_assert verdict: 0=INFO (unarmed/observational) 1=PASS (wrote within period+jitter) 2=FAIL_SILENT (armed: expected periodic write never fired) 3=FAIL_AFTER_FIN (write/IO during peer-FIN teardown) 4=NO_HISTORY (live socket, no net_rollup write row -- select net_trace too)'
+      daddr:
+        annotations:
+          columns.hex: "true"
+          description: 'Remote IPv4 (network order) of the asserted flow -- the rollup key'
+      dport:
+        annotations:
+          columns.width: "8"
+          description: 'Remote port (host order)'
+      saddr:
+        annotations:
+          columns.hex: "true"
+          columns.hidden: "true"
+          description: 'Local IPv4 (network order)'
+      sport:
+        annotations:
+          columns.hidden: "true"
+          description: 'Local port (host order)'
+      state:
+        annotations:
+          columns.width: "5"
+          description: 'Current TCP state off the live sock (1=ESTABLISHED,8=CLOSE_WAIT...) -- rules out "it just closed"/"it was not idle"'
+      last_write_gap_ns:
+        annotations:
+          value.unit: "ns"
+          description: 'now - last write on this flow (staleness). > expected_period_ns+jitter => FAIL_SILENT.'
+      expected_period_ns:
+        annotations:
+          value.unit: "ns"
+          description: 'The armed period (absence_period_ns param); 0 = unarmed/observational'
+      observed_max_gap_ns:
+        annotations:
+          value.unit: "ns"
+          description: 'Largest inter-write gap ever seen on this flow (from per_key_rollup net_rollup gap_max)'
+      write_count:
+        annotations:
+          columns.width: "8"
+          description: 'Writes/net events folded into this flow (per_key_rollup net_rollup count)'
+      closing_evts:
+        annotations:
+          columns.width: "8"
+          description: 'Writes seen while the socket was in a closing state (write-after-peer-FIN shape) -> FAIL_AFTER_FIN'
   mep_socksnap:
     fields:
       saddr:
@@ -1399,7 +1446,7 @@ params:
         path, bytes, latency, and syscall return code/errno; supports fs_op=fault|filp_open
         to isolate FAILING opens such as openat->ENOENT from read/write noise), mm_trace
         (page-fault + direct reclaim), irq_trace (softirq service time), block_io
-        (per-request block latency), runq_lat (scheduler run-queue latency), sock_state (TCP connection-lifecycle tracer via sock/inet_sock_set_state: emits old->new state + 4-tuple on EVERY transition, so SYN_SENT->CLOSE with no ESTABLISHED = refused and ESTABLISHED->CLOSE_WAIT = peer sent FIN first; PLUS affirmative inbound/outbound RST via tcp_reset (reset_dir=1 received) and tcp_v4_send_reset (reset_dir=2 sent), where sk_null=1 flags a kernel RST for a socket that no longer exists (stale/deleted endpoint); datasource mep_sockstate, no attach target). sock_snapshot (point-in-time walk of EVERY live TCP socket via the in-kernel iter/tcp iterator: current state + srtt/rto + retransmit-backoff + send/recv queue depths + in-flight bytes, i.e. ss(8)-in-eBPF; datasource mep_socksnap, no attach target) complements the event families with "what does this connection look like RIGHT NOW" -- e.g. an ESTABLISHED socket with a large & growing sndq_bytes and retransmits>0 is a peer that stopped ACKing. NOTE on the NVML per-PID capabilities (cuda_memsnapshot/cuda_smutil): per-process GPU accounting (nvmlDeviceGetComputeRunningProcesses / GetProcessUtilization) needs an active CUDA context and sufficient permission, and is frequently STRUCTURALLY EMPTY inside a containerized pod — gpu_pid=0 / used_gpu_mem=0 for proc rows is EXPECTED there and is NOT an error or an attach failure. When proc rows are empty, read the device-wide rows (dev_total/dev_used/dev_free) as the authoritative VRAM signal instead of re-querying. A one-row mep_coverage record is emitted each run listing the attached targets + matched pid filter so attached-but-idle is distinguishable from attach-failed.'
+        (per-request block latency), runq_lat (scheduler run-queue latency), sock_state (TCP connection-lifecycle tracer via sock/inet_sock_set_state: emits old->new state + 4-tuple on EVERY transition, so SYN_SENT->CLOSE with no ESTABLISHED = refused and ESTABLISHED->CLOSE_WAIT = peer sent FIN first; PLUS affirmative inbound/outbound RST via tcp_reset (reset_dir=1 received) and tcp_v4_send_reset (reset_dir=2 sent), where sk_null=1 flags a kernel RST for a socket that no longer exists (stale/deleted endpoint); datasource mep_sockstate, no attach target). sock_snapshot (point-in-time walk of EVERY live TCP socket via the in-kernel iter/tcp iterator: current state + srtt/rto + retransmit-backoff + send/recv queue depths + in-flight bytes, i.e. ss(8)-in-eBPF; datasource mep_socksnap, no attach target) complements the event families with "what does this connection look like RIGHT NOW" -- e.g. an ESTABLISHED socket with a large & growing sndq_bytes and retransmits>0 is a peer that stopped ACKing. NOTE on the NVML per-PID capabilities (cuda_memsnapshot/cuda_smutil): per-process GPU accounting (nvmlDeviceGetComputeRunningProcesses / GetProcessUtilization) needs an active CUDA context and sufficient permission, and is frequently STRUCTURALLY EMPTY inside a containerized pod — gpu_pid=0 / used_gpu_mem=0 for proc rows is EXPECTED there and is NOT an error or an attach failure. When proc rows are empty, read the device-wide rows (dev_total/dev_used/dev_free) as the authoritative VRAM signal instead of re-querying. A one-row mep_coverage record is emitted each run listing the attached targets + matched pid filter so attached-but-idle is distinguishable from attach-failed. absence_assert (proof-of-ABSENCE: walks EVERY live TCP socket via iter/tcp and cross-references the per_key_rollup net_rollup write history to return a per-flow PASS/FAIL verdict -- arm with absence_period_ns (nanoseconds, e.g. 15000000000 for 15s) and optional absence_jitter_ns: a flow silent for longer than period+jitter => FAIL_SILENT (the expected periodic write, e.g. an SSE/keepalive, never fired), a write during peer-FIN teardown => FAIL_AFTER_FIN; unarmed (period=0) emits observational INFO rows; datasource mep_absence, needs --host, pair with net_trace so writes are recorded).'
       possibleValues:
       - attach
       - attach_uprobe
@@ -1420,6 +1467,7 @@ params:
       - sock_state
       - sock_snapshot
       - epoll_timer
+      - absence_assert
     cuda_op:
       key: cuda_op
       defaultValue: ""

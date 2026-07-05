@@ -3784,4 +3784,104 @@ int mep_timer_hrtimer_expire(struct trace_event_raw_hrtimer_expire_entry *ctx)
 	return 0;
 }
 
+// ===========================================================================
+// [absence_assert] absence_assert -- negative / proof-of-ABSENCE primitive.
+// The event families are PRESENCE-oriented (they emit when something happens);
+// proving an EXPECTED event did NOT happen -- e.g. a ~15s SSE keepalive that
+// never fired on an idle-but-ESTABLISHED socket (an event-loop race) -- must be judged at
+// FETCH time against the wall clock, which no submit-hook can see. This
+// iter/tcp walk visits EVERY live TCP socket on demand and cross-references the
+// per-flow write history per_key_rollup's net_rollup_map already maintains, returning a
+// single PASS/FAIL verdict per flow. Socket-state-anchored (state off the live
+// sock) so "it just closed" / "it wasn't idle" counter-explanations are ruled
+// out in the same row. Reuses the proven iter/tcp path (sock_snapshot sock_snapshot);
+// needs --host; arm via the absence_period_ns / absence_jitter_ns params.
+const volatile __u64 absence_period_ns = 0;	// expected inter-write period (ns); 0 = unarmed/observational
+GADGET_PARAM(absence_period_ns);
+const volatile __u64 absence_jitter_ns = 0;	// allowed slop added to the period before FAIL_SILENT
+GADGET_PARAM(absence_jitter_ns);
+
+enum mep_absence_verdict {
+	ABSENCE_INFO           = 0,	// unarmed (period==0): observational row only
+	ABSENCE_PASS           = 1,	// armed: last write within period+jitter
+	ABSENCE_FAIL_SILENT    = 2,	// armed: no write for > period+jitter (expected write never fired)
+	ABSENCE_FAIL_AFTER_FIN = 3,	// write/IO seen during peer-FIN teardown (write-after-FIN)
+	ABSENCE_NO_HISTORY     = 4,	// live socket but no net_rollup write row (select net_trace too)
+};
+
+struct absence_entry {
+	__u32 saddr;			// local IPv4 (network order)
+	__u32 daddr;			// remote IPv4 (network order)
+	__u16 sport;			// local port (host order)
+	__u16 dport;			// remote port (host order)
+	__u16 family;			// AF_INET(2) / AF_INET6(10)
+	__u16 state;			// current TCP state off the live sock
+	__u8  verdict;			// enum mep_absence_verdict
+	__u64 expected_period_ns;	// the armed period (0 = unarmed)
+	__u64 last_write_gap_ns;	// now - last write on this flow (staleness)
+	__u64 observed_max_gap_ns;	// largest inter-write gap ever seen (net_rollup gap_max)
+	__u64 write_count;		// writes/net events folded into this flow (net_rollup count)
+	__u64 closing_evts;		// writes during teardown -- write-after-peer-FIN shape
+};
+
+GADGET_ITER(mep_absence, absence_entry, mep_absence);
+
+SEC("iter/tcp")
+int mep_absence(struct bpf_iter__tcp *ctx)
+{
+	struct sock_common *skc = ctx->sk_common;
+	struct seq_file *seq = ctx->meta->seq;
+	struct absence_entry e = {};
+
+	if (skc == NULL)
+		return 0;
+
+	__u16 st = BPF_CORE_READ(skc, skc_state);
+	if (st == 0)			// skip TIME_WAIT/uninit shells with no state
+		return 0;
+
+	e.saddr  = BPF_CORE_READ(skc, skc_rcv_saddr);
+	e.daddr  = BPF_CORE_READ(skc, skc_daddr);
+	e.sport  = BPF_CORE_READ(skc, skc_num);			// already host order
+	e.dport  = bpf_ntohs(BPF_CORE_READ(skc, skc_dport));	// net -> host
+	e.family = BPF_CORE_READ(skc, skc_family);
+	e.state  = st;
+	e.expected_period_ns = absence_period_ns;
+
+	if (e.family != 2)		// AF_INET only: net_rollup keys are IPv4 4-tuples
+		return 0;
+
+	struct net_rollup_key k = {};
+	k.daddr = e.daddr; k.saddr = e.saddr;
+	k.dport = e.dport; k.sport = e.sport;
+	struct net_rollup_val *v = bpf_map_lookup_elem(&net_rollup_map, &k);
+
+	if (!v || v->count == 0) {
+		e.verdict = ABSENCE_NO_HISTORY;
+		bpf_seq_write(seq, &e, sizeof(e));
+		return 0;
+	}
+
+	e.write_count         = v->count;
+	e.observed_max_gap_ns = v->gap_max_ns;
+	e.closing_evts        = v->closing_evts;
+
+	__u64 now = bpf_ktime_get_boot_ns();
+	__u64 gap = now - v->last_ts_raw;
+	e.last_write_gap_ns = gap;
+
+	if (v->closing_evts > 0)
+		e.verdict = ABSENCE_FAIL_AFTER_FIN;		// affirmative wrongness wins
+	else if (absence_period_ns == 0)
+		e.verdict = ABSENCE_INFO;			// unarmed: observational
+	else if (gap > absence_period_ns + absence_jitter_ns)
+		e.verdict = ABSENCE_FAIL_SILENT;		// expected write never fired
+	else
+		e.verdict = ABSENCE_PASS;
+
+	bpf_seq_write(seq, &e, sizeof(e));
+	return 0;
+}
+// ========================= [end absence_assert] absence_assert ======================
+
 char LICENSE[] SEC("license") = "GPL";
