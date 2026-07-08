@@ -10,6 +10,12 @@ import TabItem from '@theme/TabItem';
 
 The top_process gadget periodically reports process statistics, including CPU usage, memory usage, and other process information.
 
+## Requirements
+
+- Minimum Kernel Version : 5.4
+
+`top_process` gathers process statistics from procfs via the userspace `process` operator and does not attach any eBPF program, so it has no special kernel-feature requirement beyond the Inspektor Gadget baseline.
+
 ## Getting started
 
 Running the gadget:

@@ -19,6 +19,13 @@ It traces the following CUDA Driver API functions:
 The gadget aggregates memory allocations by user stack trace, allowing you to identify
 which code paths are responsible for CUDA memory usage.
 
+## Requirements
+
+- Minimum Kernel Version : 5.4
+- A CUDA workload dynamically linked against `libcuda.so` (the CUDA Driver API)
+
+*This is the minimal kernel version we have tried for this Gadget, however it's possible that it works with earlier versions.
+
 ## Getting started
 
 Running the gadget:
@@ -39,4 +46,78 @@ Running the gadget:
 
 ## Guide
 
-TODO
+`profile_cuda` aggregates CUDA Driver API memory allocations by userspace stack
+trace, so you can see which code paths are responsible for GPU memory usage. It
+attaches uprobes to `libcuda.so`, so the target must be a CUDA workload
+dynamically linked against the Driver API (see [Requirements](#requirements)).
+
+Run a CUDA workload inside a dedicated container so the output can be scoped to
+it. For example, a container built on the NVIDIA CUDA base image running a
+program that performs device allocations:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl run --restart=Never --image=nvidia/cuda:12.4.1-base-ubuntu22.04 \
+            ig-doc-cuda -- /path/to/your/cuda-workload
+        pod/ig-doc-cuda created
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ docker run --name ig-doc-cuda -d --rm --gpus all \
+            nvidia/cuda:12.4.1-base-ubuntu22.04 /path/to/your/cuda-workload
+        ```
+    </TabItem>
+</Tabs>
+
+Then, run the gadget, scoped to that container:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl gadget run ghcr.io/inspektor-gadget/gadget/profile_cuda:%IG_TAG%
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ sudo ig run ghcr.io/inspektor-gadget/gadget/profile_cuda:%IG_TAG% -c ig-doc-cuda
+        ```
+    </TabItem>
+</Tabs>
+
+The gadget periodically prints the CUDA allocations aggregated per stack. You
+will see output similar to:
+
+```bash
+RUNTIME.CONTAINERNAME   STACK_ID_KEY   COUNT      COMM      PID      TID
+ig-doc-cuda             12             1048576    myapp     712004   712004
+ig-doc-cuda             27             262144     myapp     712004   712004
+```
+
+The gadget-specific columns are:
+
+- `STACK_ID_KEY`: an identifier for the userspace stack trace of the allocation
+  call site (the stack that led to the `cuMemAlloc*` call).
+- `COUNT`: the total number of bytes allocated attributed to that stack.
+
+The traced Driver API functions are `cuMemAlloc_v2`, `cuMemAllocHost_v2`,
+`cuMemAllocManaged` and `cuMemAllocPitch_v2`.
+
+Finally, clean up the workload:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl delete pod ig-doc-cuda
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ docker rm -f ig-doc-cuda
+        ```
+    </TabItem>
+</Tabs>

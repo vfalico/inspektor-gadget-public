@@ -10,6 +10,12 @@ import TabItem from '@theme/TabItem';
 
 a strace for LSM tracepoints
 
+## Requirements
+
+- Minimum Kernel Version : 5.7
+
+`trace_lsm` attaches BPF LSM programs (`SEC("lsm/<hook>")`), which require Linux 5.7 or later built with `CONFIG_BPF_LSM=y` and the BPF LSM enabled in the kernel's active LSM list (e.g. boot with `lsm=...,bpf`). Individual hooks are only traceable if they exist on the running kernel.
+
 ## Getting started
 
 Running the gadget:
@@ -920,4 +926,78 @@ Default value: "false"
 
 ## Guide
 
-TODO
+`trace_lsm` reports the decisions made at Linux Security Module (LSM) hooks by
+attaching BPF LSM programs. It lets you see which security-relevant operations
+(program execution, capability checks, binder transactions, …) each process
+triggers.
+
+Because it uses BPF LSM, the kernel must have `CONFIG_BPF_LSM=y` and the BPF LSM
+enabled in the active LSM list (see [Requirements](#requirements)).
+
+Run a workload inside a dedicated container so the output can be scoped to it:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl run --restart=Never --image=busybox ig-doc-lsm -- \
+            sh -c 'id; cat /etc/hostname; sleep 3'
+        pod/ig-doc-lsm created
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ docker run --name ig-doc-lsm -d --rm busybox \
+            sh -c 'while true; do id; cat /etc/hostname; sleep 1; done'
+        ```
+    </TabItem>
+</Tabs>
+
+Then, run the gadget, scoped to that container. By default all supported hooks
+are traced; use `--trace-<hook>` (e.g. `--trace-bprm_check_security`,
+`--trace-capable`) to select specific hooks:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl gadget run ghcr.io/inspektor-gadget/gadget/trace_lsm:%IG_TAG%
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ sudo ig run ghcr.io/inspektor-gadget/gadget/trace_lsm:%IG_TAG% -c ig-doc-lsm
+        ```
+    </TabItem>
+</Tabs>
+
+The gadget prints one line per LSM hook invocation. You will see output similar
+to:
+
+```bash
+RUNTIME.CONTAINERNAME   COMM   PID      TID      TRACEPOINT
+ig-doc-lsm              id     701233   701233   capable
+ig-doc-lsm              cat    701240   701240   bprm_check_security
+```
+
+The gadget-specific column is:
+
+- `TRACEPOINT`: the name of the LSM hook that fired (e.g. `bprm_check_security`,
+  `capable`, `bprm_committed_creds`, `binder_transaction`). The full set of
+  selectable hooks is listed under [Flags](#flags).
+
+Finally, clean up the workload:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl delete pod ig-doc-lsm
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ docker rm -f ig-doc-lsm
+        ```
+    </TabItem>
+</Tabs>

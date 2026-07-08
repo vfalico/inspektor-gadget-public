@@ -10,6 +10,12 @@ import TabItem from '@theme/TabItem';
 
 Captures data on read/recv or write/send functions of OpenSSL, GnuTLS, NSS and Libcrypto
 
+## Requirements
+
+- Minimum Kernel Version : 5.4
+
+*This is the minimal kernel version we have tried for this Gadget, however it's possible that it works with earlier versions.
+
 ## Getting started
 
 Running the gadget:
@@ -38,4 +44,89 @@ Default value: "true"
 
 ## Guide
 
-TODO
+`trace_ssl` traces the buffers passed to and from userspace TLS libraries
+(OpenSSL/`libssl`, GnuTLS, NSS) by attaching uprobes to their read/write
+functions, letting you observe the *unencrypted* payload of encrypted
+connections.
+
+First, run a workload that performs TLS requests, inside a dedicated container so
+the gadget output can be scoped to just that workload:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl run --restart=Never --image=curlimages/curl ig-doc-ssl -- \
+            sh -c 'while true; do curl -s https://example.com >/dev/null; sleep 1; done'
+        pod/ig-doc-ssl created
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ docker run --name ig-doc-ssl -d --rm curlimages/curl \
+            sh -c 'while true; do curl -s https://example.com >/dev/null; sleep 1; done'
+        ```
+    </TabItem>
+</Tabs>
+
+Then, run the gadget, scoped to that container:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl gadget run ghcr.io/inspektor-gadget/gadget/trace_ssl:%IG_TAG%
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ sudo ig run ghcr.io/inspektor-gadget/gadget/trace_ssl:%IG_TAG% -c ig-doc-ssl
+        ```
+    </TabItem>
+</Tabs>
+
+The gadget emits one line per SSL read/write, exposing the plaintext buffer.
+You will see output similar to:
+
+```bash
+RUNTIME.CONTAINERNAME   COMM   PID      TID      BUF                       OPERATION   ERROR
+ig-doc-ssl              curl   690112   690112   GET / HTTP/1.1\r\nHost:…   write
+ig-doc-ssl              curl   690112   690112   HTTP/1.1 200 OK\r\n…       read
+```
+
+The gadget-specific columns are:
+
+- `BUF`: the unencrypted (plaintext) buffer read from or written to the TLS
+  library.
+- `OPERATION`: the SSL operation — `read` or `write`.
+- `ERROR`: the error value returned by the library call, if any.
+
+Pass `--record-data=false` to record only metadata (operation, length, latency)
+without capturing buffer contents.
+
+:::note
+
+`trace_ssl` attaches uprobes to the TLS library **inside the target process**, so
+that process must be dynamically linked against a supported library
+(`libssl`/OpenSSL, GnuTLS or NSS). If the library file is not directly
+attachable on the running filesystem (for example, some read-only or overlay
+mounts), the uprobe attach can fail; in that case run the gadget against a
+process whose TLS library resides on a regular filesystem.
+
+:::
+
+Finally, clean up the workload:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl delete pod ig-doc-ssl
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ docker rm -f ig-doc-ssl
+        ```
+    </TabItem>
+</Tabs>

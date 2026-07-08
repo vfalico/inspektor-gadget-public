@@ -10,6 +10,12 @@ import TabItem from '@theme/TabItem';
 
 use uprobe to trace malloc and free in libc.so
 
+## Requirements
+
+- Minimum Kernel Version : 5.4
+
+*This is the minimal kernel version we have tried for this Gadget, however it's possible that it works with earlier versions.
+
 ## Getting started
 
 Running the gadget:
@@ -38,4 +44,77 @@ Default value: "false"
 
 ## Guide
 
-TODO
+First, run a workload that allocates and frees memory. Run it inside a dedicated
+container so the gadget output can be scoped to just that workload.
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl run --restart=Never --image=python:3-slim ig-doc-malloc -- python3 -c \
+            'import ctypes,time; libc=ctypes.CDLL("libc.so.6"); \
+             [libc.free(libc.malloc(300001)) for _ in range(1000)]; time.sleep(3)'
+        pod/ig-doc-malloc created
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ docker run --name ig-doc-malloc -d --rm python:3-slim python3 -c \
+            'import ctypes,time; libc=ctypes.CDLL("libc.so.6"); \
+             [libc.free(libc.malloc(300001)) for _ in range(1000)]; time.sleep(30)'
+        ```
+    </TabItem>
+</Tabs>
+
+Then, run the gadget, scoped to that container:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl gadget run ghcr.io/inspektor-gadget/gadget/trace_malloc:%IG_TAG%
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ sudo ig run ghcr.io/inspektor-gadget/gadget/trace_malloc:%IG_TAG% -c ig-doc-malloc
+        ```
+    </TabItem>
+</Tabs>
+
+The gadget shows each `malloc` and `free` performed by the workload:
+
+```bash
+RUNTIME.CONTAINERNAME   COMM      PID      TID      ADDR             SIZE     OPERATION
+ig-doc-malloc           python3   574496   574496   0x59B9441781D0   300001   malloc
+ig-doc-malloc           python3   574496   574496   0x59B9441C15C0   300001   malloc
+ig-doc-malloc           python3   574496   574496   0x59B94420A9B0   300001   malloc
+ig-doc-malloc           python3   574496   574496   0x59B944CA0B60   0        free
+ig-doc-malloc           python3   574496   574496   0x59B944C57770   0        free
+```
+
+The gadget-specific columns are:
+
+- `ADDR`: the address returned by `malloc` (or the address passed to `free`).
+- `SIZE`: the number of bytes requested; `0` for `free` operations.
+- `OPERATION`: the memory operation — one of `malloc`, `calloc`, `realloc`,
+  `free`, `aligned_alloc`, `memalign`, `posix_memalign`, `valloc`, `pvalloc`.
+
+Pass `--collect-ustack` to additionally capture the userspace stack trace of each
+allocation call site.
+
+Finally, clean up the workload:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl delete pod ig-doc-malloc
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ docker rm -f ig-doc-malloc
+        ```
+    </TabItem>
+</Tabs>

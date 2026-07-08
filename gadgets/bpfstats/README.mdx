@@ -10,6 +10,12 @@ import TabItem from '@theme/TabItem';
 
 The bpfstats Gadget provides CPU and memory usage for Gadgets and eBPF programs.
 
+## Requirements
+
+- Minimum Kernel Version : 5.8
+
+`bpfstats` reports the CPU time and memory used by each eBPF program. This relies on BPF runtime statistics, enabled through `BPF_ENABLE_STATS`, which was introduced in Linux 5.8.
+
 ## Getting started
 
 Running the gadget:
