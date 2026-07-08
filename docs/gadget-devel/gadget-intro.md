@@ -102,4 +102,31 @@ is an example of a gadget using this data source.
 
 ### Snapshotters
 
-TODO
+Snapshotters are data sources that report the state of the system at the moment
+the gadget is run, rather than a stream of events: the list of currently running
+processes, the currently open sockets, etc. When the gadget runs, the
+snapshotter's programs are invoked and the union of the entries they return is
+reported as a single snapshot.
+
+Snapshotters are defined with the `GADGET_SNAPSHOTTER()` macro:
+
+```c
+GADGET_SNAPSHOTTER(name, type, program);
+```
+
+- name: Name of the data source
+- type: Name of the structure describing each element of the snapshot
+- the remaining arguments are the eBPF programs (1 to 3) that generate the
+  snapshot; the output is the union of the entries they return
+
+:::note
+
+`GADGET_SNAPSHOTTER()` is deprecated in favour of `GADGET_ITER()`, which is used
+the same way. New gadgets should use `GADGET_ITER()`.
+
+:::
+
+[snapshot_process](https://github.com/inspektor-gadget/inspektor-gadget/tree/%IG_BRANCH%/gadgets/snapshot_process)
+and
+[snapshot_socket](https://github.com/inspektor-gadget/inspektor-gadget/tree/%IG_BRANCH%/gadgets/snapshot_socket)
+are examples of Gadgets that provide this kind of data source.

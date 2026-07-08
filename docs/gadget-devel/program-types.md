@@ -72,7 +72,13 @@ All parameters are mandatory for now.
 
 ### Raw Tracepoints
 
-TODO!
+The section name must use the `raw_tracepoint/<tracepoint_name>` format, for
+example `raw_tracepoint/sys_enter`. `<tracepoint_name>` is one of the available
+tracepoints on the system. Unlike regular tracepoints, raw tracepoints receive
+the raw arguments passed at the tracepoint call site rather than a stable,
+pre-formatted argument structure; this has lower overhead but exposes a less
+stable interface, so the program has to know the layout of the arguments for the
+kernel it runs on.
 
 ### SchedCLS
 

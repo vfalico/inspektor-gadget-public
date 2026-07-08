@@ -8,8 +8,7 @@ source in all the output modes supported by the [CLI
 operator](../spec/operators/cli.md#output). Unless you have specific
 requirements, we recommend using the CLI operator's default configuration.
 However, for [Map Iterators](./gadget-intro.md#map-iterators) with a map value
-type of `gadget_histogram_slot__u32` or `gadget_histogram_slot__u64` (TODO: Add
-links), the output should be displayed as a chart, which the CLI operator
+type of `gadget_histogram_slot__u32` or `gadget_histogram_slot__u64` (see [Using well-known types in the eBPF code](./metrics.md#using-well-known-types-in-the-ebpf-code)), the output should be displayed as a chart, which the CLI operator
 doesn't support. In such cases, you can use the [Otel
 Metrics](../spec/operators/otel-metrics.md) operator to render the output as a
 histogram by annotating the data source with [metrics.print:

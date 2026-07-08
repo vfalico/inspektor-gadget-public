@@ -36,4 +36,13 @@ Since the path is hardcoded usernames provided through `ldap`, `nss-systemd`, sy
 
 ### Image based gadgets
 
-TODO
+For image-based gadgets no interface has to be implemented: resolution happens
+automatically. The operator inspects every data source and enriches any field
+that carries the well-known UID/GID types. Declare the relevant eBPF fields with
+the enriched types `gadget_uid` and `gadget_gid` (see
+[Enriched types](../../gadget-devel/gadget-ebpf-api.md#enriched-types)); the
+resolver then adds a companion string field holding the resolved name. By
+default these added fields are named `user` and `group`. The name of the added
+field can be overridden through the field's annotations understood by the
+operator (`uidgidresolver.uid` / `uidgidresolver.gid`, with `uidgidresolver.target`
+naming the target field).

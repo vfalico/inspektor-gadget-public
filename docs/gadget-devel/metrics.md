@@ -166,4 +166,11 @@ datasources:
       metrics.collect: true
 ```
 
-> TODO: more details on histograms
+Histograms are handed to the Otel Metrics operator using the well-known slot
+types `gadget_histogram_slot__u32` and `gadget_histogram_slot__u64` (see
+[Using well-known types in the eBPF code](#using-well-known-types-in-the-ebpf-code)).
+A field of one of these types carries a full set of histogram buckets at once;
+the operator reads the per-slot counts and adds their values up into the
+exported histogram. This is the same slot representation produced by the
+[Map Iterators](./gadget-intro.md#map-iterators) that back chart-rendered
+latency output.

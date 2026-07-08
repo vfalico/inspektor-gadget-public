@@ -76,7 +76,7 @@ output in more human-friendly formats.
 Currently, this feature only supports rendering as histograms the output of [Map
 Iterators](../../gadget-devel/gadget-intro.md#map-iterators) with the map’s
 value type of `gadget_histogram_slot__u32` or `gadget_histogram_slot__u64`
-(TODO: Add link). To achieve this, the Otel Metrics operator disables the
+(see [Using well-known types in the eBPF code](../../gadget-devel/metrics.md#using-well-known-types-in-the-ebpf-code)). To achieve this, the Otel Metrics operator disables the
 original data source and creates a new one, suffixed with `-rendered`, which
 will emit the original data source's output as a rendered histogram.
 Additionally, the Otel Metrics operator will configure the CLI operator for this

@@ -34,7 +34,7 @@ The following modes are supported:
   tabular format with a column for each field in the data source, unless the
   field is annotated with `columns.hidden: true`. In addition to hiding columns,
   you can also customize the columns format by using several annotations like
-  `columns.width`, `columns.alignment`, etc., as explained in TODO.
+  `columns.width`, `columns.alignment`, etc., as explained in the [field annotations](../../gadget-devel/metadata.md#annotations) documentation.
 - `json`: This mode displays the output in JSON format. Note that the output
   contains all the fields of the data source, even if they annotated with
   `columns.hidden: true` as this annotation applies only to the `columns` mode.

@@ -4,7 +4,14 @@ sidebar_position: 20
 description: 'Reference documentation for the format of a gadget OCI artifact'
 ---
 
-Intro TODO
+Inspektor Gadget distributes gadgets as OCI artifacts. A gadget is packaged as
+an OCI image that, instead of a container root filesystem, carries the gadget's
+eBPF program, an optional WebAssembly program, the gadget metadata and,
+optionally, BTF information for BTFGen. Because gadgets are standard OCI
+artifacts, they can be stored in and pulled from any OCI-compliant container
+registry. This document describes the format of a gadget OCI artifact: its
+artifact type, the supported architectures, and the per-architecture layers and
+their media types.
 
 ## Specifications
 
