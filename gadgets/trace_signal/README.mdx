@@ -60,4 +60,72 @@ Default value: ""
 
 ## Guide
 
-TODO
+First, run a workload that sends a signal to another process. Run it inside a
+dedicated container so the gadget output can be scoped to just that workload.
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl run --restart=Never --image=busybox ig-doc-signal -- sh -c \
+            'sleep 300 & child=$!; sleep 1; kill -9 $child; sleep 3'
+        pod/ig-doc-signal created
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ docker run --name ig-doc-signal -d --rm busybox sh -c \
+            'sleep 300 & child=$!; sleep 1; kill -9 $child; sleep 30'
+        ```
+    </TabItem>
+</Tabs>
+
+Then, run the gadget, scoped to that container:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl gadget run ghcr.io/inspektor-gadget/gadget/trace_signal:%IG_TAG%
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ sudo ig run ghcr.io/inspektor-gadget/gadget/trace_signal:%IG_TAG% -c ig-doc-signal
+        ```
+    </TabItem>
+</Tabs>
+
+The gadget reports each signal sent, including the `SIGKILL` (signal 9) our
+workload sends to its child:
+
+```bash
+RUNTIME.CONTAINERNAME   COMM   PID      TID      TPID     SIG       ERROR
+ig-doc-signal           sh     566814   566814   566867   SIGKILL
+```
+
+The gadget-specific columns are:
+
+- `TPID`: the target process the signal is delivered to.
+- `SIG`: the signal being sent (e.g. `SIGKILL`, `SIGTERM`, `SIGINT`).
+- `ERROR`: the error returned by the `kill` syscall, if any (empty on success).
+
+Useful flags: `--pid` filters by the sending PID, `--signal` traces only a
+specific signal, `--kill-only` traces only `SIGKILL`, and `--failed` shows only
+signals whose delivery failed.
+
+Finally, clean up the workload:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl delete pod ig-doc-signal
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ docker rm -f ig-doc-signal
+        ```
+    </TabItem>
+</Tabs>

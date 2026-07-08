@@ -62,7 +62,10 @@ Let's start the gadget before running our workload:
 
 <Tabs groupId="env">
   <TabItem value="kubectl-gadget" label="kubectl gadget">
-TODO
+```bash
+$ kubectl gadget run trace_fsslower:%IG_TAG% --filesystem ext4 --min 1000
+RUNTIME.CONTAINERNAME     COMM                 PID        TID DELTA_… OFFSET   SIZE FILE         OP
+```
   </TabItem>
 
   <TabItem value="ig" label="ig">
@@ -78,7 +81,14 @@ Launch a container that will perform input/output operations:
 
 <Tabs groupId="env">
   <TabItem value="kubectl-gadget" label="kubectl gadget">
-TODO
+```bash
+$ kubectl run --restart=Never -it --rm --image=debian test-trace-fsslower -- \
+    /bin/sh -c "apt-get update && apt-get install -y git"
+Get:1 http://deb.debian.org/debian bullseye InRelease [116 kB]
+Get:2 http://deb.debian.org/debian-security bullseye-security InRelease [48.4 kB]
+...
+0 added, 0 removed; done.
+```
   </TabItem>
 
   <TabItem value="ig" label="ig">
@@ -98,7 +108,13 @@ The tool will list the I/O operations that were slower than 1ms:
 
 <Tabs groupId="env">
   <TabItem value="kubectl-gadget" label="kubectl gadget">
-TODO
+```bash
+$ kubectl gadget run trace_fsslower:%IG_TAG% --filesystem ext4 --min 1000
+RUNTIME.CONTAINERNAME     COMM                 PID        TID DELTA_… OFFSET   SIZE FILE         OP
+test-trace-fsslower       dpkg-preconf…     204239     204239    1008      0 92233… #38586681    F_FSYNC
+test-trace-fsslower       dpkg              204242     204242    3245      0 92233… perl-module… F_FSYNC
+test-trace-fsslower       dpkg              204242     204242    1517      0 92233… libperl5.36… F_FSYNC
+```
   </TabItem>
 
   <TabItem value="ig" label="ig">
