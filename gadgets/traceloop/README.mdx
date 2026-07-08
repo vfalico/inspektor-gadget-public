@@ -32,6 +32,14 @@ Running the gadget:
     </TabItem>
 </Tabs>
 
+## Flags
+
+### `--syscall-filters`
+
+Filter out by syscall names. Join multiple names with ','
+
+Default value: ""
+
 ## Guide
 
 System calls are the foundation of how applications interact with the operating system. When debugging production issues, understanding the exact sequence of system calls before a crash or failure can be invaluable. The traceloop gadget continuously captures these system calls, allowing you to "rewind" and see exactly what your application was doing when something went wrong.
