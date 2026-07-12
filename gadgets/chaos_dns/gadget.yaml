@@ -1,0 +1,26 @@
+name: chaos_dns
+description: TC-eBPF DNS chaos — drop, synthesize NXDOMAIN/SERVFAIL, or mark for delay
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/chaos_dns
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/chaos_dns
+datasources:
+  events:
+    fields:
+      ts:
+        annotations:
+          description: Timestamp of the affected DNS query
+          template: timestamp
+      saddr:
+        annotations:
+          description: Client source IP
+          template: l4endpoint
+      daddr:
+        annotations:
+          description: Resolver destination IP
+          template: l4endpoint
+      mode:
+        annotations:
+          description: Chaos mode (1 drop 2 rcode 3 mark)
+      qhash:
+        annotations:
+          description: FNV-1a hash of the matched qname (0 = all)
