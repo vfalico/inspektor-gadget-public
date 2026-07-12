@@ -1,0 +1,30 @@
+name: chaos_syscall_fail
+description: Inject a chosen errno into a scoped process's syscalls via kprobe + bpf_override_return
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/chaos_syscall_fail
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/chaos_syscall_fail
+datasources:
+  events:
+    fields:
+      ts:
+        annotations:
+          description: Timestamp of the injected fault
+          template: timestamp
+      tgid:
+        annotations:
+          description: Target thread group ID (PID)
+          template: pid
+      mntns:
+        annotations:
+          description: Target mount namespace inode
+          template: ns
+      errno_val:
+        annotations:
+          description: Injected errno (negative)
+      hook:
+        annotations:
+          description: Syscall hook id (0 open 1 openat 2 openat2 3 connect 4 read)
+      comm:
+        annotations:
+          description: Target process command
+          template: comm

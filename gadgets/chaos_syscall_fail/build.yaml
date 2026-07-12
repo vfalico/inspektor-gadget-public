@@ -1,0 +1,2 @@
+ebpfsource: program.bpf.c
+cflags: "-g -O2 -Wall -D__TARGET_ARCH_x86"
