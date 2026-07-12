@@ -1,0 +1,32 @@
+# Artifact Hub package metadata file
+version: 0.53.2
+name: "ebpf proxy"
+category: monitoring-logging
+displayName: "ebpf proxy"
+createdAt: "2026-07-13T00:00:00Z"
+digest: "2026-07-13T00:00:00Z"
+description: "Read-only multi-capability kernel+GPU eBPF observation gadget (kprobe/uprobe/syscall/net/CUDA tracing) exposed to MCP clients"
+logoURL: "https://inspektor-gadget.io/media/brand-icon.svg"
+license: ""
+homeURL: "https://inspektor-gadget.io/docs/latest/gadgets/ebpf_proxy"
+containersImages:
+    - name: gadget
+      image: "ghcr.io/inspektor-gadget/gadget/ebpf_proxy:latest"
+      platforms:
+        - linux/amd64
+        - linux/arm64
+keywords:
+    - gadget
+    - ebpf
+    - proxy
+    - observability
+links:
+    - name: source
+      url: "https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/ebpf_proxy"
+install: |
+    # Run
+    ```bash
+    sudo ig run ghcr.io/inspektor-gadget/gadget/ebpf_proxy:latest
+    ```
+provider:
+    name: Inspektor Gadget
