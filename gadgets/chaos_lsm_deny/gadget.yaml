@@ -1,0 +1,30 @@
+name: chaos_lsm_deny
+description: Deny file_open and socket_connect for a scoped process/container via BPF-LSM
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/chaos_lsm_deny
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/chaos_lsm_deny
+datasources:
+  events:
+    fields:
+      ts:
+        annotations:
+          description: Timestamp of the denial
+          template: timestamp
+      tgid:
+        annotations:
+          description: Target thread group ID (PID)
+          template: pid
+      mntns:
+        annotations:
+          description: Target mount namespace inode
+          template: ns
+      errno_val:
+        annotations:
+          description: Returned errno (negative)
+      hook:
+        annotations:
+          description: LSM hook id (0 file_open 1 socket_connect)
+      comm:
+        annotations:
+          description: Target process command
+          template: comm
