@@ -16,12 +16,14 @@ package puller
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/distribution/reference"
 	"github.com/stretchr/testify/require"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
+	"oras.land/oras-go/v2/errdef"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 )
@@ -87,4 +89,72 @@ func TestPullSigningInformation(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+type fakePuller struct {
+	name  string
+	err   error
+	calls *int
+}
+
+func (p *fakePuller) PullSigningInformation(context.Context, *remote.Repository, oras.Target, string) error {
+	*p.calls++
+	return p.err
+}
+
+func (p *fakePuller) Name() string { return p.name }
+
+func TestPullSigningInformationClassification(t *testing.T) {
+	t.Parallel()
+
+	authErr := errors.New("authentication required")
+	malformedErr := errors.New("malformed signature manifest")
+	tests := []struct {
+		name       string
+		errs       []error
+		want       error
+		wantCalls  int
+		wantDetail int
+	}{
+		{name: "all formats absent", errs: []error{errdef.ErrNotFound, errdef.ErrNotFound, errdef.ErrNotFound}, want: ErrSignatureNotFound, wantCalls: 3, wantDetail: 3},
+		{name: "authentication is not absence", errs: []error{errdef.ErrNotFound, authErr, errdef.ErrNotFound}, want: authErr, wantCalls: 2},
+		{name: "malformed is not absence", errs: []error{malformedErr, errdef.ErrNotFound}, want: malformedErr, wantCalls: 1},
+		{name: "cancellation is not absence", errs: []error{context.Canceled, errdef.ErrNotFound}, want: context.Canceled, wantCalls: 1},
+		{name: "deadline is not absence", errs: []error{context.DeadlineExceeded, errdef.ErrNotFound}, want: context.DeadlineExceeded, wantCalls: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			pullers := make([]Puller, 0, len(test.errs))
+			for i, err := range test.errs {
+				pullers = append(pullers, &fakePuller{name: string(rune('a' + i)), err: err, calls: &calls})
+			}
+			p := SignaturePuller{pullers: pullers}
+			err := p.PullSigningInformation(context.Background(), nil, nil, "sha256:test")
+			require.ErrorIs(t, err, test.want)
+			require.Equal(t, test.wantCalls, calls)
+			if !errors.Is(test.want, ErrSignatureNotFound) {
+				require.NotErrorIs(t, err, ErrSignatureNotFound)
+				require.NotContains(t, err.Error(), "--verify-image=false")
+				return
+			}
+			var details interface{ Details() []error }
+			require.ErrorAs(t, err, &details)
+			require.Len(t, details.Details(), test.wantDetail)
+			require.Equal(t, "signature not found", err.Error())
+		})
+	}
+}
+
+func TestPullSigningInformationStopsAtSuccess(t *testing.T) {
+	t.Parallel()
+	calls := 0
+	p := SignaturePuller{pullers: []Puller{
+		&fakePuller{name: "absent", err: errdef.ErrNotFound, calls: &calls},
+		&fakePuller{name: "success", calls: &calls},
+		&fakePuller{name: "must not run", err: errors.New("unexpected"), calls: &calls},
+	}}
+	require.NoError(t, p.PullSigningInformation(context.Background(), nil, nil, "sha256:test"))
+	require.Equal(t, 2, calls)
 }

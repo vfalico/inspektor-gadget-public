@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/errdef"
 	"oras.land/oras-go/v2/registry"
 )
 
@@ -58,6 +59,11 @@ func CraftCosignSignatureTag(digest string) (string, error) {
 	return fmt.Sprintf("%s-%s.sig", parts[0], parts[1]), nil
 }
 
+// ErrReferrerNotFound indicates that a subject has no referrer of the
+// requested artifact type. Callers can use errors.Is to distinguish absence
+// from failures while querying the registry or OCI store.
+var ErrReferrerNotFound = errors.New("referrer not found")
+
 const (
 	BundleV03MediaType = "application/vnd.dev.sigstore.bundle.v0.3+json" // https://github.com/sigstore/cosign/blob/ee3d9fe1c55e/pkg/cosign/bundle/protobundle.go#L36
 
@@ -82,10 +88,16 @@ func FindOCI11SignatureTag(ctx context.Context, imageStore oras.ReadOnlyGraphTar
 	if err == nil {
 		return signingInfoTag, nil
 	}
+	if !errors.Is(err, ErrReferrerNotFound) && !errors.Is(err, errdef.ErrUnsupported) {
+		return "", fmt.Errorf("finding cosign referrer: %w", err)
+	}
 
 	signingInfoTag, err = FindNotationSignatureTag(ctx, imageStore, imageDigest)
 	if err == nil {
 		return signingInfoTag, nil
+	}
+	if !errors.Is(err, ErrReferrerNotFound) && !errors.Is(err, errdef.ErrUnsupported) {
+		return "", fmt.Errorf("finding notation referrer: %w", err)
 	}
 
 	return CraftSignatureIndexTag(imageDigest)
@@ -111,7 +123,7 @@ func findReferrerTag(ctx context.Context, imageStore oras.ReadOnlyGraphTarget, i
 	}
 
 	if len(descriptors) == 0 {
-		return "", errors.New("no referrers found")
+		return "", ErrReferrerNotFound
 	}
 
 	if len(descriptors) > 1 {

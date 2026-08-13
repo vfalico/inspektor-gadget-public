@@ -154,7 +154,7 @@ func VerifyGadgetImage(ctx context.Context, image string, imgOpts *ImageOptions)
 				return fmt.Errorf("verifying gadget signature %q: %w", image, err)
 			}
 
-			log.Warn("signature not found, will pull signing information and try verification again")
+			log.Debug("signature not found locally; pulling signing information before retrying verification")
 
 			repo, err := newRepository(imageRef, &imgOpts.AuthOptions)
 			if err != nil {
@@ -170,6 +170,10 @@ func VerifyGadgetImage(ctx context.Context, image string, imgOpts *ImageOptions)
 			// again.
 			err = puller.DefaultSignaturePuller.PullSigningInformation(ctx, repo, imageStore, desc.Digest.String())
 			if err != nil {
+				if errors.Is(err, puller.ErrSignatureNotFound) {
+					logSignatureLookupDetails(err)
+					return &gadgetSignatureNotFoundError{image: image, cause: err}
+				}
 				return fmt.Errorf("pulling gadget signature %q: %w", image, err)
 			}
 
@@ -185,6 +189,32 @@ func VerifyGadgetImage(ctx context.Context, image string, imgOpts *ImageOptions)
 
 		return nil
 	})
+}
+
+type gadgetSignatureNotFoundError struct {
+	image string
+	cause error
+}
+
+func (e *gadgetSignatureNotFoundError) Error() string {
+	return fmt.Sprintf("no signature found for gadget %q; verification is enabled", e.image)
+}
+
+func (e *gadgetSignatureNotFoundError) Unwrap() error {
+	return e.cause
+}
+
+type signatureLookupDetails interface {
+	Details() []error
+}
+
+func logSignatureLookupDetails(err error) {
+	var details signatureLookupDetails
+	if errors.As(err, &details) {
+		for _, detail := range details.Details() {
+			log.Debugf("signature lookup: %v", detail)
+		}
+	}
 }
 
 func pullGadgetImage(ctx context.Context, image string, authOpts *AuthOptions) (*GadgetImageDesc, error) {
@@ -269,7 +299,15 @@ func pullImage(ctx context.Context, targetImage reference.Named, imageStore oras
 
 	imageDigest := desc.Digest.String()
 	if err := puller.DefaultSignaturePuller.PullSigningInformation(ctx, repo, imageStore, imageDigest); err != nil {
-		log.Warnf("error pulling signature: %v", err)
+		if errors.Is(err, puller.ErrSignatureNotFound) {
+			logSignatureLookupDetails(err)
+			log.Debugf("error pulling signature: %v", err)
+		} else {
+			// Signature copying is optional for an image pull, but decisive
+			// authentication, transport, or malformed-artifact failures must
+			// remain visible instead of being presented as simple absence.
+			log.Warnf("error pulling signature: %v", err)
+		}
 		// it's not a requirement to have a signature for pulling the image
 		return &desc, nil
 	}

@@ -17,7 +17,9 @@ package ocihandler
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/blang/semver"
@@ -25,9 +27,12 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/signature/puller"
 )
 
 func TestCheckBuilderVersion(t *testing.T) {
@@ -365,6 +370,51 @@ func TestConstructTempConfig(t *testing.T) {
 				require.Fail(t, "Invalid length")
 
 			}
+		})
+	}
+}
+
+func TestWrapVerifyImageError(t *testing.T) {
+	t.Parallel()
+
+	t.Run("direct missing signature has CLI remediation", func(t *testing.T) {
+		err := wrapVerifyImageError(fmt.Errorf("signature lookup: %w", puller.ErrSignatureNotFound), false)
+		require.ErrorIs(t, err, puller.ErrSignatureNotFound)
+		require.Equal(t,
+			"verifying image: signature lookup: signature not found. If you trust this unsigned gadget and accept the security risk, rerun with --verify-image=false",
+			err.Error(),
+		)
+		require.Equal(t, 1, strings.Count(err.Error(), "--verify-image=false"))
+		require.NotContains(t, err.Error(), "operator.oci.verify-image=false")
+	})
+
+	t.Run("remote missing signature has deployed remediation", func(t *testing.T) {
+		err := wrapVerifyImageError(fmt.Errorf("signature lookup: %w", puller.ErrSignatureNotFound), true)
+		require.ErrorIs(t, err, puller.ErrSignatureNotFound)
+		require.Equal(t,
+			"verifying image: signature lookup: signature not found. If you trust this unsigned gadget and accept the security risk, configure operator.oci.verify-image=false for deployed execution",
+			err.Error(),
+		)
+		require.Equal(t, 1, strings.Count(err.Error(), "operator.oci.verify-image=false"))
+		require.NotContains(t, err.Error(), "--verify-image=false")
+	})
+
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "authentication", err: errors.New("unauthorized")},
+		{name: "network", err: errors.New("connection refused")},
+		{name: "malformed artifact", err: errors.New("malformed signature manifest")},
+		{name: "cryptographic failure", err: errors.New("signature verification failed")},
+		{name: "cancellation", err: context.Canceled},
+		{name: "timeout", err: context.DeadlineExceeded},
+	} {
+		t.Run(test.name+" has no bypass advice", func(t *testing.T) {
+			err := wrapVerifyImageError(test.err, true)
+			require.ErrorIs(t, err, test.err)
+			require.NotContains(t, err.Error(), "operator.oci.verify-image=false")
+			require.NotContains(t, err.Error(), "--verify-image=false")
 		})
 	}
 }

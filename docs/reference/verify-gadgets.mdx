@@ -310,11 +310,14 @@ gadget              gadget-z55jq        gadget                   55375      5535
 
 <TabItem value="ig" label="ig">
 ```bash
-$ sudo ig run --verify-image=false ghcr.io/your-repo/gadget/trace_open
+$ sudo ig run ghcr.io/your-repo/gadget/trace_open --verify-image=false
 WARN[0000] gadget signature verification is disabled due to using corresponding option
 WARN[0000] gadget signature verification is disabled due to using corresponding option
 RUNTIME.CONTAINERNAME  PID          UID          GID          MNTNS_ID RET FL… MODE        COMM        FNAME                  TIMESTAMP
 ```
+
+Disabling verification removes a security check. Use this only when you trust
+the unsigned gadget and accept the risk of running unverified code.
 </TabItem>
 
 <TabItem value="ig-daemon" label="ig daemon">

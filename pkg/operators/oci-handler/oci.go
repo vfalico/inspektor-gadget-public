@@ -39,6 +39,7 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/resources"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/signature/puller"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/signature/verifier"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/signature/verifier/cosign"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/signature/verifier/notation"
@@ -116,7 +117,7 @@ func (o *ociHandler) GlobalParams() api.Params {
 		{
 			Key:          verifyImage,
 			Title:        "Verify image",
-			Description:  "Verify image using the provided public key",
+			Description:  "Verify gadget signatures (enabled by default); disabling this check allows untrusted code to run",
 			DefaultValue: "true",
 			TypeHint:     api.TypeBool,
 		},
@@ -356,6 +357,17 @@ func constructTempConfig(ann string) (map[string]any, int, error) {
 	return nil, 0, fmt.Errorf("invalid annotation %q", ann)
 }
 
+func wrapVerifyImageError(err error, remoteCall bool) error {
+	if !errors.Is(err, puller.ErrSignatureNotFound) {
+		return fmt.Errorf("verifying image: %w", err)
+	}
+
+	if remoteCall {
+		return fmt.Errorf("verifying image: %w. If you trust this unsigned gadget and accept the security risk, configure operator.oci.verify-image=false for deployed execution", err)
+	}
+	return fmt.Errorf("verifying image: %w. If you trust this unsigned gadget and accept the security risk, rerun with --verify-image=false", err)
+}
+
 func (o *OciHandlerInstance) init(gadgetCtx operators.GadgetContext) error {
 	if len(gadgetCtx.ImageName()) == 0 {
 		return fmt.Errorf("imageName empty")
@@ -411,7 +423,7 @@ func (o *OciHandlerInstance) init(gadgetCtx operators.GadgetContext) error {
 
 		err = oci.VerifyGadgetImage(gadgetCtx.Context(), gadgetCtx.ImageName(), imgOpts)
 		if err != nil {
-			return fmt.Errorf("verifying image: %w", err)
+			return wrapVerifyImageError(err, gadgetCtx.IsRemoteCall())
 		}
 	}
 

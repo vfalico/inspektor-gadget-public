@@ -18,15 +18,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
 	"oras.land/oras-go/v2/registry"
+
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/signature/puller"
 )
 
 func TestExtendedCopyPreservesReferrers(t *testing.T) {
@@ -340,4 +344,18 @@ func TestGetHostString(t *testing.T) {
 			require.Equal(t, test.host, host)
 		})
 	}
+}
+
+func TestGadgetSignatureNotFoundError(t *testing.T) {
+	t.Parallel()
+	err := &gadgetSignatureNotFoundError{
+		image: "registry.example/gadget:v1",
+		cause: puller.ErrSignatureNotFound,
+	}
+	require.ErrorIs(t, err, puller.ErrSignatureNotFound)
+	require.Equal(t,
+		`no signature found for gadget "registry.example/gadget:v1"; verification is enabled`,
+		err.Error(),
+	)
+	require.Equal(t, 1, strings.Count(err.Error(), "no signature found"))
 }
