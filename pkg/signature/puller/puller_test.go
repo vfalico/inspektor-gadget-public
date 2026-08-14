@@ -82,7 +82,7 @@ func TestPullSigningInformation(t *testing.T) {
 
 			err = DefaultSignaturePuller.PullSigningInformation(ctx, repo, store, desc.Digest.String())
 			if test.shouldErr {
-				require.Error(t, err)
+				require.ErrorIs(t, err, ErrSignatureNotFound)
 				return
 			}
 
@@ -98,7 +98,7 @@ type fakePuller struct {
 }
 
 func (p *fakePuller) PullSigningInformation(context.Context, *remote.Repository, oras.Target, string) error {
-	*p.calls++
+	(*p.calls)++
 	return p.err
 }
 

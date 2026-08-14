@@ -117,7 +117,7 @@ func (o *ociHandler) GlobalParams() api.Params {
 		{
 			Key:          verifyImage,
 			Title:        "Verify image",
-			Description:  "Verify gadget signatures (enabled by default); disabling this check allows untrusted code to run",
+			Description:  "Verify gadget signatures (enabled by default); disabling this check permits unverified gadget code to run",
 			DefaultValue: "true",
 			TypeHint:     api.TypeBool,
 		},

@@ -8,14 +8,23 @@ package helpers
 import (
 	"bytes"
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
+	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
 )
+
+type resolveErrorTarget struct {
+	oras.ReadOnlyGraphTarget
+	err error
+}
+
+func (t resolveErrorTarget) Resolve(context.Context, string) (ocispec.Descriptor, error) {
+	return ocispec.Descriptor{}, t.err
+}
 
 func TestFindReferrerTagClassifiesAbsence(t *testing.T) {
 	t.Parallel()
@@ -44,12 +53,12 @@ func TestFindOCI11SignatureTagPreservesResolveFailure(t *testing.T) {
 
 func TestFindReferrerTagPreservesCancellation(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	store, err := oci.New(t.TempDir())
-	require.NoError(t, err)
 
-	_, err = FindBundleTag(ctx, store, digest.FromString("missing").String())
-	require.Error(t, err)
-	require.True(t, errors.Is(err, context.Canceled) || !errors.Is(err, ErrReferrerNotFound))
+	_, err := FindBundleTag(
+		context.Background(),
+		resolveErrorTarget{err: context.Canceled},
+		digest.FromString("missing").String(),
+	)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, ErrReferrerNotFound)
 }
