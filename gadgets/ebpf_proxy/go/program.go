@@ -144,6 +144,7 @@ var fsTracePrograms = []string{
 	"ebpf_proxy_fs_write", "ebpf_proxy_fs_write_ret",
 	"ebpf_proxy_fs_open", "ebpf_proxy_fs_open_ret",
 	"ebpf_proxy_fs_filp_open", "ebpf_proxy_fs_filp_open_ret",
+	"ebpf_proxy_fs_async_enter",
 }
 
 // mm_trace: memory management (page faults + direct-reclaim duration).
@@ -306,7 +307,10 @@ var (
 	// fs_trace-only server-side op filter. Published into
 	// the filter_fs_op BPF map in gadgetStart so the rare failing-open rows are
 	// not truncated out of the MCP window by the vfs_read/write flood. 0 == all.
-	enrichedFsOp uint64
+	enrichedFsOp             uint64
+	enrichedFsAsyncActive    bool
+	enrichedFsIoUringEnterNr uint64
+	enrichedFsIoSubmitNr     uint64
 
 	// cuda_profile-only server-side op-class filter.
 	// Published into the filter_cuda_op BPF map in gadgetStart so the rare
@@ -487,7 +491,7 @@ func gadgetPreStart() int32 {
 		return preStartFixed("heap_profile", heapProfilePrograms)
 	case "net_trace":
 		// Co-attach the item-12a inbound-RST hook (ebpf_proxy_tcp_reset) so the
-		// net_rollup datasource's rst_count actually populates here. Note: 
+		// net_rollup datasource's rst_count actually populates here. Note:
 		// tcp_v4_connect's kretprobe returns retval=0/SYN_SENT on a refused
 		// connect (the refusal RST is delivered asynchronously in softirq),
 		// so the net family itself never sees the RST — only ebpf_proxy_tcp_reset
@@ -833,6 +837,19 @@ func preStartFixed(name string, programs []string) int32 {
 			return 1
 		}
 		enrichedFsOp = fsop
+		ioUringEnterID, err := api.GetSyscallID("io_uring_enter")
+		if err != nil || ioUringEnterID < 0 {
+			api.Errorf("ebpf_proxy[fs_trace]: resolving io_uring_enter syscall: %s", err)
+			return 1
+		}
+		ioSubmitID, err := api.GetSyscallID("io_submit")
+		if err != nil || ioSubmitID < 0 {
+			api.Errorf("ebpf_proxy[fs_trace]: resolving io_submit syscall: %s", err)
+			return 1
+		}
+		enrichedFsAsyncActive = true
+		enrichedFsIoUringEnterNr = uint64(ioUringEnterID)
+		enrichedFsIoSubmitNr = uint64(ioSubmitID)
 		if fsop != 0 {
 			api.Infof("ebpf_proxy[fs_trace]: fs_op filter=%d (1=read 2=write 3=open 4=filp_open 5=fault)", fsop)
 		}
@@ -975,6 +992,14 @@ func gadgetStart() int32 {
 		// fs_trace op filter (0 for the other families == FS_FILTER_ALL, a no-op).
 		if rc := putFilter("filter_fs_op", enrichedFsOp); rc != 0 {
 			return rc
+		}
+		if enrichedFsAsyncActive {
+			if rc := putFilter("filter_fs_io_uring_enter_nr", enrichedFsIoUringEnterNr); rc != 0 {
+				return rc
+			}
+			if rc := putFilter("filter_fs_io_submit_nr", enrichedFsIoSubmitNr); rc != 0 {
+				return rc
+			}
 		}
 		// cuda_profile op filter (0 for the other families == CUDA_OP_FILTER_ALL).
 		if rc := putFilter("filter_cuda_op", enrichedCudaOp); rc != 0 {

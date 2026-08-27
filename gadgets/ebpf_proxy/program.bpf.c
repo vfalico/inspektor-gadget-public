@@ -2992,41 +2992,51 @@ int ebpf_proxy_irq_exit(struct trace_event_raw_softirq *ctx)
 	return 0;
 }
 
-// async I/O submission. Neither io_submit(2) nor io_uring_enter(2) has a
-// sys_enter tracepoint, so we attach via ksyscall (libbpf resolves the arch
-// wrapper). These surface async-I/O submission that never appears as a
-// read()/write() syscall: an MCP client seeing high throughput but few rw syscalls
-// finds the work here. count = number of ops submitted in this call.
-SEC("ksyscall/io_uring_enter")
-int BPF_KSYSCALL(ebpf_proxy_fs_io_uring_enter, unsigned int fd, unsigned int to_submit, unsigned int min_complete, unsigned int flags)
-{
-	if (!ebpf_proxy_proc_wanted())
-		return 0;
-	struct fs_event *e = gadget_reserve_buf(&fs_events, sizeof(*e));
-	if (!e)
-		return 0;
-	e->timestamp_raw = bpf_ktime_get_boot_ns();
-	gadget_process_populate(&e->proc);
-	e->fs_op_raw = fs_io_uring_enter;
-	e->count = (__u64)to_submit;	// SQEs submitted this call
-	e->retval = 0;
-	e->fname[0] = '\0';
-	gadget_submit_buf(ctx, &fs_events, e, sizeof(*e));
-	return 0;
-}
+// Async I/O submission. Named ksyscall sections are not supported by every
+// Inspektor Gadget/kernel combination, and a single unsupported section keeps
+// the whole multi-capability gadget from loading. Use the universally available
+// raw syscall tracepoint and let the WASM control plane publish architecture-
+// correct syscall IDs. count = number of operations submitted in this call.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} filter_fs_io_uring_enter_nr SEC(".maps");
 
-SEC("ksyscall/io_submit")
-int BPF_KSYSCALL(ebpf_proxy_fs_io_submit, long aio_ctx, long nr, void *iocbpp)
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} filter_fs_io_submit_nr SEC(".maps");
+
+SEC("raw_tracepoint/sys_enter")
+int ebpf_proxy_fs_async_enter(struct bpf_raw_tracepoint_args *ctx)
 {
 	if (!ebpf_proxy_proc_wanted())
 		return 0;
+	__u32 z = 0;
+	__u64 syscall_nr = (__u64)ctx->args[1];
+	__u64 *io_uring_enter_nr = bpf_map_lookup_elem(&filter_fs_io_uring_enter_nr, &z);
+	__u64 *io_submit_nr = bpf_map_lookup_elem(&filter_fs_io_submit_nr, &z);
+	enum fs_op op;
+	if (io_uring_enter_nr && syscall_nr == *io_uring_enter_nr)
+		op = fs_io_uring_enter;
+	else if (io_submit_nr && syscall_nr == *io_submit_nr)
+		op = fs_io_submit;
+	else
+		return 0;
+
+	struct pt_regs *regs = (struct pt_regs *)ctx->args[0];
+	__s64 submitted = (__s64)PT_REGS_PARM2_CORE_SYSCALL(regs);
 	struct fs_event *e = gadget_reserve_buf(&fs_events, sizeof(*e));
 	if (!e)
 		return 0;
 	e->timestamp_raw = bpf_ktime_get_boot_ns();
 	gadget_process_populate(&e->proc);
-	e->fs_op_raw = fs_io_submit;
-	e->count = (nr < 0) ? 0 : (__u64)nr;	// iocbs submitted this call
+	e->fs_op_raw = op;
+	e->count = submitted < 0 ? 0 : (__u64)submitted;
 	e->retval = 0;
 	e->fname[0] = '\0';
 	gadget_submit_buf(ctx, &fs_events, e, sizeof(*e));
