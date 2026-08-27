@@ -51,12 +51,20 @@ Pass these as the tool's structured arguments (names match the CLI flags):
 
 ## Agent RCA loop over MCP (recommended)
 1. Read the symptom → pick ONE capability from SKILL.md §1.
-2. Call it scoped (`pid` + short `timeout`).
-3. Inspect `ebpf_proxy_coverage`: attached but idle → re-call with a wider `timeout`.
-4. Read the decisive field for that capability (SKILL.md §1 "reference" column).
-5. If the evidence points at another layer, pivot capability (e.g. `sock_snapshot`
+2. Start the bounded representative workload asynchronously and confirm it is
+   active before entering a blocking capture.
+3. Call the capability scoped (`pid` + short `timeout`) while that workload is
+   still active, then join the workload and preserve both intervals.
+4. If using a detached `duration=0` capture, call `get_results` while the
+   workload remains active. A streaming instance may not replay events emitted
+   before retrieval attached; starting a gadget, completing traffic, and only
+   then fetching can return an empty result even though traffic occurred.
+5. Inspect `ebpf_proxy_coverage`: attached but idle → re-call with a wider `timeout`.
+6. Read the decisive field for that capability (SKILL.md §1 "reference" column).
+7. If the evidence points at another layer, pivot capability (e.g. `sock_snapshot`
    found a wedged socket → `sock_state` for how it got wedged).
-6. Stop when a single field proves the fault (e.g. `verdict=FAIL`,
+8. Stop every detached gadget by its exact ID on success, error, or cancellation.
+9. Stop when a single field proves the fault (e.g. `verdict=FAIL`,
    `newstate=CLOSE` with no ESTABLISHED, `sk_null=1`, `retrans_count` spike).
 
 ## Gotchas specific to MCP driving
@@ -65,6 +73,13 @@ Pass these as the tool's structured arguments (names match the CLI flags):
 - `timeout` is the capture window — an MCP call blocks for roughly that long. Keep it
   short (1–3 s) for a first look; a 30 s window on a high-rate capability returns a
   truncated flood, not more insight.
+- A foreground call only sees activity during its blocking capture window.
+  Work started after the call returns cannot overlap it. For detached streams,
+  `get_results` may collect live events rather than replay historical ones, so
+  invoke it before the workload ends.
+- Generic array limiters may be invalid for streaming datasources. Prefer
+  PID/syscall/op filters, short live windows, and server-side aggregation
+  advertised by the selected capability.
 - Errors surface in `ebpf_proxy_coverage.note` / a non-zero attach — surface them to the
   agent instead of silently reporting "no data".
 - Local/unsigned image still needs the equivalent of `--verify-image=false`; if the
