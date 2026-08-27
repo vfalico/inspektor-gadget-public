@@ -326,8 +326,7 @@ var (
 func fsOpFilterValue() (uint64, bool) {
 	v, err := api.GetParamValue("fs_op", 32)
 	if err != nil {
-		api.Errorf("ebpf_proxy[fs_trace]: reading fs_op param: %s", err)
-		return 0, false
+		v = ""
 	}
 	switch v {
 	case "", "all":
@@ -360,8 +359,7 @@ func fsOpFilterValue() (uint64, bool) {
 func cudaOpFilterValue() (uint64, bool) {
 	v, err := api.GetParamValue("cuda_op", 32)
 	if err != nil {
-		api.Errorf("ebpf_proxy[cuda_profile]: reading cuda_op param: %s", err)
-		return 0, false
+		v = ""
 	}
 	switch v {
 	case "", "all":
@@ -387,8 +385,7 @@ func cudaOpFilterValue() (uint64, bool) {
 func readPidParam(tag string) (uint64, bool) {
 	pidStr, err := api.GetParamValue("pid", 32)
 	if err != nil {
-		api.Errorf("ebpf_proxy[%s]: reading pid param: %s", tag, err)
-		return 0, false
+		pidStr = ""
 	}
 	if pidStr == "" {
 		return 0, true
@@ -884,8 +881,7 @@ func preStartFixed(name string, programs []string) int32 {
 func preStartTraceSyscall() int32 {
 	syscall, err := api.GetParamValue("syscall", 64)
 	if err != nil {
-		api.Errorf("ebpf_proxy[trace_syscall]: reading syscall param: %s", err)
-		return 1
+		syscall = ""
 	}
 
 	var nr uint64 = anySyscall
@@ -898,19 +894,9 @@ func preStartTraceSyscall() int32 {
 		nr = uint64(id)
 	}
 
-	pidStr, err := api.GetParamValue("pid", 32)
-	if err != nil {
-		api.Errorf("ebpf_proxy[trace_syscall]: reading pid param: %s", err)
+	pid, ok := readPidParam("trace_syscall")
+	if !ok {
 		return 1
-	}
-	var pid uint64
-	if pidStr != "" {
-		p, err := strconv.ParseUint(pidStr, 10, 32)
-		if err != nil {
-			api.Errorf("ebpf_proxy[trace_syscall]: invalid pid %q (must be a non-negative integer)", pidStr)
-			return 1
-		}
-		pid = p
 	}
 
 	// Remember the validated filter values; they are written to the BPF maps in
