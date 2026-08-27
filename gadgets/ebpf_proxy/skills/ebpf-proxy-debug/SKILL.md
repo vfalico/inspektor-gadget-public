@@ -1,26 +1,16 @@
 ---
 name: ebpf-proxy-debug
 description: >-
-  Use to diagnose Linux runtime and proxy/mesh problems by tracing the kernel and
-  userspace with eBPF Proxy, a single read-only eBPF gadget run through the `ig` CLI or
-  over MCP (NO rebuild). Trigger when a process, proxy, or service misbehaves and
-  you need ground-truth kernel evidence: failing/ENOENT config opens, fd or memory
-  leaks, mutex/lock stalls, TCP resets vs refused connects, retransmits/slow
-  connects, high syscall latency, scheduler run-queue delay, page-fault/reclaim
-  pressure, block I/O latency, softirq storms, event-loop/epoll/timerfd stalls,
-  recursion or stack-depth blowups, "the connection is stuck right now", a periodic
-  write (keepalive/SSE/heartbeat) that silently stopped, which downstream proxy
-  socket maps to which upstream socket, which pod/peer is on the far end of a
-  connection, decoding a string argument at a uprobe, binding a userspace fd to its
-  kernel socket, or "attach a kprobe/uprobe to <kernel or lib function>". Also for
-  enumerating attachable kernel symbols. Handles symptoms described as "it can't
-  find its config", "fd leak", "memory keeps growing", "it's hanging on a lock",
-  "connection resets", "connection refused vs reset", "why is this slow", "the
-  event loop stalled", "stack overflow / infinite recursion", "the heartbeat
-  stopped", "what does this socket look like right now", "which upstream does this
-  downstream connection use", "who is the peer pod", "trace syscall X for PID Y",
-  "what's this process doing in the kernel". Do NOT use for editing code, static
-  analysis, or problems with no running process to observe.
+  Diagnose Linux runtime, performance, and proxy or mesh problems with the
+  read-only eBPF Proxy gadget through the `ig` CLI or MCP. Use for ground-truth
+  kernel and userspace evidence about failing file opens, fd or memory leaks,
+  lock stalls, TCP resets/refusals/retransmits, syscall latency, scheduler delay,
+  memory pressure, block I/O, softirqs, event-loop or timer stalls, recursion,
+  stopped periodic writes, socket correlation and peer identity, and targeted
+  kprobe or uprobe tracing. Also use to enumerate attachable symbols, decode
+  userspace arguments, bind file descriptors to sockets, or inspect what a live
+  process is doing in the kernel. Do not use for static analysis, code editing,
+  or a target with no running process to observe.
 license: Apache-2.0
 metadata:
   version: "2.0.0"
