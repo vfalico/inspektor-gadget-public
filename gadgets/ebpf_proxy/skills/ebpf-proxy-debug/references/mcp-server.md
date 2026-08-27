@@ -24,7 +24,8 @@ stdout you receive structured rows.
 3. **Scope in-kernel.** Pass `pid` and a short `timeout`; use the op-class selectors
    (`fs_op`, `cuda_op`) and the aggregating capabilities (`per_key_rollup`) to stay
    under the output budget. High-rate capabilities (`runq_lat`, unfiltered `attach`,
-   `trace_syscall` with no syscall) flood — always narrow first.
+   `trace_syscall` with no syscall) flood — always narrow first. For
+   `trace_syscall`, name one syscall; do not send an empty syscall value.
 4. **Identity is inline.** Socket-bearing rows already carry the 4-tuple +
    `sk_state` — the agent should read those fields rather than issuing a second
    "which connection" call (see connection-identity.md).
@@ -84,6 +85,14 @@ Pass these as the tool's structured arguments (names match the CLI flags):
 - Generic array limiters may be invalid for streaming datasources. Prefer
   PID/syscall/op filters, short live windows, and server-side aggregation
   advertised by the selected capability.
+- Prefer native op selectors (`fs_op=read`, `cuda_op=copy`) over generic filter
+  expressions. If an expression is needed, string values must be quoted:
+  `fs_op == "read"` is valid, while `fs_op == read` looks up a field named
+  `read` and fails compilation.
+- A filter-compilation or gadget-pre-start error invalidates that call, not the
+  observation workflow. Correct the arguments or choose another applicable,
+  bounded capability and retry; do not derive a hypothesis or edit source from
+  a failed capture.
 - Errors surface in `ebpf_proxy_coverage.note` / a non-zero attach — surface them to the
   agent instead of silently reporting "no data".
 - Local/unsigned image still needs the equivalent of `--verify-image=false`; if the
