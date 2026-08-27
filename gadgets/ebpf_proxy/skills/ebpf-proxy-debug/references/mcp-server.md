@@ -64,7 +64,11 @@ Pass these as the tool's structured arguments (names match the CLI flags):
 7. If the evidence points at another layer, pivot capability (e.g. `sock_snapshot`
    found a wedged socket → `sock_state` for how it got wedged).
 8. Stop every detached gadget by its exact ID on success, error, or cancellation.
-9. Stop when a single field proves the fault (e.g. `verdict=FAIL`,
+9. A response with `<aggregateComplete>true</aggregateComplete>` reports a
+   full-set server aggregate. It is valid aggregate evidence even when the
+   accompanying representative raw rows are marked truncated; preserve both
+   markers and do not describe the raw sample as complete.
+10. Stop when a single field proves the fault (e.g. `verdict=FAIL`,
    `newstate=CLOSE` with no ESTABLISHED, `sk_null=1`, `retrans_count` spike).
 
 ## Gotchas specific to MCP driving
