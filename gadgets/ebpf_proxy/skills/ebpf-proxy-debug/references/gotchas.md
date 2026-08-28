@@ -26,13 +26,30 @@ A naive top-level `row["comm"]` is `None`. `-o columns` flattens to `COMM`/`PID`
 ## 5. `--pid` (gadget) vs `operator.oci.wasm.pid`
 Use the gadget `--pid` to FILTER EVENTS (in-kernel `filter_pid` map). The WASM
 operator's `pid` param only scopes uprobe ATTACH resolution — it does not filter
-event output.
+event output. Therefore uprobe-backed capabilities (`heap_profile`, `lock_trace`,
+`cuda_memtrace`, `cuda_profile`, and explicit `attach_uprobe`) require both
+selectors with the same verified process identity:
+
+```bash
+--pid=<PID> --operator.oci.wasm.pid=<PID>
+```
+
+Using only gadget `--pid` can report `attached_count > 0` after attaching libc or
+CUDA probes to unrelated long-lived host processes; the in-kernel filter then
+correctly emits no rows for the requested PID. Treat attachment logs naming
+other PIDs as invalid target attachment, not as evidence that the requested
+process was observed. Kernel-only capabilities such as `trace_syscall` need only
+gadget `--pid`; setting only the operator PID for them yields an unfiltered or
+empty result rather than correct event scoping.
 
 ## 6. `ebpf_proxy_coverage`: attached-but-idle vs attach-fail
 Every run emits one `ebpf_proxy_coverage` record (`capability`, `attached_targets`,
 `attached_count`, `pid_filter`, `note`). `attached_count > 0` with **zero events**
 = attached-but-idle: WIDEN `--timeout`/`--pid`; do NOT switch capability. This is
-the #1 source of false "it didn't work".
+the #1 source of false "it didn't work" only after attachment identity is valid.
+For uprobe-backed capabilities, first verify the attachment log names the
+requested PID or its mapped executable/library; unrelated attachment PIDs make
+the run invalid regardless of `attached_count`.
 
 ## 7. High-rate capabilities truncate/flood
 `runq_lat` produced **366266 rows in ~6 s**; unfiltered `attach` on a hot symbol

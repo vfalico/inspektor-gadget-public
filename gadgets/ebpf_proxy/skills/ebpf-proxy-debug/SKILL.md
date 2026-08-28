@@ -113,7 +113,10 @@ Each run emits one record: `capability`, `attached_targets`, `attached_count`,
 - `list_attachable` flags are `--filter` / `--max` / `--type` (NOT `--ksym_filter`).
   Symbols render in `-o columns` (`TYPE NAME MODULE`; TYPE 116 = 't' = function).
 - `-o json` nests process identity under `proc.*`.
-- Gadget `--pid` filters events; `operator.oci.wasm.pid` only scopes uprobe ATTACH.
+- Gadget `--pid` filters events. For uprobe-backed capabilities, also pass
+  `--operator.oci.wasm.pid=<same PID>` so attachment resolves against that
+  process rather than unrelated long-lived host processes. Kernel-only
+  capabilities need only gadget `--pid`.
 - `sock_state`/RST rows often fire in softirq/timer context — key on the **4-tuple**,
   not `proc` (it may name an incidentally-running task).
 - `absence_assert` needs `--host` and, to record writes, pair it with a `net_trace`

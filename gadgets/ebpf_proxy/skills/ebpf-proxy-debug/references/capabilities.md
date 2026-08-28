@@ -37,6 +37,8 @@ carry the **inline 4-tuple** `saddr/daddr/sport/dport/sk_state/sk_family` — se
 - fields: `daddr, saddr, dport, sport, bytes, retval, retrans_out, tcp_state, connect_latency_ns, net_op_raw, dst_endpoint(peer, k8s-resolved)`
 
 ### heap_profile — libc malloc/free churn+leak
+- Uprobe-backed: use both `--pid=<PID>` and
+  `--operator.oci.wasm.pid=<PID>` with the same verified identity.
 - attaches malloc/calloc/realloc/free/brk/mmap (+rets); fields `size, ptr, heap_op`.
 
 ### lock_trace — userspace mutex/cond wait

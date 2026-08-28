@@ -54,14 +54,16 @@ sudo ig run ebpf_proxy:latest --verify-image=false \
 ## heap_profile (libc malloc/free) — system-wide
 ```bash
 sudo ig run ebpf_proxy:latest --verify-image=false \
-  --capability=heap_profile --pid=<PID> --timeout=6 -o json
+  --capability=heap_profile --pid=<PID> \
+  --operator.oci.wasm.pid=<PID> --timeout=6 -o json
 ```
 ```json
 {"size":null,"ptr":null,"heap_op":null,"proc.comm":null}   # sample; attaches 9 uprobes
 ebpf_proxy_coverage: attached_count=9 (malloc/calloc/realloc/free/brk/mmap + rets)
 ```
 With a tight pid + short window you may see only the coverage row
-(attached-but-idle) — widen the window or run system-wide.
+(attached-but-idle) after verifying that the uprobe attachment log names that
+PID or its mapped libc. Widen the window only after that identity check.
 
 ## runq_lat (scheduler run-queue latency) — 366266 events in ~6 s (HIGH RATE)
 ```bash
