@@ -104,6 +104,7 @@ var cudaProfilePrograms = []string{
 // lock_trace: userspace mutex/cond contention (blocked-wait duration).
 var lockTracePrograms = []string{
 	"ebpf_proxy_lock_mutex", "ebpf_proxy_lock_mutex_ret",
+	"ebpf_proxy_lock_unlock",
 	"ebpf_proxy_lock_cond", "ebpf_proxy_lock_cond_ret",
 	"ebpf_proxy_lock_condt", "ebpf_proxy_lock_condt_ret",
 	"ebpf_proxy_lock_futex_enter", "ebpf_proxy_lock_futex_exit", // directive-22126: kernel futex(WAIT) contention hook
@@ -125,6 +126,7 @@ var heapProfilePrograms = []string{
 var netTracePrograms = []string{
 	"ebpf_proxy_net_connect", "ebpf_proxy_net_connect_ret",
 	"ebpf_proxy_net_retransmit", "ebpf_proxy_net_sendmsg",
+	"ebpf_proxy_net_udp_send", "ebpf_proxy_net_udp_recv",
 	"ebpf_proxy_sockpair_accept",
 }
 
@@ -144,12 +146,15 @@ var fsTracePrograms = []string{
 	"ebpf_proxy_fs_write", "ebpf_proxy_fs_write_ret",
 	"ebpf_proxy_fs_open", "ebpf_proxy_fs_open_ret",
 	"ebpf_proxy_fs_filp_open", "ebpf_proxy_fs_filp_open_ret",
+	"ebpf_proxy_fs_close",
+	"ebpf_proxy_fs_io_submit", "ebpf_proxy_fs_io_uring_enter",
 }
 
 // mm_trace: memory management (page faults + direct-reclaim duration).
 var mmTracePrograms = []string{
 	"ebpf_proxy_mm_fault",
 	"ebpf_proxy_mm_reclaim", "ebpf_proxy_mm_reclaim_ret",
+	"ebpf_proxy_mm_memcg_reclaim", "ebpf_proxy_mm_memcg_reclaim_ret",
 }
 
 // irq_trace: drivers/IRQ (softirq entry->exit service duration per vector).
@@ -180,9 +185,10 @@ var runqLatPrograms = []string{
 // enrichedFamilies groups the new fixed-program capabilities for allPrograms
 // assembly and the capability dispatch table.
 var enrichedFamilies = [][]string{
-	cudaProfilePrograms, lockTracePrograms, heapProfilePrograms,
+	cudaProfilePrograms, memsnapPrograms, smutilPrograms,
+	lockTracePrograms, heapProfilePrograms,
 	netTracePrograms, sockStatePrograms, fsTracePrograms, mmTracePrograms,
-	irqTracePrograms, blockIoPrograms, runqLatPrograms,
+	irqTracePrograms, blockIoPrograms, runqLatPrograms, epollTimerPrograms,
 }
 
 // every program in the object; any not enabled by the chosen capability is
@@ -487,7 +493,7 @@ func gadgetPreStart() int32 {
 		return preStartFixed("heap_profile", heapProfilePrograms)
 	case "net_trace":
 		// Co-attach the item-12a inbound-RST hook (ebpf_proxy_tcp_reset) so the
-		// net_rollup datasource's rst_count actually populates here. Note: 
+		// net_rollup datasource's rst_count actually populates here. Note:
 		// tcp_v4_connect's kretprobe returns retval=0/SYN_SENT on a refused
 		// connect (the refusal RST is delivered asynchronously in softirq),
 		// so the net family itself never sees the RST — only ebpf_proxy_tcp_reset
