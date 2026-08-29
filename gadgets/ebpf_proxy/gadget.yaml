@@ -1516,10 +1516,11 @@ params:
         do_unlinkat or tcp_v4_connect. Validated against /proc/kallsyms before load.'
     mode:
       key: mode
-      defaultValue: kprobe_kretprobe
+      defaultValue: ""
       description: '[attach] Probe kind: kprobe, kretprobe or kprobe_kretprobe. [attach_uprobe]
         Probe kind: uprobe, uretprobe or uprobe_uretprobe (default uprobe_uretprobe
-        when capability=attach_uprobe).'
+        when capability=attach_uprobe). When omitted, the selected capability
+        supplies its own compatible default.'
     pid:
       key: pid
       defaultValue: ""

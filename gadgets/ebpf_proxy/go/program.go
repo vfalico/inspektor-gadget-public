@@ -569,9 +569,9 @@ func preStartAttach() int32 {
 		}
 	}
 
-	// `mode` is optional (defaultValue "kprobe_kretprobe"). As with capability,
-	// an absent param over the daemon path yields an error, not the default, so
-	// treat an unreadable value as "unset" and apply the default.
+	// `mode` is optional. The shared metadata leaves it empty because attach and
+	// attach_uprobe require different defaults. An absent param over the daemon
+	// path yields an error, so treat an unreadable value as "unset" too.
 	mode, err := api.GetParamValue("mode", 64)
 	if err != nil {
 		mode = ""
