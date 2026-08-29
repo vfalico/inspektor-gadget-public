@@ -117,6 +117,9 @@ Each run emits one record: `capability`, `attached_targets`, `attached_count`,
   `--operator.oci.wasm.pid=<same PID>` so attachment resolves against that
   process rather than unrelated long-lived host processes. Kernel-only
   capabilities need only gadget `--pid`.
+- `attach_uprobe --target` requires the exact raw linker symbol. Resolve Rust/C++
+  targets with `nm --no-demangle` (and `-D` for dynamic exports); never copy a
+  readable `nm -C` name containing `::` into the attach command.
 - `sock_state`/RST rows often fire in softirq/timer context — key on the **4-tuple**,
   not `proc` (it may name an incidentally-running task).
 - `absence_assert` needs `--host` and, to record writes, pair it with a `net_trace`

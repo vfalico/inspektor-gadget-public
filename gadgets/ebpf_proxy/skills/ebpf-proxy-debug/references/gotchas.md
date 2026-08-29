@@ -42,7 +42,22 @@ process was observed. Kernel-only capabilities such as `trace_syscall` need only
 gadget `--pid`; setting only the operator PID for them yields an unfiltered or
 empty result rather than correct event scoping.
 
-## 6. `ebpf_proxy_coverage`: attached-but-idle vs attach-fail
+## 6. `attach_uprobe` requires the raw linker symbol
+Rust and C++ tools often print a readable demangled name containing components
+such as `::`. That display name is not the ELF symbol and cannot be used as the
+attach target. Resolve and copy the exact non-demangled symbol-table entry:
+
+```bash
+nm --no-demangle --defined-only <binary-or-library> | grep '<stable fragment>'
+# Use -D as well when the target is a dynamic export:
+nm -D --no-demangle --defined-only <library> | grep '<stable fragment>'
+```
+
+Pass the complete name column to `--target=<path>:<symbol>`. `nm -C` is useful
+for identifying what a symbol means, but its output must not be copied into the
+attach command.
+
+## 7. `ebpf_proxy_coverage`: attached-but-idle vs attach-fail
 Every run emits one `ebpf_proxy_coverage` record (`capability`, `attached_targets`,
 `attached_count`, `pid_filter`, `note`). `attached_count > 0` with **zero events**
 = attached-but-idle: WIDEN `--timeout`/`--pid`; do NOT switch capability. This is
@@ -51,17 +66,17 @@ For uprobe-backed capabilities, first verify the attachment log names the
 requested PID or its mapped executable/library; unrelated attachment PIDs make
 the run invalid regardless of `attached_count`.
 
-## 7. High-rate capabilities truncate/flood
+## 8. High-rate capabilities truncate/flood
 `runq_lat` produced **366266 rows in ~6 s**; unfiltered `attach` on a hot symbol
 and `trace_syscall` with no `--syscall` are similar. Always scope with `--pid`, a
 short `--timeout`, and op-class filters (`fs_op=fault`, `cuda_op=copy`) first.
 
-## 8. NVML per-PID GPU fields are often 0 in containers
+## 9. NVML per-PID GPU fields are often 0 in containers
 `gpu_pid`, `used_gpu_mem`, `sm_util` are frequently structurally empty inside
 containers by NVML design — **0 is expected**, not a bug. Use device-level
 `dev_total`/`dev_used`/`dev_free`. (GPU details in the `ebpf-proxy-gpu-debug` skill.)
 
-## 9. columns mode prints a header block per datasource
+## 10. columns mode prints a header block per datasource
 `-o columns` prints a header for EVERY datasource in the gadget (fs/net/heap/runq/
 cuda/...) even when only one is active. The real rows are those with data —
 prefer `-o json` + field filtering for programmatic use.

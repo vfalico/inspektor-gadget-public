@@ -2,7 +2,7 @@
 
 Invocation: `sudo ig run ebpf_proxy:latest --verify-image=false --capability=<CAP> [params] --timeout=<s> -o json`
 Common params: `--pid=<N>` (in-kernel event filter), `--timeout=<s>`.
-Every run emits one `ebpf_proxy_coverage` record (see gotchas.md #6). Socket-bearing rows
+Every run emits one `ebpf_proxy_coverage` record (see gotchas.md #7). Socket-bearing rows
 carry the **inline 4-tuple** `saddr/daddr/sport/dport/sk_state/sk_family` — see
 `connection-identity.md`.
 
@@ -13,7 +13,12 @@ carry the **inline 4-tuple** `saddr/daddr/sport/dport/sk_state/sk_family` — se
 - validate the symbol with `list_attachable` first.
 
 ### attach_uprobe — uprobe/uretprobe on a userspace symbol
-- params: `--target=<lib-or-path>:<symbol>` (e.g. `libc:malloc`, `libssl:SSL_read`), `--mode=uprobe|uretprobe`
+- params: `--target=<lib-or-path>:<symbol>` (e.g. `libc:malloc`, `libssl:SSL_read`), `--mode=uprobe|uretprobe|uprobe_uretprobe` (default `uprobe_uretprobe`)
+- `<symbol>` must be the exact raw linker symbol, not a demangled Rust/C++ display name. Discover it without demangling:
+  `nm --no-demangle --defined-only <binary-or-library> | grep '<stable fragment>'`.
+  For dynamic exports use `nm -D --no-demangle --defined-only`. Copy the complete
+  symbol-name column into `--target`; use `nm -C` only to understand candidates,
+  never as the source of the attach string.
 - auto-pairs enter/return (`call_depth`), decodes a `char*` arg to `arg_str`, resolves an fd arg to the kernel socket (inline 4-tuple). See event-loop.md, connection-identity.md.
 - the WASM operator `pid` scopes ATTACH resolution; gadget `--pid` filters events.
 
