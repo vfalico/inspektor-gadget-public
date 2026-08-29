@@ -18,7 +18,8 @@ carry the **inline 4-tuple** `saddr/daddr/sport/dport/sk_state/sk_family` — se
   `nm --no-demangle --defined-only <binary-or-library> | grep '<stable fragment>'`.
   For dynamic exports use `nm -D --no-demangle --defined-only`. Copy the complete
   symbol-name column into `--target`; use `nm -C` only to understand candidates,
-  never as the source of the attach string.
+  never as the source of the attach string. Legacy Rust raw symbols can contain
+  `$LT$`, `$GT$`, and similar `$`-delimited components; pass them unchanged.
 - For high-frequency symbols, use single-sided `--mode=uprobe` with
   `--uprobe_sample_every=N`. Sampling occurs in-kernel before ring-buffer
   submission, so it can prevent transport loss. `--max-entries` only limits

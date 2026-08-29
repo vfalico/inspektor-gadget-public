@@ -449,6 +449,10 @@ func validSymbolChar(b byte) bool {
 	}
 }
 
+func validUprobeSymbolChar(b byte) bool {
+	return validSymbolChar(b) || b == '$'
+}
+
 // enableOnly disables every program except those named in `keep`.
 func enableExact(keep map[string]string) {
 	for _, p := range allPrograms {
@@ -651,16 +655,15 @@ func preStartAttachUprobe() int32 {
 	lib := target[:colon]
 	symbol := target[colon+1:]
 
-	// Symbol must be a valid C identifier-ish token (same grammar as kprobe
-	// attach: [A-Za-z0-9_.], leading letter/underscore). This blocks attempts
-	// to smuggle a second ':' or shell/path metacharacters into the symbol.
+	// Userspace linker symbols additionally use '$' in encodings such as Rust's
+	// $LT$/$GT$. Keep ':' and shell/path metacharacters excluded.
 	if c := symbol[0]; !(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
 		api.Errorf("ebpf_proxy[attach_uprobe]: invalid symbol %q: must start with a letter or '_'", symbol)
 		return 1
 	}
 	for i := 0; i < len(symbol); i++ {
-		if !validSymbolChar(symbol[i]) {
-			api.Errorf("ebpf_proxy[attach_uprobe]: invalid symbol %q: char %q not allowed (use only [A-Za-z0-9_.])", symbol, string(symbol[i]))
+		if !validUprobeSymbolChar(symbol[i]) {
+			api.Errorf("ebpf_proxy[attach_uprobe]: invalid symbol %q: char %q not allowed (use only [A-Za-z0-9_.$])", symbol, string(symbol[i]))
 			return 1
 		}
 	}

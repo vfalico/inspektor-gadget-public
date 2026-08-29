@@ -53,6 +53,10 @@ nm --no-demangle --defined-only <binary-or-library> | grep '<stable fragment>'
 nm -D --no-demangle --defined-only <library> | grep '<stable fragment>'
 ```
 
+Legacy Rust raw symbols can contain `$LT$`, `$GT$`, and similar
+`$`-delimited components. These are part of the linker symbol and must be
+passed unchanged.
+
 Pass the complete name column to `--target=<path>:<symbol>`. `nm -C` is useful
 for identifying what a symbol means, but its output must not be copied into the
 attach command.
