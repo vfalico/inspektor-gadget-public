@@ -16,6 +16,24 @@ import (
 	"testing"
 )
 
+func TestUprobeSymbolValidationAllowsRustLegacyMangling(t *testing.T) {
+	dir := gadgetDir(t)
+	source, err := os.ReadFile(filepath.Join(dir, "go", "program.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, required := range []string{
+		"func validUprobeSymbolChar(b byte) bool",
+		"validSymbolChar(b) || b == '$'",
+		"if !validUprobeSymbolChar(symbol[i])",
+	} {
+		if !regexp.MustCompile(regexp.QuoteMeta(required)).MatchString(text) {
+			t.Fatalf("uprobe Rust-symbol validation is missing %q", required)
+		}
+	}
+}
+
 func gadgetDir(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
