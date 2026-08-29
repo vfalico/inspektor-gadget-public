@@ -31,6 +31,7 @@ func TestAllCompiledProgramsAreCapabilityControlled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	goFile, err := parser.ParseFile(token.NewFileSet(), filepath.Join(dir, "go", "program.go"), nil, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -135,5 +136,38 @@ func TestAllCompiledProgramsAreCapabilityControlled(t *testing.T) {
 	if len(duplicates) != 0 || len(uncontrolled) != 0 || len(unknown) != 0 {
 		t.Fatalf("capability inventory mismatch: duplicates=%v uncontrolled=%v unknown=%v",
 			duplicates, uncontrolled, unknown)
+	}
+}
+
+func TestFunctionFieldFitsValidatedSymbols(t *testing.T) {
+	dir := gadgetDir(t)
+	bpfSource, err := os.ReadFile(filepath.Join(dir, "program.bpf.c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	goSource, err := os.ReadFile(filepath.Join(dir, "go", "program.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	maxMatch := regexp.MustCompile(`const maxFuncLen = ([0-9]+)`).FindSubmatch(goSource)
+	fieldMatch := regexp.MustCompile(`char func\[([0-9]+)\]`).FindSubmatch(bpfSource)
+	if len(maxMatch) != 2 || len(fieldMatch) != 2 {
+		t.Fatal("cannot resolve maxFuncLen or event.func capacity")
+	}
+	maxLen, err := strconv.Atoi(string(maxMatch[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fieldLen, err := strconv.Atoi(string(fieldMatch[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fieldLen <= maxLen {
+		t.Fatalf(
+			"event.func capacity %d cannot hold max validated symbol length %d plus NUL",
+			fieldLen,
+			maxLen,
+		)
 	}
 }
