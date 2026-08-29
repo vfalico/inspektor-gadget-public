@@ -34,6 +34,9 @@ const disabled = "gadget_program_disabled"
 // maxFuncLen bounds the MCP client-supplied symbol name.
 const maxFuncLen = 128
 
+// eventFuncLabelMax reserves one byte for the fixed event field's terminating NUL.
+const eventFuncLabelMax = 39
+
 // maxUprobeTargetLen bounds the MCP client-supplied "<lib-or-path>:<symbol>" target.
 const maxUprobeTargetLen = 384
 
@@ -231,6 +234,15 @@ const anySyscall uint64 = 0xffffffff
 // validatedFunc is remembered between gadgetPreStart and gadgetInit so the
 // `attach` enricher can stamp the resolved symbol onto every event.
 var validatedFunc string
+
+func eventFuncLabel(symbol string) string {
+	if len(symbol) <= eventFuncLabelMax {
+		return symbol
+	}
+	const suffixLen = 16
+	prefixLen := eventFuncLabelMax - suffixLen - 1
+	return symbol[:prefixLen] + "~" + symbol[len(symbol)-suffixLen:]
+}
 
 // --- attach-confirmation / coverage feedback --------------------------
 //
@@ -1030,7 +1042,7 @@ func gadgetInit() int32 {
 	}
 	ds.Subscribe(func(source api.DataSource, data api.Data) {
 		if validatedFunc != "" {
-			funcF.SetString(data, validatedFunc)
+			funcF.SetString(data, eventFuncLabel(validatedFunc))
 		}
 	}, 0)
 	registerCoverageDataSource()

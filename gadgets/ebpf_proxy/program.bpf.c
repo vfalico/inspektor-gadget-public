@@ -95,9 +95,9 @@ struct event {
 	struct gadget_process proc;
 
 	enum ebpf_proxy_phase phase_raw;
-	// func is filled by the WASM enricher with the validated symbol name. Keep
-	// one byte beyond maxFuncLen for the terminating NUL.
-	char func[129];
+	// func is filled by the WASM enricher with a bounded label for the
+	// validated symbol. The full attach target remains in coverage evidence.
+	char func[40];
 	__u64 arg0;
 	__u64 arg1;
 	__u64 arg2;
