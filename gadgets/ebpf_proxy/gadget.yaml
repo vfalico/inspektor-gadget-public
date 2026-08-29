@@ -1547,3 +1547,12 @@ params:
         the target process ld.so.cache (e.g. libc, libssl, /usr/lib/x86_64-linux-gnu/libcuda.so.1);
         the right side is an exported symbol (e.g. malloc, SSL_read, cuMemAlloc_v2).
         Resolved by IG''s uprobetracer at attach time.'
+    uprobe_sample_every:
+      key: uprobe_sample_every
+      defaultValue: "1"
+      description: '[attach_uprobe] In-kernel event sampling for high-frequency symbols.
+        Emit one of every N matching hits before reserving/submitting ring-buffer
+        events. N must be >=1. Values greater than 1 require single-sided mode=uprobe
+        or mode=uretprobe; paired mode rejects sampling so entry/return semantics
+        remain exact. Output --max-entries is not a substitute because it truncates
+        after kernel emission.'

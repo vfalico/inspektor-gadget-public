@@ -626,6 +626,39 @@ GADGET_PARAM(uprobe_str_len_arg);
 const volatile __u32 uprobe_fd_arg = 0xff;
 GADGET_PARAM(uprobe_fd_arg);
 
+// [uprobe_sampling] Emit one of every N matching hits in-kernel. Output
+// truncation cannot prevent ring-buffer loss because it happens after the BPF
+// program has already submitted every event. Sampling before reserve/submit
+// keeps high-frequency attribution probes loss-free. Values greater than one
+// are accepted only for single-sided uprobe or uretprobe mode so entry/return
+// pairing semantics cannot be corrupted.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} ebpf_proxy_uprobe_sample_seq SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} uprobe_sample_every SEC(".maps");
+
+static __always_inline bool ebpf_proxy_uprobe_sample_wanted(void)
+{
+	__u32 key = 0;
+	__u64 *every = bpf_map_lookup_elem(&uprobe_sample_every, &key);
+	if (!every || *every <= 1)
+		return true;
+	__u64 *seq = bpf_map_lookup_elem(&ebpf_proxy_uprobe_sample_seq, &key);
+	if (!seq)
+		return false;
+	__u64 current = *seq;
+	*seq = current + 1;
+	return current % *every == 0;
+}
+
 SEC("uprobe/__ebpf_proxy_uprobe_dummy")
 int BPF_UPROBE(ebpf_proxy_uprobe)
 {
@@ -635,6 +668,8 @@ int BPF_UPROBE(ebpf_proxy_uprobe)
 	 * host malloc/cuda noise. The WASM control plane publishes filter_pid and
 	 * flips enabled last (ready gate) in gadgetStart(). */
 	if (!ebpf_proxy_proc_wanted())
+		return 0;
+	if (!ebpf_proxy_uprobe_sample_wanted())
 		return 0;
 	struct event *e = ebpf_proxy_new(enter);
 	if (!e)
@@ -727,6 +762,8 @@ int BPF_URETPROBE(ebpf_proxy_uretprobe, long retval)
 {
 	/* Same host-PID gate as ebpf_proxy_uprobe: keep entry/return attribution symmetric. */
 	if (!ebpf_proxy_proc_wanted())
+		return 0;
+	if (!ebpf_proxy_uprobe_sample_wanted())
 		return 0;
 	struct event *e = ebpf_proxy_new(ret);
 	if (!e)

@@ -320,6 +320,7 @@ var (
 	// gadgetStart knows to publish filter_pid for them too.
 	enrichedActive    bool
 	enrichedFilterPid uint64 // pid, or 0 == any
+	uprobeSampleEvery uint64 // attach_uprobe only; 1 == emit every event
 
 	// fs_trace-only server-side op filter. Published into
 	// the filter_fs_op BPF map in gadgetStart so the rare failing-open rows are
@@ -685,7 +686,23 @@ func preStartAttachUprobe() int32 {
 		api.Errorf("ebpf_proxy[attach_uprobe]: invalid mode %q (want uprobe, uretprobe or uprobe_uretprobe)", mode)
 		return 1
 	}
-
+	sampleEveryText, err := api.GetParamValue("uprobe_sample_every", 32)
+	if err != nil {
+		api.Errorf("ebpf_proxy[attach_uprobe]: reading uprobe_sample_every param: %s", err)
+		return 1
+	}
+	if sampleEveryText == "" {
+		sampleEveryText = "1"
+	}
+	sampleEvery, err := strconv.ParseUint(sampleEveryText, 10, 32)
+	if err != nil || sampleEvery < 1 {
+		api.Errorf("ebpf_proxy[attach_uprobe]: invalid uprobe_sample_every %q (must be an integer >= 1)", sampleEveryText)
+		return 1
+	}
+	if sampleEvery > 1 && mode == "uprobe_uretprobe" {
+		api.Errorf("ebpf_proxy[attach_uprobe]: uprobe_sample_every > 1 requires single-sided mode=uprobe or mode=uretprobe so paired-call semantics remain exact")
+		return 1
+	}
 	pid, ok := readPidParam("attach_uprobe")
 	if !ok {
 		return 1
@@ -704,8 +721,9 @@ func preStartAttachUprobe() int32 {
 	// reserving/submitting an event. pid=0 keeps the legacy host-wide behavior.
 	enrichedFilterPid = pid
 	enrichedActive = true
+	uprobeSampleEvery = sampleEvery
 	validatedFunc = symbol // stamp the symbol onto every emitted event
-	api.Infof("ebpf_proxy[attach_uprobe]: mode=%s attaching %d program(s) to %q (lib=%q symbol=%q, pid filter=%d; use --host / operator.localmanager.host=true for host processes)", mode, len(wanted), target, lib, symbol, pid)
+	api.Infof("ebpf_proxy[attach_uprobe]: mode=%s attaching %d program(s) to %q (lib=%q symbol=%q, pid filter=%d, sample every=%d; use --host / operator.localmanager.host=true for host processes)", mode, len(wanted), target, lib, symbol, pid, sampleEvery)
 	return 0
 }
 
@@ -996,6 +1014,9 @@ func gadgetStart() int32 {
 		}
 		// cuda_profile op filter (0 for the other families == CUDA_OP_FILTER_ALL).
 		if rc := putFilter("filter_cuda_op", enrichedCudaOp); rc != 0 {
+			return rc
+		}
+		if rc := putFilter("uprobe_sample_every", uprobeSampleEvery); rc != 0 {
 			return rc
 		}
 		if rc := putFilter("enabled", 1); rc != 0 {

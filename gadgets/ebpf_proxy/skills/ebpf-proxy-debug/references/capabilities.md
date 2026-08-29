@@ -13,12 +13,18 @@ carry the **inline 4-tuple** `saddr/daddr/sport/dport/sk_state/sk_family` — se
 - validate the symbol with `list_attachable` first.
 
 ### attach_uprobe — uprobe/uretprobe on a userspace symbol
-- params: `--target=<lib-or-path>:<symbol>` (e.g. `libc:malloc`, `libssl:SSL_read`), `--mode=uprobe|uretprobe|uprobe_uretprobe` (default `uprobe_uretprobe`)
+- params: `--target=<lib-or-path>:<symbol>` (e.g. `libc:malloc`, `libssl:SSL_read`), `--mode=uprobe|uretprobe|uprobe_uretprobe` (default `uprobe_uretprobe`), `--uprobe_sample_every=<N>` (default `1`)
 - `<symbol>` must be the exact raw linker symbol, not a demangled Rust/C++ display name. Discover it without demangling:
   `nm --no-demangle --defined-only <binary-or-library> | grep '<stable fragment>'`.
   For dynamic exports use `nm -D --no-demangle --defined-only`. Copy the complete
   symbol-name column into `--target`; use `nm -C` only to understand candidates,
   never as the source of the attach string.
+- For high-frequency symbols, use single-sided `--mode=uprobe` with
+  `--uprobe_sample_every=N`. Sampling occurs in-kernel before ring-buffer
+  submission, so it can prevent transport loss. `--max-entries` only limits
+  rendered/output rows and does not reduce kernel event volume. Sampling is
+  rejected with paired `uprobe_uretprobe` mode because independently dropping
+  entry/return events would invalidate pairing.
 - auto-pairs enter/return (`call_depth`), decodes a `char*` arg to `arg_str`, resolves an fd arg to the kernel socket (inline 4-tuple). See event-loop.md, connection-identity.md.
 - the WASM operator `pid` scopes ATTACH resolution; gadget `--pid` filters events.
 
