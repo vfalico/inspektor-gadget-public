@@ -23,6 +23,7 @@
 package main
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -39,6 +40,28 @@ const eventFuncLabelMax = 39
 
 // maxUprobeTargetLen bounds the MCP client-supplied "<lib-or-path>:<symbol>" target.
 const maxUprobeTargetLen = 384
+
+func validateUprobeRateParameters(mode, sampleEveryText, rollupEveryText string) (uint64, uint64, error) {
+	sampleEvery, err := strconv.ParseUint(sampleEveryText, 10, 32)
+	if err != nil || sampleEvery < 1 {
+		return 0, 0, fmt.Errorf("invalid uprobe_sample_every %q (must be an integer >= 1)", sampleEveryText)
+	}
+
+	rollupEvery, err := strconv.ParseUint(rollupEveryText, 10, 32)
+	if err != nil || rollupEvery < 1 {
+		return 0, 0, fmt.Errorf("invalid uprobe_rollup_every %q (must be an integer >= 1)", rollupEveryText)
+	}
+	if rollupEvery > 1 && sampleEvery > 1 {
+		return 0, 0, fmt.Errorf("uprobe rollup and sampling are mutually exclusive")
+	}
+	if sampleEvery > 1 && mode == "uprobe_uretprobe" {
+		return 0, 0, fmt.Errorf("uprobe_sample_every > 1 requires single-sided mode=uprobe or mode=uretprobe so paired-call semantics remain exact")
+	}
+	if rollupEvery > 1 && mode != "uprobe_uretprobe" {
+		return 0, 0, fmt.Errorf("uprobe_rollup_every > 1 requires paired mode=uprobe_uretprobe")
+	}
+	return sampleEvery, rollupEvery, nil
+}
 
 // eBPF program section names (must match SEC()/func names in program.bpf.c).
 const (
@@ -321,6 +344,7 @@ var (
 	enrichedActive    bool
 	enrichedFilterPid uint64 // pid, or 0 == any
 	uprobeSampleEvery uint64 // attach_uprobe only; 1 == emit every event
+	uprobeRollupEvery uint64 // attach_uprobe paired mode; aggregate N calls per row
 
 	// fs_trace-only server-side op filter. Published into
 	// the filter_fs_op BPF map in gadgetStart so the rare failing-open rows are
@@ -697,13 +721,17 @@ func preStartAttachUprobe() int32 {
 	if sampleEveryText == "" {
 		sampleEveryText = "1"
 	}
-	sampleEvery, err := strconv.ParseUint(sampleEveryText, 10, 32)
-	if err != nil || sampleEvery < 1 {
-		api.Errorf("ebpf_proxy[attach_uprobe]: invalid uprobe_sample_every %q (must be an integer >= 1)", sampleEveryText)
+	rollupEveryText, err := api.GetParamValue("uprobe_rollup_every", 32)
+	if err != nil {
+		api.Errorf("ebpf_proxy[attach_uprobe]: reading uprobe_rollup_every param: %s", err)
 		return 1
 	}
-	if sampleEvery > 1 && mode == "uprobe_uretprobe" {
-		api.Errorf("ebpf_proxy[attach_uprobe]: uprobe_sample_every > 1 requires single-sided mode=uprobe or mode=uretprobe so paired-call semantics remain exact")
+	if rollupEveryText == "" {
+		rollupEveryText = "1"
+	}
+	sampleEvery, rollupEvery, err := validateUprobeRateParameters(mode, sampleEveryText, rollupEveryText)
+	if err != nil {
+		api.Errorf("ebpf_proxy[attach_uprobe]: %s", err)
 		return 1
 	}
 	pid, ok := readPidParam("attach_uprobe")
@@ -725,6 +753,7 @@ func preStartAttachUprobe() int32 {
 	enrichedFilterPid = pid
 	enrichedActive = true
 	uprobeSampleEvery = sampleEvery
+	uprobeRollupEvery = rollupEvery
 	validatedFunc = symbol // stamp the symbol onto every emitted event
 	api.Infof("ebpf_proxy[attach_uprobe]: mode=%s attaching %d program(s) to %q (lib=%q symbol=%q, pid filter=%d, sample every=%d; use --host / operator.localmanager.host=true for host processes)", mode, len(wanted), target, lib, symbol, pid, sampleEvery)
 	return 0
@@ -1020,6 +1049,9 @@ func gadgetStart() int32 {
 			return rc
 		}
 		if rc := putFilter("uprobe_sample_every", uprobeSampleEvery); rc != 0 {
+			return rc
+		}
+		if rc := putFilter("uprobe_rollup_every", uprobeRollupEvery); rc != 0 {
 			return rc
 		}
 		if rc := putFilter("enabled", 1); rc != 0 {

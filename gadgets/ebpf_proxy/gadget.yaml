@@ -409,6 +409,11 @@ datasources:
           columns.hex: "true"
           columns.hidden: "true"
           description: Fifth argument (PT_REGS_PARM5) at kprobe entry
+      call_count:
+        annotations:
+          value.unit: "count"
+          description: '[uprobe_rollup] Number of completed outermost calls represented
+            by this return row; 0 on ordinary rows.'
       daddr:
         annotations:
           columns.hex: "true"
@@ -431,6 +436,12 @@ datasources:
       sk_family:
         annotations:
           description: '[per_conn_identity attach] Address family of arg0-as-sock (2=AF_INET,10=AF_INET6). 0 => arg0(PARM1) was NOT a struct sock* (regular kprobe target) — ignore the 4-tuple/state fields in that case.'
+      duration_ns:
+        annotations:
+          value.unit: "nanoseconds"
+          value.semantics: "interval_elapsed"
+          description: '[uprobe_pairing] Outermost call duration on an ordinary return
+            row, or cumulative duration for call_count calls in rollup mode.'
       stack_used:
         annotations:
           columns.width: "9"
@@ -1556,3 +1567,11 @@ params:
         or mode=uretprobe; paired mode rejects sampling so entry/return semantics
         remain exact. Output --max-entries is not a substitute because it truncates
         after kernel emission.'
+    uprobe_rollup_every:
+      key: uprobe_rollup_every
+      defaultValue: "1"
+      description: '[attach_uprobe] In-kernel outermost-call duration rollup for
+        high-frequency symbols. N must be >=1. Values greater than 1 require paired
+        mode=uprobe_uretprobe, suppress entry rows, and emit one return row per N
+        completed calls with cumulative duration_ns and call_count. Mutually exclusive
+        with uprobe_sample_every > 1.'

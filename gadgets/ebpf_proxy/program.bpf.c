@@ -104,6 +104,11 @@ struct event {
 	__u64 arg3;
 	__u64 arg4;
 	__s64 retval;
+	// [uprobe_duration_rollup] On paired uretprobe rollup rows, cumulative
+	// outermost-call duration and call count since the previous emitted row.
+	// Zero on ordinary entry/return rows.
+	gadget_duration duration_ns;
+	__u64 call_count;
 	// [per_conn_identity attach] best-effort socket identity when arg0 is a
 	// struct sock* (the dominant net-family kprobe target: tcp_*, udp_*,
 	// inet_*). sk_family=0 => arg0 was not an inet socket (ignore the 4-tuple).
@@ -145,6 +150,8 @@ static __always_inline struct event *ebpf_proxy_new(enum ebpf_proxy_phase phase)
 	e->func[0] = '\0';
 	e->arg0 = e->arg1 = e->arg2 = e->arg3 = e->arg4 = 0;
 	e->retval = 0;
+	e->duration_ns = 0;
+	e->call_count = 0;
 	e->saddr = e->daddr = 0; e->sport = e->dport = 0;
 	e->sk_state = e->sk_family = 0;
 	e->call_depth = 0;
@@ -593,7 +600,13 @@ int ebpf_proxy_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 // count (enter++ / return--), which gives automatic enter<->return pairing and
 // a per-tid recursion-depth signal. entry_sp is reserved for stack_watermark
 // (stack_watermark) and initialised here so the two items share one map.
-struct ebpf_proxy_uctx { __u32 depth; __u64 entry_sp; __u8 alarmed; };
+#define EBPF_PROXY_MAX_UPROBE_DEPTH 16
+struct ebpf_proxy_uctx {
+	__u32 depth;
+	__u64 entry_sp;
+	__u8 alarmed;
+	__u64 entry_ns[EBPF_PROXY_MAX_UPROBE_DEPTH];
+};
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
@@ -644,6 +657,60 @@ struct {
 	__type(key, __u32);
 	__type(value, __u64);
 } uprobe_sample_every SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} uprobe_rollup_every SEC(".maps");
+struct ebpf_proxy_uprobe_rollup {
+	__u64 duration_ns;
+	__u64 call_count;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct ebpf_proxy_uprobe_rollup);
+} ebpf_proxy_uprobe_rollup_state SEC(".maps");
+
+static __always_inline void ebpf_proxy_set_uprobe_entry_ns(
+	struct ebpf_proxy_uctx *state, __u32 depth, __u64 entry_ns)
+{
+	switch (depth) {
+	case 1: state->entry_ns[0] = entry_ns; break;
+	case 2: state->entry_ns[1] = entry_ns; break;
+	case 3: state->entry_ns[2] = entry_ns; break;
+	case 4: state->entry_ns[3] = entry_ns; break;
+	case 5: state->entry_ns[4] = entry_ns; break;
+	case 6: state->entry_ns[5] = entry_ns; break;
+	case 7: state->entry_ns[6] = entry_ns; break;
+	case 8: state->entry_ns[7] = entry_ns; break;
+	}
+}
+
+static __always_inline __u64 ebpf_proxy_get_uprobe_entry_ns(
+	struct ebpf_proxy_uctx *state, __u32 depth)
+{
+	switch (depth) {
+	case 1: return state->entry_ns[0];
+	case 2: return state->entry_ns[1];
+	case 3: return state->entry_ns[2];
+	case 4: return state->entry_ns[3];
+	case 5: return state->entry_ns[4];
+	case 6: return state->entry_ns[5];
+	case 7: return state->entry_ns[6];
+	case 8: return state->entry_ns[7];
+	default: return 0;
+	}
+}
+
+static __always_inline __u64 ebpf_proxy_uprobe_rollup_every(void)
+{
+	__u32 key = 0;
+	__u64 *every = bpf_map_lookup_elem(&uprobe_rollup_every, &key);
+	return every && *every ? *every : 1;
+}
 
 static __always_inline bool ebpf_proxy_uprobe_sample_wanted(void)
 {
@@ -670,6 +737,29 @@ int BPF_UPROBE(ebpf_proxy_uprobe)
 	if (!ebpf_proxy_proc_wanted())
 		return 0;
 	if (!ebpf_proxy_uprobe_sample_wanted())
+		return 0;
+	__u64 now = bpf_ktime_get_boot_ns();
+	__u64 rollup_every = ebpf_proxy_uprobe_rollup_every();
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 sp = PT_REGS_SP(ctx);
+	struct ebpf_proxy_uctx *u = bpf_map_lookup_elem(&ebpf_proxy_uctx_map, &tid);
+	__u32 depth;
+	if (!u || sp >= u->entry_sp) {
+		struct ebpf_proxy_uctx nu = {
+			.depth = 1,
+			.entry_sp = sp,
+			.alarmed = 0,
+		};
+		nu.entry_ns[0] = now;
+		bpf_map_update_elem(&ebpf_proxy_uctx_map, &tid, &nu, BPF_ANY);
+		depth = 1;
+	} else {
+		u->depth += 1;
+		depth = u->depth;
+		if (depth <= EBPF_PROXY_MAX_UPROBE_DEPTH)
+			ebpf_proxy_set_uprobe_entry_ns(u, depth, now);
+	}
+	if (rollup_every > 1)
 		return 0;
 	struct event *e = ebpf_proxy_new(enter);
 	if (!e)
@@ -722,28 +812,10 @@ int BPF_UPROBE(ebpf_proxy_uprobe)
 	// as the call chain's stack base; on deeper hits emit stack_used = base - sp
 	// and fire a one-shot alarm the first time it crosses stack_watermark_bytes.
 	{
-		__u32 tid = (__u32)bpf_get_current_pid_tgid();
-		__u64 sp = PT_REGS_SP(ctx);
-		struct ebpf_proxy_uctx *u = bpf_map_lookup_elem(&ebpf_proxy_uctx_map, &tid);
-		// [stack_watermark] Detect the OUTERMOST frame by stack GEOMETRY, not by
-		// the uretprobe unwind count. On x86-64 the stack grows DOWN, so a deeper
-		// frame always has a strictly lower SP than its caller. If we have no
-		// context OR the current SP has risen back to/above the stored chain base
-		// (u->entry_sp), the previous chain has fully unwound and this is a fresh
-		// outermost call -- even if some uretprobes were MISSED (which would
-		// otherwise leave ebpf_proxy_uctx->depth drifting upward across chains, the
-		// call_depth=21162 bug). Re-anchor: reset depth=1 and re-stamp entry_sp to
-		// this SP so call_depth is bounded per chain and stack_used is measured
-		// from the true current base, never a stale one.
-		if (!u || sp >= u->entry_sp) {
-			struct ebpf_proxy_uctx nu = { .depth = 1, .entry_sp = sp, .alarmed = 0 };
-			bpf_map_update_elem(&ebpf_proxy_uctx_map, &tid, &nu, BPF_ANY);
-			e->call_depth = 1;
+		e->call_depth = depth;
+		if (depth == 1) {
 			e->stack_used = 0;
-		} else {
-			/* sp < u->entry_sp guaranteed by the branch above */
-			u->depth += 1;
-			e->call_depth = u->depth;
+		} else if (u) {
 			__u64 used = u->entry_sp - sp;
 			e->stack_used = used;
 			if (stack_watermark_bytes && !u->alarmed &&
@@ -765,22 +837,55 @@ int BPF_URETPROBE(ebpf_proxy_uretprobe, long retval)
 		return 0;
 	if (!ebpf_proxy_uprobe_sample_wanted())
 		return 0;
-	struct event *e = ebpf_proxy_new(ret);
-	if (!e)
-		return 0;
-	e->retval = (__s64)retval;
+	__u64 now = bpf_ktime_get_boot_ns();
+	__u64 rollup_every = ebpf_proxy_uprobe_rollup_every();
+	__u64 duration = 0;
+	__u32 leaving_depth = 0;
 	// [uprobe_pairing] pair this return to the entry depth, then unwind.
 	{
 		__u32 tid = (__u32)bpf_get_current_pid_tgid();
 		struct ebpf_proxy_uctx *u = bpf_map_lookup_elem(&ebpf_proxy_uctx_map, &tid);
 		if (u) {
-			e->call_depth = u->depth;	// depth of the frame we are LEAVING
+			leaving_depth = u->depth;
+			if (leaving_depth && leaving_depth <= EBPF_PROXY_MAX_UPROBE_DEPTH)
+				duration = now - ebpf_proxy_get_uprobe_entry_ns(u, leaving_depth);
 			if (u->depth <= 1)
 				bpf_map_delete_elem(&ebpf_proxy_uctx_map, &tid);
 			else
 				u->depth -= 1;
 		}
 	}
+	if (rollup_every > 1) {
+		if (leaving_depth != 1)
+			return 0;
+		__u32 key = 0;
+		struct ebpf_proxy_uprobe_rollup *rollup =
+			bpf_map_lookup_elem(&ebpf_proxy_uprobe_rollup_state, &key);
+		if (!rollup)
+			return 0;
+		rollup->duration_ns += duration;
+		rollup->call_count += 1;
+		if (rollup->call_count < rollup_every)
+			return 0;
+		struct event *e = ebpf_proxy_new(ret);
+		if (!e)
+			return 0;
+		e->retval = (__s64)retval;
+		e->call_depth = 1;
+		e->duration_ns = rollup->duration_ns;
+		e->call_count = rollup->call_count;
+		rollup->duration_ns = 0;
+		rollup->call_count = 0;
+		gadget_submit_buf(ctx, &events, e, sizeof(*e));
+		return 0;
+	}
+	struct event *e = ebpf_proxy_new(ret);
+	if (!e)
+		return 0;
+	e->retval = (__s64)retval;
+	e->call_depth = leaving_depth;
+	e->duration_ns = duration;
+	e->call_count = leaving_depth == 1 ? 1 : 0;
 	gadget_submit_buf(ctx, &events, e, sizeof(*e));
 	return 0;
 }
