@@ -1,0 +1,30 @@
+version: 0.55.0
+name: "cuda observability"
+displayName: "cuda observability"
+category: monitoring-logging
+createdAt: "2026-10-09T07:10:00Z"
+description: Factual CUDA Driver API telemetry with explicitly enabled inference activity candidates
+logoURL: https://inspektor-gadget.io/media/brand-icon.svg
+license: ""
+homeURL: "https://inspektor-gadget.io/docs/latest/gadgets/cuda_observability/"
+containersImages:
+  - name: gadget
+    image: "ghcr.io/inspektor-gadget/gadget/cuda_observability:latest"
+    platforms:
+      - linux/amd64
+keywords:
+  - inspektor-gadget
+  - cuda
+  - gpu
+  - inference
+  - opentelemetry
+links:
+  - name: source
+    url: "https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/cuda_observability"
+install: |
+  # Run
+  ```bash
+  sudo ig run ghcr.io/inspektor-gadget/gadget/cuda_observability:latest
+  ```
+provider:
+  name: Inspektor Gadget

@@ -119,6 +119,7 @@ GADGETS ?= \
 	advise_seccomp \
 	audit_seccomp \
 	bpfstats \
+	cuda_observability \
 	deadlock \
 	fdpass \
 	fsnotify \

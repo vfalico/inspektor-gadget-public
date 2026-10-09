@@ -1,0 +1,339 @@
+name: cuda observability
+description: Factual CUDA Driver API telemetry with opt-in inference activity candidates
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/cuda_observability
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/cuda_observability
+datasources:
+  analyzer_health:
+    annotations:
+      logs.name: cuda.inference.analyzer_health
+      metrics.collect: "true"
+      metrics.implicit-counter.description: Analyzer capacity and lifecycle health
+        events
+      metrics.implicit-counter.name: cuda.inference.analyzer.health.events
+    fields:
+      close_reason:
+        annotations:
+          description: Analyzer health reason; capacity_eviction denotes deterministic
+            oldest-state eviction at the 4096-state bound.
+          metrics.type: key
+      type:
+        annotations:
+          description: Record type; analyzer_health for lifecycle/capacity health
+            events.
+          metrics.type: key
+  cuda_calls:
+    annotations:
+      logs.name: cuda.api.call
+      metrics.collect: "true"
+      metrics.implicit-counter.description: Observed CUDA Driver API call returns
+      metrics.implicit-counter.name: cuda.api.calls
+    fields:
+      block_x:
+        annotations:
+          description: Kernel block dimension X; valid only when has_function=1 for
+            a kernel launch.
+      block_y:
+        annotations:
+          description: Kernel block dimension Y; valid only when has_function=1 for
+            a kernel launch.
+      block_z:
+        annotations:
+          description: Kernel block dimension Z; valid only when has_function=1 for
+            a kernel launch.
+      bytes:
+        annotations:
+          columns.alignment: right
+          columns.width: "12"
+          description: Requested transfer or allocation byte count; zero when the
+            operation has no byte-size argument.
+          metrics.boundaries: 1,16,64,256,1024,4096,16384,65536,262144,1048576,16777216
+          metrics.description: Requested CUDA transfer or allocation bytes
+          metrics.name: cuda.api.requested_bytes
+          metrics.type: histogram
+          metrics.unit: By
+      copy_direction_raw:
+        annotations:
+          description: 'Numeric copy-direction enum: 0 none, 1 D2H, 2 H2D, 3 D2D.'
+      device:
+        annotations:
+          description: CUDA device ordinal cached from a successful context-device
+            query; valid only when has_device=1.
+      duration_raw:
+        annotations:
+          columns.width: "14"
+          description: Host-side CUDA Driver API entry-to-return latency in nanoseconds;
+            not GPU execution time.
+          metrics.boundaries: 1000,5000,10000,50000,100000,500000,1000000,5000000,10000000
+          metrics.description: Host-side CUDA Driver API duration
+          metrics.name: cuda.api.duration
+          metrics.type: histogram
+          metrics.unit: ns
+      function:
+        annotations:
+          description: Opaque CUfunction handle for kernel launches; valid only when
+            has_function=1.
+      grid_x:
+        annotations:
+          description: Kernel grid dimension X; valid only when has_function=1 for
+            a kernel launch.
+      grid_y:
+        annotations:
+          description: Kernel grid dimension Y; valid only when has_function=1 for
+            a kernel launch.
+      grid_z:
+        annotations:
+          description: Kernel grid dimension Z; valid only when has_function=1 for
+            a kernel launch.
+      has_device:
+        annotations:
+          description: 'Availability bit: 1 means device contains an observed or cached
+            CUDA device ordinal; 0 means unavailable.'
+      has_function:
+        annotations:
+          description: 'Availability bit: 1 means function and kernel geometry fields
+            are populated; 0 means unavailable.'
+      has_pointer:
+        annotations:
+          description: 'Availability bit: 1 means pointer contains an observed allocation/free
+            device pointer; 0 means unavailable.'
+      has_stream:
+        annotations:
+          description: 'Availability bit: 1 means stream contains an observed CUstream
+            or graph-launch stream handle; 0 means unavailable.'
+      operation:
+        annotations:
+          columns.width: "28"
+          description: Symbolic CUDA Driver API operation category derived from operation_raw.
+          metrics.type: key
+      operation_raw:
+        annotations:
+          columns.hidden: "true"
+          description: Numeric operation enum defined by program.bpf.c; bounded to
+            the declared CUDA operation set.
+      pointer:
+        annotations:
+          description: Opaque CUDA device pointer for allocation/free operations;
+            valid only when has_pointer=1.
+      proc:
+        annotations:
+          description: Inspektor Gadget process and container attribution for the
+            calling task; not an aggregate-map key.
+      result:
+        annotations:
+          columns.alignment: right
+          columns.width: "10"
+          description: CUDA Driver API return code; zero is CUDA_SUCCESS.
+          metrics.type: key
+      shared_mem_bytes:
+        annotations:
+          description: Dynamic shared-memory bytes requested by a kernel launch; valid
+            only when has_function=1.
+      stream:
+        annotations:
+          description: Opaque CUstream handle for asynchronous calls and graph launches;
+            valid only when has_stream=1.
+      timestamp_raw:
+        annotations:
+          columns.hidden: "true"
+          description: Boot-clock timestamp in nanoseconds captured on API return;
+            converted by IG for display/export.
+          logs.name: timestamp
+  cuda_stats:
+    annotations:
+      logs.name: cuda.api.aggregate
+    fields:
+      calls:
+        annotations:
+          description: Total observed completed CUDA calls for this operation key.
+      comm:
+        annotations:
+          description: Not populated for global aggregates; per-process command attribution
+            remains in cuda_calls.
+      duration_ns:
+        annotations:
+          description: Sum of host-side API entry-to-return latency in nanoseconds
+            for this operation key.
+      errors:
+        annotations:
+          description: Count of nonzero CUDA Driver API return codes for this operation
+            key.
+      mntns_id:
+        annotations:
+          description: Not populated for global aggregates; per-process mount namespace
+            attribution remains in cuda_calls.
+      operation_raw:
+        annotations:
+          description: Numeric operation enum and sole aggregate-map key; cardinality
+            is bounded by the declared operation set.
+      pending_update_failures:
+        annotations:
+          description: Count of failures to insert entry state into the bounded pending-call
+            map for this operation.
+      pid:
+        annotations:
+          description: Not populated for global aggregates; PID is deliberately excluded
+            from aggregate keys.
+      requested_bytes:
+        annotations:
+          description: Sum of requested transfer or allocation bytes for this operation
+            key.
+      reserve_failures:
+        annotations:
+          description: Count of raw event-buffer reservation failures after aggregate
+            accounting for this operation.
+      unmatched_returns:
+        annotations:
+          description: Count of return probes lacking matching entry state for this
+            operation.
+  effective_config:
+    annotations:
+      logs.name: cuda.inference.effective_config
+    fields:
+      config_canonical:
+        annotations:
+          description: Canonical effective state-machine parameter values used for
+            this run.
+      config_digest:
+        annotations:
+          description: SHA-256 of the canonical effective state-machine configuration.
+      preset:
+        annotations:
+          description: Explicit selected immutable preset identifier.
+  inference_activity:
+    annotations:
+      logs.name: cuda.inference.activity_candidate
+      metrics.collect: "true"
+      metrics.implicit-counter.description: Inference activity candidate records
+      metrics.implicit-counter.name: cuda.inference.activity.events
+    fields:
+      interval_candidate_ns:
+        annotations:
+          description: Interval between CUDA-derived decode candidates; not semantic
+            inter-token latency.
+          metrics.boundaries: 100000,500000,1000000,5000000,10000000,25000000,50000000,100000000
+          metrics.description: Interval between CUDA-derived decode candidates
+          metrics.name: cuda.inference.decode_interval_candidate
+          metrics.type: histogram
+          metrics.unit: ns
+      phase:
+        annotations:
+          description: Heuristic state-machine phase.
+          metrics.type: key
+      ttft_candidate_ns:
+        annotations:
+          description: Delay from observed CUDA activity onset to first decode candidate;
+            not semantic TTFT.
+          metrics.boundaries: 1000000,5000000,10000000,25000000,50000000,100000000,250000000,1000000000
+          metrics.description: First decode candidate delay from observed CUDA activity
+            onset
+          metrics.name: cuda.inference.ttft_candidate
+          metrics.type: histogram
+          metrics.unit: ns
+      type:
+        annotations:
+          description: 'Candidate record type: activity_boundary, first_decode_candidate,
+            or decode_candidate.'
+          metrics.type: key
+  inference_summary:
+    annotations:
+      logs.name: cuda.inference.activity_summary
+      metrics.collect: "true"
+      metrics.implicit-counter.description: Closed inference activity candidates
+      metrics.implicit-counter.name: cuda.inference.activities
+    fields:
+      candidate_count:
+        annotations:
+          description: Number of CUDA-derived decode candidates in the closed activity;
+            not output-token count.
+          metrics.boundaries: 1,2,4,8,16,32,64,128,256,512
+          metrics.name: cuda.inference.decode_candidate_count
+          metrics.type: histogram
+      close_reason:
+        annotations:
+          description: Why the bounded activity state closed.
+          metrics.type: key
+      duration_ns:
+        annotations:
+          description: Observed activity lifetime in nanoseconds.
+          metrics.boundaries: 1000000,10000000,100000000,1000000000,10000000000,60000000000
+          metrics.name: cuda.inference.activity_duration
+          metrics.type: histogram
+          metrics.unit: ns
+      phase:
+        annotations:
+          description: Final heuristic state-machine phase.
+          metrics.type: key
+params:
+  ebpf:
+    targ_comm:
+      key: targ_comm
+      defaultValue: ""
+      description: Process command name filter; Linux task comm is limited to 15 visible
+        bytes
+    targ_gid:
+      key: targ_gid
+      defaultValue: ""
+      description: Effective group ID filter
+    targ_pid:
+      key: targ_pid
+      defaultValue: ""
+      description: Host process ID filter
+    targ_tid:
+      key: targ_tid
+      defaultValue: ""
+      description: Host thread ID filter
+    targ_uid:
+      key: targ_uid
+      defaultValue: ""
+      description: Effective user ID filter
+  wasm:
+    candidate-gap:
+      key: candidate-gap
+      defaultValue: ""
+      description: Override quiet gap that qualifies a decode candidate (Go duration)
+    candidate-max-copy-bytes:
+      key: candidate-max-copy-bytes
+      defaultValue: ""
+      description: Override maximum D2H bytes eligible as candidate evidence
+    decode-min-launches:
+      key: decode-min-launches
+      defaultValue: ""
+      description: Override minimum launches in a decode-candidate interval
+    dedup-window:
+      key: dedup-window
+      defaultValue: ""
+      description: Override anchored candidate deduplication window (Go duration)
+    heuristics:
+      key: heuristics
+      defaultValue: "false"
+      description: Enable bounded inference activity candidate analysis; raw telemetry
+        is always unchanged
+    max-activity-duration:
+      key: max-activity-duration
+      defaultValue: ""
+      description: Override maximum activity lifetime (Go duration)
+    min-activity-offset:
+      key: min-activity-offset
+      defaultValue: ""
+      description: Override minimum time after activity onset before decode qualification
+    prefill-min-copies:
+      key: prefill-min-copies
+      defaultValue: ""
+      description: Override minimum prefill copy observations
+    prefill-min-launches:
+      key: prefill-min-launches
+      defaultValue: ""
+      description: Override minimum prefill launch observations
+    preset:
+      key: preset
+      defaultValue: generic-conservative-v1
+      description: Exact immutable preset identifier; no process-name auto-detection
+    request-gap:
+      key: request-gap
+      defaultValue: ""
+      description: Override inactivity gap that closes an activity candidate (Go duration)
+    state-timeout:
+      key: state-timeout
+      defaultValue: ""
+      description: Override inactive-state timeout (Go duration)

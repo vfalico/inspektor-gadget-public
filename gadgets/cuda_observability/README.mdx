@@ -1,0 +1,180 @@
+---
+title: cuda_observability
+sidebar_position: 0
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# cuda_observability
+
+The `cuda_observability` gadget records factual CUDA Driver API returns and can
+optionally derive bounded inference-activity timing candidates from launch and
+copy patterns.
+
+Raw `cuda_calls` output is unchanged when heuristics are enabled. The
+`duration_raw` field is host API entry-to-return latency, not GPU execution
+time. Candidate fields are not semantic TTFT, inter-token latency, token
+counts, request IDs, or proof of GPU completion.
+
+## Requirements
+
+- Linux with eBPF privileges.
+- An NVIDIA driver exposing the traced CUDA Driver API symbols.
+- Host processes require `--host`; container workloads can be selected with
+  the standard container filters.
+
+## Getting started
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl gadget run ghcr.io/inspektor-gadget/gadget/cuda_observability:%IG_TAG% [flags]
+        ```
+    </TabItem>
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ sudo ig run ghcr.io/inspektor-gadget/gadget/cuda_observability:%IG_TAG% [flags]
+        ```
+    </TabItem>
+</Tabs>
+
+The default mode emits factual CUDA calls:
+
+```bash
+$ sudo ig run ghcr.io/inspektor-gadget/gadget/cuda_observability:%IG_TAG% \
+    --host -o json
+```
+
+Enable inference candidates explicitly:
+
+```bash
+$ sudo ig run ghcr.io/inspektor-gadget/gadget/cuda_observability:%IG_TAG% \
+    --host -o json \
+    --heuristics=true \
+    --preset=generic-conservative-v1
+```
+
+The first heuristic record includes the effective preset, canonical
+configuration, and its SHA-256 digest.
+
+## Raw telemetry
+
+The gadget traces selected CUDA Driver API entry and return points, including:
+
+- kernel and graph launches;
+- host-to-device, device-to-host, and device-to-device copies;
+- device-memory allocations and frees;
+- stream, context, and event synchronization; and
+- context device lookup.
+
+Each `cuda_calls` record contains the return code, host-side duration, operation
+metadata, and Inspektor Gadget process/container attribution. Bounded aggregate
+rows report call, error, byte, duration, unmatched-return, map-update, and
+buffer-reservation counts by operation.
+
+## Heuristic candidates
+
+Heuristics are disabled by default. When enabled, the Wasm analyzer groups
+successful launch and bounded-copy observations into per-process activity
+candidates. It emits:
+
+- `inference_activity`: activity boundaries, first-decode candidates, and
+  repeated-decode candidates;
+- `inference_summary`: bounded activity summaries;
+- `effective_config`: the exact configuration used for the run; and
+- `analyzer_health`: capacity-eviction events.
+
+State is bounded to 4096 active processes. The oldest state is evicted
+deterministically when the bound is reached.
+
+Use the generic preset unless a workload-specific preset exactly matches the
+serving stack, model, GPU, and request shape it names. Process names never
+select a preset automatically.
+
+## OpenTelemetry
+
+Datasource annotations expose bounded metrics and complete log records.
+Important metric names include:
+
+- `cuda.api.calls`;
+- `cuda.api.duration`;
+- `cuda.api.requested_bytes`;
+- `cuda.inference.activity.events`;
+- `cuda.inference.activities`;
+- `cuda.inference.ttft_candidate`;
+- `cuda.inference.decode_interval_candidate`;
+- `cuda.inference.decode_candidate_count`; and
+- `cuda.inference.activity_duration`.
+
+Candidate metric names deliberately retain the `_candidate` suffix. They must
+not be relabeled as serving-level TTFT or inter-token latency.
+
+## Parameters
+
+### `--heuristics`
+
+Enable bounded inference-activity candidate analysis.
+
+Default value: `"false"`
+
+### `--preset`
+
+Select an immutable analyzer preset. The generic preset is suitable for initial
+observation; stack-specific presets are valid only for their named stack.
+
+Default value: `"generic-conservative-v1"`
+
+### `--request-gap`
+
+Override the inactivity gap that closes an activity candidate as a Go duration.
+
+### `--candidate-gap`
+
+Override the quiet gap that qualifies a decode candidate as a Go duration.
+
+### `--dedup-window`
+
+Override the anchored candidate de-duplication window as a Go duration.
+
+### `--prefill-min-launches`
+
+Override the minimum observed prefill launches.
+
+### `--prefill-min-copies`
+
+Override the minimum observed prefill copies.
+
+### `--decode-min-launches`
+
+Override the minimum launches in a decode-candidate interval.
+
+### `--candidate-max-copy-bytes`
+
+Override the maximum device-to-host copy size eligible as candidate evidence.
+
+### `--min-activity-offset`
+
+Override the minimum time after activity onset before decode qualification.
+
+### `--state-timeout`
+
+Override the inactive-state timeout as a Go duration.
+
+### `--max-activity-duration`
+
+Override the maximum activity lifetime as a Go duration.
+
+## Limitations
+
+1. CUDA host calls are asynchronous with respect to GPU execution. This gadget
+   does not measure kernel completion or GPU hardware occupancy.
+2. Candidate boundaries are inferred from CUDA call timing and cannot identify
+   semantic requests or tokens.
+3. Concurrent requests in one process can overlap in the same process-scoped
+   state. Use an independent request/wire timeline for semantic comparison.
+4. Presets encode assumptions about a serving stack and workload. A preset may
+   be inaccurate after changing model, batching, scheduler, GPU, or software
+   version.
+5. Missing uprobes, event-buffer pressure, or analyzer-capacity eviction can
+   reduce observations. Check aggregate and analyzer-health records.
