@@ -114,9 +114,9 @@ rows report call, error, byte, duration, unmatched-return, map-update, and
 buffer-reservation counts by operation.
 
 Raw CUDA calls can arrive in large bursts. Each attached eBPF instance therefore
-uses a 32 MiB ring buffer for `cuda_calls`; the independent request-marker and
+uses a 128 MiB ring buffer for `cuda_calls`; the independent request-marker and
 process-exit buffers remain smaller. Kernel memory scales with the number of
-attached instances, so eight attachments reserve about 256 MiB for raw CUDA
+attached instances, so eight attachments reserve about 1 GiB for raw CUDA
 events. Custom source builds may override the power-of-two
 `CUDA_OBSERVABILITY_EVENT_RING_BYTES` compile definition, with a minimum of
 1 MiB. A nonzero `reserve_failures` count means raw records were lost and any
