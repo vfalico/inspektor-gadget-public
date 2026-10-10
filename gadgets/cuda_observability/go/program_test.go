@@ -43,3 +43,54 @@ func TestEmitRoutingCoversAllRecordKinds(t *testing.T) {
 		}
 	}
 }
+
+func TestTransitionV3PresetFreezesPairCoalescing(t *testing.T) {
+	const v2 = "vllm-0.10.2-qwen2.5-0.5b-a100-sequential-transition-v2"
+	const v3 = "vllm-0.10.2-qwen2.5-0.5b-a100-sequential-transition-v3"
+	previous, ok := preset(v2)
+	if !ok {
+		t.Fatalf("missing preset %q", v2)
+	}
+	if previous.CandidatePairWindowNS != 0 {
+		t.Fatalf("v2 preset changed: %#v", previous)
+	}
+	current, ok := preset(v3)
+	if !ok {
+		t.Fatalf("missing preset %q", v3)
+	}
+	if current.RequestGapNS != 12_500_000 ||
+		current.CandidateGapNS != 300_000 ||
+		current.DedupWindowNS != 2_000_000 ||
+		current.PrefillMinLaunches != 1 ||
+		current.PrefillMinCopies != 0 ||
+		current.DecodeMinLaunches != 0 ||
+		current.CandidateMaxCopyBytes != 1_048_576 ||
+		current.MinActivityOffsetNS != 0 ||
+		current.StateTimeoutNS != 5_000_000_000 ||
+		current.MaxActivityDurationNS != 120_000_000_000 ||
+		current.CandidatePreviousOperationMask != 17 ||
+		current.CandidateCurrentOperationMask != 64 ||
+		current.CandidatePairWindowNS != 3_000_000 {
+		t.Fatalf("unexpected v3 preset: %#v", current)
+	}
+	const wantCanonical = "preset=" + v3 +
+		";request_gap_ns=12500000" +
+		";candidate_gap_ns=300000" +
+		";dedup_window_ns=2000000" +
+		";prefill_min_launches=1" +
+		";prefill_min_copies=0" +
+		";decode_min_launches=0" +
+		";candidate_max_copy_bytes=1048576" +
+		";min_activity_offset_ns=0" +
+		";state_timeout_ns=5000000000" +
+		";max_activity_duration_ns=120000000000" +
+		";candidate_previous_operation_mask=17" +
+		";candidate_current_operation_mask=64" +
+		";candidate_pair_window_ns=3000000"
+	if got := current.Canonical(); got != wantCanonical {
+		t.Fatalf("canonical=%q want=%q", got, wantCanonical)
+	}
+	if err := current.Validate(); err != nil {
+		t.Fatalf("v3 preset validation: %v", err)
+	}
+}

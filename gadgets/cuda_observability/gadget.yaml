@@ -4,6 +4,46 @@ homepageURL: https://inspektor-gadget.io/
 documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/cuda_observability
 sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/cuda_observability
 datasources:
+  correlation_loss:
+    annotations:
+      logs.name: cuda.correlation.capture_footer
+    fields:
+      cuda_completed:
+        annotations:
+          description: Matched CUDA returns completed during the capture.
+      cuda_emitted:
+        annotations:
+          description: CUDA return records successfully submitted to the event buffer.
+      exit_attempts:
+        annotations:
+          description: Tracked marker-process leader exits observed.
+      exit_emitted:
+        annotations:
+          description: Process-exit records successfully submitted.
+      exit_reserve_failures:
+        annotations:
+          description: Process-exit records lost to event-buffer reservation failure.
+      generation:
+        annotations:
+          description: Final monotonic loss generation used to reject incomplete offline correlation captures.
+      marker_accepted:
+        annotations:
+          description: Marker transitions accepted by the locked kernel state machine.
+      marker_emitted:
+        annotations:
+          description: Marker records successfully submitted.
+      marker_invocations:
+        annotations:
+          description: Marker function invocations observed after gadget filtering.
+      marker_rejected:
+        annotations:
+          description: Marker transitions rejected and made fail-closed by the kernel state machine.
+      marker_reserve_failures:
+        annotations:
+          description: Marker records lost to event-buffer reservation failure.
+      state_insert_failures:
+        annotations:
+          description: TGID request-state insertion failures, including map capacity.
   analyzer_health:
     annotations:
       logs.name: cuda.inference.analyzer_health
@@ -15,7 +55,8 @@ datasources:
       close_reason:
         annotations:
           description: Analyzer health reason; capacity_eviction denotes deterministic
-            oldest-state eviction at the 4096-state bound.
+            oldest-state eviction at the 4096-state bound, while unresolved_launch_*
+            records an unconfirmed launch candidate dropped at a factual boundary.
           metrics.type: key
       type:
         annotations:
@@ -101,6 +142,9 @@ datasources:
         annotations:
           description: 'Availability bit: 1 means stream contains an observed CUstream
             or graph-launch stream handle; 0 means unavailable.'
+      loss_generation:
+        annotations:
+          description: Monotonic global generation incremented on CUDA or correlation event loss.
       operation:
         annotations:
           columns.width: "28"
@@ -111,6 +155,31 @@ datasources:
           columns.hidden: "true"
           description: Numeric operation enum defined by program.bpf.c; bounded to
             the declared CUDA operation set.
+      request_context_state:
+        annotations:
+          columns.hidden: "true"
+          description: 'Optional marker context state: 0 no ready, 1 valid inactive,
+            2 valid active, 3 invalid epoch, 4 state unavailable.'
+      request_id_hi:
+        annotations:
+          columns.hidden: "true"
+          description: High 64 bits of the active pseudonymous request ID; nonzero only for valid active context.
+      request_id_lo:
+        annotations:
+          columns.hidden: "true"
+          description: Low 64 bits of the active pseudonymous request ID; nonzero only for valid active context.
+      request_loss_generation:
+        annotations:
+          columns.hidden: "true"
+          description: Correlation loss generation observed when the active request began.
+      request_process_epoch:
+        annotations:
+          columns.hidden: "true"
+          description: Marker process epoch copied atomically with request context.
+      request_sequence:
+        annotations:
+          columns.hidden: "true"
+          description: Per-TGID CUDA-return sequence assigned under the request-state lock for deterministic offline replay.
       pointer:
         annotations:
           description: Opaque CUDA device pointer for allocation/free operations;
@@ -264,6 +333,121 @@ datasources:
         annotations:
           description: Final heuristic state-machine phase.
           metrics.type: key
+  request_correlation_health:
+    annotations:
+      logs.name: cuda.request.correlation_health
+      metrics.collect: "true"
+      metrics.implicit-counter.description: Fail-closed request marker lifecycle diagnostics
+      metrics.implicit-counter.name: cuda.request.correlation.health.events
+    fields:
+      reason:
+        annotations:
+          description: Validation failure or lifecycle reason that prevented request attribution.
+          metrics.type: key
+      type:
+        annotations:
+          description: Record type; request_correlation_health for bounded diagnostics.
+          metrics.type: key
+  request_intervals:
+    annotations:
+      logs.name: cuda.request.interval
+      metrics.collect: "true"
+      metrics.implicit-counter.description: Validated request lifecycle intervals
+      metrics.implicit-counter.name: cuda.request.intervals
+    fields:
+      close_reason:
+        annotations:
+          description: Validated lifecycle close reason; natural or abort.
+          metrics.type: key
+      duration_ns:
+        annotations:
+          description: Scheduler lifecycle duration from START through END; not GPU completion time.
+          metrics.boundaries: 1000000,10000000,100000000,1000000000,10000000000,60000000000
+          metrics.name: cuda.request.lifecycle_duration
+          metrics.type: histogram
+          metrics.unit: ns
+      request_id_hi:
+        annotations:
+          description: High 64 bits of the domain-separated pseudonymous request identifier.
+      request_id_lo:
+        annotations:
+          description: Low 64 bits of the domain-separated pseudonymous request identifier.
+      tid:
+        annotations:
+          description: Host thread ID that emitted the accepted lifecycle markers and CUDA returns.
+      type:
+        annotations:
+          description: Record type; request_interval for a watermark-finalized valid lifecycle.
+          metrics.type: key
+  request_marker_stats:
+    annotations:
+      logs.name: cuda.request.marker_stats
+    fields:
+      reserve_failures:
+        annotations:
+          description: Request marker records dropped because the bounded event buffer was full.
+  request_process_exits:
+    annotations:
+      logs.name: cuda.request.process_exit
+    fields:
+      proc:
+        annotations:
+          description: Host process attribution for the exiting marker-emitting TGID.
+      process_epoch:
+        annotations:
+          description: Marker process epoch captured from bounded BPF state.
+      loss_generation:
+        annotations:
+          description: Monotonic global generation observed when the marker process exited.
+      timestamp_raw:
+        annotations:
+          columns.hidden: "true"
+          description: Boot-clock timestamp captured when the marker-emitting process exits.
+          logs.name: timestamp
+  request_markers:
+    annotations:
+      logs.name: cuda.request.marker
+    fields:
+      flags:
+        annotations:
+          description: Protocol flags; version 1 requires zero.
+      phase_raw:
+        annotations:
+          description: 'Marker phase: 1 READY, 2 START, 3 END, 4 ORPHAN.'
+      request_sequence:
+        annotations:
+          description: Final request-local emitted CUDA sequence for accepted END/ORPHAN;
+            zero for READY/START.
+      transition_accepted:
+        annotations:
+          description: One when the kernel request-state transition was accepted;
+            zero when it failed closed.
+      loss_generation:
+        annotations:
+          description: Monotonic global generation observed when this lifecycle marker was captured.
+      proc:
+        annotations:
+          description: Inspektor Gadget host process attribution used to join markers and CUDA activity by TGID.
+      process_epoch:
+        annotations:
+          description: Random process-start epoch used to reject PID reuse and stale lifecycle state.
+      protocol_version:
+        annotations:
+          description: Marker protocol version derived from the ig_gpu_request_marker_v1 symbol.
+      reason:
+        annotations:
+          description: 'Marker reason: 0 none, 1 natural, 2 abort, 3 shutdown/orphan.'
+      request_id_hi:
+        annotations:
+          description: High 64 bits of the domain-separated pseudonymous request identifier.
+      request_id_lo:
+        annotations:
+          description: Low 64 bits of the domain-separated pseudonymous request identifier.
+      timestamp_raw:
+        annotations:
+          columns.hidden: "true"
+          description: Boot-clock timestamp captured by BPF at marker function entry.
+          logs.name: timestamp
 params:
   ebpf:
     targ_comm:
@@ -296,6 +480,12 @@ params:
       key: candidate-max-copy-bytes
       defaultValue: ""
       description: Override maximum D2H bytes eligible as candidate evidence
+    candidate-pair-window:
+      key: candidate-pair-window
+      defaultValue: ""
+      description: Experimental default-off launch-to-D2H candidate coalescing window
+        (Go duration); valid only with transition-v2/v3 operation masks and
+        decode-min-launches=0
     decode-min-launches:
       key: decode-min-launches
       defaultValue: ""
@@ -329,6 +519,18 @@ params:
       key: preset
       defaultValue: generic-conservative-v1
       description: Exact immutable preset identifier; no process-name auto-detection
+    request-marker-library:
+      key: request-marker-library
+      defaultValue: ""
+      description: Absolute marker library path; empty keeps request correlation disabled
+    request-marker-reorder-window:
+      key: request-marker-reorder-window
+      defaultValue: 50ms
+      description: Bounded cross-datasource marker reorder window (Go duration)
+    request-marker-state-timeout:
+      key: request-marker-state-timeout
+      defaultValue: 5m
+      description: Maximum open marker lifecycle duration before fail-closed invalidation
     request-gap:
       key: request-gap
       defaultValue: ""

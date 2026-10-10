@@ -14,6 +14,7 @@
 #define MAX_PENDING_CALLS 8192
 #define MAX_STAT_ROWS 4096
 #define CUDA_DEVICE_UNKNOWN (-1)
+#define REQUEST_MARKER_PROTOCOL_V1 1
 
 enum cuda_operation {
 	CUDA_OP_LAUNCH_KERNEL,
@@ -89,6 +90,13 @@ struct event {
 	__s32 result;
 	enum cuda_operation operation_raw;
 	enum cuda_copy_direction copy_direction_raw;
+	__u64 loss_generation;
+	__u64 request_process_epoch;
+	__u64 request_id_hi;
+	__u64 request_id_lo;
+	__u64 request_sequence;
+	__u64 request_loss_generation;
+	__u32 request_context_state;
 };
 
 struct stat_key {
@@ -103,6 +111,76 @@ struct cuda_stat {
 	gadget_counter__u64 unmatched_returns;
 	gadget_counter__u64 reserve_failures;
 	gadget_counter__u64 pending_update_failures;
+};
+
+enum request_marker_phase {
+	REQUEST_MARKER_READY = 1,
+	REQUEST_MARKER_START = 2,
+	REQUEST_MARKER_END = 3,
+	REQUEST_MARKER_ORPHAN = 4,
+};
+
+struct request_marker_event {
+	gadget_timestamp timestamp_raw;
+	struct gadget_process proc;
+	__u64 process_epoch;
+	__u64 request_id_hi;
+	__u64 request_id_lo;
+	__u64 request_sequence;
+	__u32 protocol_version;
+	__u32 phase_raw;
+	__u32 flags;
+	__u32 reason;
+	__u32 transition_accepted;
+	__u64 loss_generation;
+};
+
+struct request_marker_stat {
+	gadget_counter__u64 reserve_failures;
+};
+
+enum request_context_state {
+	REQUEST_CONTEXT_NO_READY = 0,
+	REQUEST_CONTEXT_INACTIVE_VALID = 1,
+	REQUEST_CONTEXT_ACTIVE_VALID = 2,
+	REQUEST_CONTEXT_EPOCH_INVALID = 3,
+	REQUEST_CONTEXT_STATE_UNAVAILABLE = 4,
+};
+
+struct request_process_state {
+	__u64 process_epoch;
+	__u64 request_id_hi;
+	__u64 request_id_lo;
+	__u64 request_sequence;
+	__u64 loss_generation;
+	__u32 context_state;
+	__u32 cuda_depth;
+};
+
+struct request_process_exit_event {
+	gadget_timestamp timestamp_raw;
+	struct gadget_process proc;
+	__u64 process_epoch;
+	__u64 loss_generation;
+};
+
+struct correlation_loss_state {
+	__u64 generation;
+	__u64 cuda_completed;
+	__u64 cuda_emitted;
+	__u64 marker_invocations;
+	__u64 marker_accepted;
+	__u64 marker_rejected;
+	__u64 marker_emitted;
+	__u64 marker_reserve_failures;
+	__u64 state_insert_failures;
+	__u64 exit_attempts;
+	__u64 exit_emitted;
+	__u64 exit_reserve_failures;
+};
+
+struct singleton_key {
+	__u32 key;
 };
 
 struct {
@@ -121,14 +199,57 @@ struct {
 GADGET_MAPITER(cuda_stats, cuda_stats);
 
 struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key, struct singleton_key);
+	__type(value, struct request_marker_stat);
+} request_marker_stats SEC(".maps");
+GADGET_MAPITER(request_marker_stats, request_marker_stats);
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key, struct singleton_key);
+	__type(value, struct correlation_loss_state);
+} correlation_loss SEC(".maps");
+GADGET_MAPITER(correlation_loss, correlation_loss);
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u64);
+	__type(value, struct request_process_state);
+} request_processes SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 4096);
 	__type(key, __u32);
 	__type(value, __s32);
 } process_devices SEC(".maps");
 
-GADGET_TRACER_MAP(events, 1024 * 1024);
+#ifndef CUDA_OBSERVABILITY_EVENT_RING_BYTES
+#define CUDA_OBSERVABILITY_EVENT_RING_BYTES (16 * 1024 * 1024)
+#endif
+
+#if CUDA_OBSERVABILITY_EVENT_RING_BYTES < (1024 * 1024)
+#error "CUDA_OBSERVABILITY_EVENT_RING_BYTES must be at least 1 MiB"
+#endif
+
+#if (CUDA_OBSERVABILITY_EVENT_RING_BYTES & \
+     (CUDA_OBSERVABILITY_EVENT_RING_BYTES - 1)) != 0
+#error "CUDA_OBSERVABILITY_EVENT_RING_BYTES must be a power of two"
+#endif
+
+GADGET_TRACER_MAP(events, CUDA_OBSERVABILITY_EVENT_RING_BYTES);
 GADGET_TRACER(cuda_calls, events, event);
+
+GADGET_TRACER_MAP(request_marker_events, 256 * 1024);
+GADGET_TRACER(request_markers, request_marker_events, request_marker_event);
+
+GADGET_TRACER_MAP(request_process_exit_events, 64 * 1024);
+GADGET_TRACER(request_process_exits, request_process_exit_events,
+	      request_process_exit_event);
 
 static __always_inline struct cuda_stat *get_stat(enum cuda_operation op)
 {
@@ -141,7 +262,90 @@ static __always_inline struct cuda_stat *get_stat(enum cuda_operation op)
 		bpf_map_update_elem(&cuda_stats, &key, &zero, BPF_NOEXIST);
 		s = bpf_map_lookup_elem(&cuda_stats, &key);
 	}
+
 	return s;
+}
+
+static __always_inline struct correlation_loss_state *correlation_stats(void)
+{
+	struct singleton_key key = {};
+	struct correlation_loss_state *state =
+		bpf_map_lookup_elem(&correlation_loss, &key);
+
+	if (!state) {
+		struct correlation_loss_state zero = {};
+		bpf_map_update_elem(&correlation_loss, &key, &zero, BPF_NOEXIST);
+		state = bpf_map_lookup_elem(&correlation_loss, &key);
+	}
+	return state;
+}
+
+static __always_inline __u64 loss_generation(void)
+{
+	struct correlation_loss_state *state = correlation_stats();
+
+	return state ? state->generation : 0;
+}
+
+static __always_inline void record_correlation_loss(void)
+{
+	struct correlation_loss_state *state = correlation_stats();
+
+	if (state)
+		__sync_fetch_and_add(&state->generation, 1);
+}
+
+static __always_inline void request_cuda_enter(__u64 pid_tgid)
+{
+	struct request_process_state *state =
+		bpf_map_lookup_elem(&request_processes, &pid_tgid);
+
+	if (!state)
+		return;
+	if (state->cuda_depth == (__u32)-1) {
+		state->context_state = REQUEST_CONTEXT_EPOCH_INVALID;
+		return;
+	}
+	state->cuda_depth++;
+}
+
+static __always_inline void snapshot_request_context(__u64 pid_tgid,
+						      struct event *event)
+{
+	struct request_process_state *state =
+		bpf_map_lookup_elem(&request_processes, &pid_tgid);
+
+	event->request_context_state = REQUEST_CONTEXT_STATE_UNAVAILABLE;
+	if (!state)
+		return;
+	if (state->cuda_depth == 0) {
+		state->context_state = REQUEST_CONTEXT_EPOCH_INVALID;
+		return;
+	}
+	state->cuda_depth--;
+	state->request_sequence++;
+	event->request_sequence = state->request_sequence;
+	event->request_process_epoch = state->process_epoch;
+	event->request_context_state = state->context_state;
+	event->request_loss_generation = state->loss_generation;
+	if (state->context_state == REQUEST_CONTEXT_ACTIVE_VALID) {
+		event->request_id_hi = state->request_id_hi;
+		event->request_id_lo = state->request_id_lo;
+	}
+}
+
+static __always_inline void unwind_request_cuda(__u64 pid_tgid)
+{
+	struct request_process_state *state =
+		bpf_map_lookup_elem(&request_processes, &pid_tgid);
+
+	if (!state)
+		return;
+	if (state->cuda_depth == 0) {
+		state->context_state = REQUEST_CONTEXT_EPOCH_INVALID;
+		return;
+	}
+	state->cuda_depth--;
 }
 
 static __always_inline int call_enter(struct pending_call *pending)
@@ -160,6 +364,9 @@ static __always_inline int call_enter(struct pending_call *pending)
 		struct cuda_stat *s = get_stat(pending->operation);
 		if (s)
 			__sync_fetch_and_add(&s->pending_update_failures, 1);
+		record_correlation_loss();
+	} else {
+		request_cuda_enter(key.pid_tgid);
 	}
 	return 0;
 }
@@ -174,6 +381,7 @@ static __always_inline int call_exit(struct pt_regs *ctx,
 	struct pending_call *stored;
 	struct pending_call call;
 	struct cuda_stat *s;
+	struct correlation_loss_state *capture;
 	struct event *event;
 	__u64 now, timestamp_boot, duration;
 	__s32 result = (__s32)PT_REGS_RC(ctx);
@@ -185,10 +393,14 @@ static __always_inline int call_exit(struct pt_regs *ctx,
 		s = get_stat(expected);
 		if (s)
 			__sync_fetch_and_add(&s->unmatched_returns, 1);
+		record_correlation_loss();
 		return 0;
 	}
 	call = *stored;
 	bpf_map_delete_elem(&pending_calls, &key);
+	capture = correlation_stats();
+	if (capture)
+		__sync_fetch_and_add(&capture->cuda_completed, 1);
 	now = bpf_ktime_get_ns();
 	timestamp_boot = bpf_ktime_get_boot_ns();
 	duration = now - call.start_ns;
@@ -220,8 +432,10 @@ static __always_inline int call_exit(struct pt_regs *ctx,
 
 	event = gadget_reserve_buf(&events, sizeof(*event));
 	if (!event) {
+		unwind_request_cuda(key.pid_tgid);
 		if (s)
 			__sync_fetch_and_add(&s->reserve_failures, 1);
+		record_correlation_loss();
 		return 0;
 	}
 	__builtin_memset(event, 0, sizeof(*event));
@@ -246,8 +460,16 @@ static __always_inline int call_exit(struct pt_regs *ctx,
 	event->result = result;
 	event->operation_raw = call.operation;
 	event->copy_direction_raw = call.copy_direction;
+	event->loss_generation = loss_generation();
+	snapshot_request_context(key.pid_tgid, event);
 	gadget_process_populate(&event->proc);
-	gadget_submit_buf(ctx, &events, event, sizeof(*event));
+	if (gadget_submit_buf(ctx, &events, event, sizeof(*event))) {
+		if (s)
+			__sync_fetch_and_add(&s->reserve_failures, 1);
+		record_correlation_loss();
+	} else if (capture) {
+		__sync_fetch_and_add(&capture->cuda_emitted, 1);
+	}
 	return 0;
 }
 
@@ -256,12 +478,189 @@ int trace_sched_process_exit(void *ctx)
 {
 	struct call_key key = { .pid_tgid = bpf_get_current_pid_tgid() };
 	__u32 pid = (__u32)(key.pid_tgid >> 32);
+	struct request_process_state *request_process;
+	struct request_process_exit_event *exit_event;
+	struct correlation_loss_state *capture;
+	__u64 request_process_epoch;
 #pragma unroll
 	for (int operation = 0; operation < CUDA_OP_MAX; operation++) {
 		key.operation = operation;
 		bpf_map_delete_elem(&pending_calls, &key);
 	}
 	bpf_map_delete_elem(&process_devices, &pid);
+	request_process = bpf_map_lookup_elem(&request_processes, &key.pid_tgid);
+	if (!request_process)
+		return 0;
+	capture = correlation_stats();
+	if (capture)
+		__sync_fetch_and_add(&capture->exit_attempts, 1);
+	request_process_epoch = request_process->process_epoch;
+	request_process->context_state = REQUEST_CONTEXT_EPOCH_INVALID;
+	exit_event = gadget_reserve_buf(&request_process_exit_events,
+					sizeof(*exit_event));
+	if (exit_event) {
+		__builtin_memset(exit_event, 0, sizeof(*exit_event));
+		exit_event->timestamp_raw = bpf_ktime_get_boot_ns();
+		exit_event->process_epoch = request_process_epoch;
+		exit_event->loss_generation = loss_generation();
+		gadget_process_populate(&exit_event->proc);
+		if (gadget_submit_buf(ctx, &request_process_exit_events,
+				      exit_event, sizeof(*exit_event))) {
+			if (capture)
+				__sync_fetch_and_add(&capture->exit_reserve_failures,
+						     1);
+			record_correlation_loss();
+		} else if (capture) {
+			__sync_fetch_and_add(&capture->exit_emitted, 1);
+		}
+	} else {
+		if (capture)
+			__sync_fetch_and_add(&capture->exit_reserve_failures, 1);
+		record_correlation_loss();
+	}
+	bpf_map_delete_elem(&request_processes, &key.pid_tgid);
+	return 0;
+}
+
+SEC("uprobe/gadget_program_disabled")
+int BPF_UPROBE(request_marker_v1, __u64 process_epoch,
+	       __u64 request_id_hi, __u64 request_id_lo, __u32 phase,
+	       __u32 flags, __u32 reason)
+{
+	struct request_marker_event *event;
+	struct request_process_state *state;
+	struct correlation_loss_state *capture;
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u64 generation;
+	__u64 request_sequence = 0;
+	bool accepted = false;
+
+	if (gadget_should_discard_data_current())
+		return 0;
+
+	capture = correlation_stats();
+	if (capture)
+		__sync_fetch_and_add(&capture->marker_invocations, 1);
+	generation = loss_generation();
+	state = bpf_map_lookup_elem(&request_processes, &pid_tgid);
+	if (!state) {
+		struct request_process_state initial = {};
+		if (bpf_map_update_elem(&request_processes, &pid_tgid, &initial,
+					BPF_NOEXIST)) {
+			if (capture)
+				__sync_fetch_and_add(&capture->state_insert_failures, 1);
+			record_correlation_loss();
+			return 0;
+		}
+		state = bpf_map_lookup_elem(&request_processes, &pid_tgid);
+	}
+	if (!state) {
+		record_correlation_loss();
+		return 0;
+	}
+	if (state->cuda_depth != 0) {
+		state->context_state = REQUEST_CONTEXT_EPOCH_INVALID;
+	} else if (phase == REQUEST_MARKER_READY && process_epoch != 0 && flags == 0 &&
+	    reason == 0 && request_id_hi == 0 && request_id_lo == 0 &&
+	    (state->context_state == REQUEST_CONTEXT_NO_READY ||
+	     state->process_epoch != process_epoch)) {
+		state->process_epoch = process_epoch;
+		state->request_id_hi = 0;
+		state->request_id_lo = 0;
+		state->request_sequence = 0;
+		state->loss_generation = generation;
+		state->context_state = REQUEST_CONTEXT_INACTIVE_VALID;
+		accepted = true;
+	} else if (phase == REQUEST_MARKER_START &&
+		   state->context_state == REQUEST_CONTEXT_INACTIVE_VALID &&
+		   state->process_epoch == process_epoch && flags == 0 &&
+		   reason == 0 && (request_id_hi != 0 || request_id_lo != 0)) {
+		state->request_id_hi = request_id_hi;
+		state->request_id_lo = request_id_lo;
+		state->request_sequence = 0;
+		state->loss_generation = generation;
+		state->context_state = REQUEST_CONTEXT_ACTIVE_VALID;
+		accepted = true;
+	} else if ((phase == REQUEST_MARKER_END ||
+		    phase == REQUEST_MARKER_ORPHAN) &&
+		   state->context_state == REQUEST_CONTEXT_ACTIVE_VALID &&
+		   state->process_epoch == process_epoch &&
+		   state->request_id_hi == request_id_hi &&
+		   state->request_id_lo == request_id_lo && flags == 0) {
+		if ((phase == REQUEST_MARKER_END &&
+		     (reason == 1 || reason == 2)) ||
+		    (phase == REQUEST_MARKER_ORPHAN && reason == 3)) {
+			request_sequence = state->request_sequence;
+			state->request_id_hi = 0;
+			state->request_id_lo = 0;
+			state->context_state = REQUEST_CONTEXT_INACTIVE_VALID;
+			accepted = true;
+		} else {
+			state->context_state = REQUEST_CONTEXT_EPOCH_INVALID;
+		}
+	} else {
+		state->context_state = REQUEST_CONTEXT_EPOCH_INVALID;
+		state->request_id_hi = 0;
+		state->request_id_lo = 0;
+	}
+	if (capture) {
+		if (accepted)
+			__sync_fetch_and_add(&capture->marker_accepted, 1);
+		else
+			__sync_fetch_and_add(&capture->marker_rejected, 1);
+	}
+
+	event = gadget_reserve_buf(&request_marker_events, sizeof(*event));
+	if (!event) {
+		struct singleton_key key = {};
+		struct request_marker_stat *s =
+			bpf_map_lookup_elem(&request_marker_stats, &key);
+		if (!s) {
+			struct request_marker_stat zero = {};
+			bpf_map_update_elem(&request_marker_stats, &key, &zero,
+					    BPF_NOEXIST);
+			s = bpf_map_lookup_elem(&request_marker_stats, &key);
+		}
+		if (s)
+			__sync_fetch_and_add(&s->reserve_failures, 1);
+		if (capture)
+			__sync_fetch_and_add(&capture->marker_reserve_failures, 1);
+		record_correlation_loss();
+		return 0;
+	}
+
+	__builtin_memset(event, 0, sizeof(*event));
+	event->timestamp_raw = bpf_ktime_get_boot_ns();
+	event->process_epoch = process_epoch;
+	event->request_id_hi = request_id_hi;
+	event->request_id_lo = request_id_lo;
+	event->request_sequence = request_sequence;
+	event->protocol_version = REQUEST_MARKER_PROTOCOL_V1;
+	event->phase_raw = phase;
+	event->flags = flags;
+	event->reason = reason;
+	event->transition_accepted = accepted;
+	event->loss_generation = generation;
+	gadget_process_populate(&event->proc);
+	if (gadget_submit_buf(ctx, &request_marker_events, event,
+			      sizeof(*event))) {
+		struct singleton_key key = {};
+		struct request_marker_stat *s =
+			bpf_map_lookup_elem(&request_marker_stats, &key);
+		if (!s) {
+			struct request_marker_stat zero = {};
+			bpf_map_update_elem(&request_marker_stats, &key, &zero,
+					    BPF_NOEXIST);
+			s = bpf_map_lookup_elem(&request_marker_stats, &key);
+		}
+		if (s)
+			__sync_fetch_and_add(&s->reserve_failures, 1);
+		if (capture)
+			__sync_fetch_and_add(&capture->marker_reserve_failures, 1);
+		record_correlation_loss();
+	} else if (capture) {
+		__sync_fetch_and_add(&capture->marker_emitted, 1);
+	}
 	return 0;
 }
 

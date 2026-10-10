@@ -183,3 +183,528 @@ func TestConfigJSONContract(t *testing.T) {
 		t.Fatalf("incomplete JSON config: %#v", got)
 	}
 }
+
+func transitionCfg() Config {
+	c := cfg()
+	c.CandidatePreviousOperationMask = (uint64(1) << 0) | (uint64(1) << 4)
+	c.CandidateCurrentOperationMask = uint64(1) << 6
+	return c
+}
+
+func pairCfg() Config {
+	c := transitionCfg()
+	c.DecodeMinLaunches = 0
+	c.CandidatePairWindowNS = 25
+	return c
+}
+
+func TestOperationTransitionGateAllowsConfiguredPairs(t *testing.T) {
+	for _, events := range [][]Event{
+		{{PID: 1, TimestampNS: 1, Operation: 0}, {PID: 1, TimestampNS: 2, Operation: 0}, {PID: 1, TimestampNS: 20, Operation: 6}},
+		{{PID: 1, TimestampNS: 1, Operation: 0}, {PID: 1, TimestampNS: 2, Operation: 4, Bytes: 8}, {PID: 1, TimestampNS: 20, Operation: 6}},
+	} {
+		if got := count(collect(New(transitionCfg()), events...), "first_decode_candidate"); got != 1 {
+			t.Fatalf("allowed transition emitted %d candidates for %#v", got, events)
+		}
+	}
+}
+
+func TestOperationTransitionGateRejectsOtherPairs(t *testing.T) {
+	for _, events := range [][]Event{
+		{{PID: 1, TimestampNS: 1, Operation: 1}, {PID: 1, TimestampNS: 2, Operation: 1}, {PID: 1, TimestampNS: 20, Operation: 6}},
+		{{PID: 1, TimestampNS: 1, Operation: 0}, {PID: 1, TimestampNS: 2, Operation: 0}, {PID: 1, TimestampNS: 20, Operation: 5}},
+	} {
+		if got := count(collect(New(transitionCfg()), events...), "first_decode_candidate"); got != 0 {
+			t.Fatalf("disallowed transition emitted %d candidates for %#v", got, events)
+		}
+	}
+}
+
+func TestOperationTransitionGateDoesNotSynthesizeTerminalCandidate(t *testing.T) {
+	a := New(transitionCfg())
+	collect(a, Event{PID: 1, TimestampNS: 1, Operation: 0}, Event{PID: 1, TimestampNS: 2, Operation: 0})
+	if got := count(a.CloseAll("test"), "first_decode_candidate"); got != 0 {
+		t.Fatalf("close emitted %d transition candidates", got)
+	}
+}
+
+func TestOperationTransitionGateDoesNotCrossActivityBoundary(t *testing.T) {
+	a := New(transitionCfg())
+	rs := collect(a,
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 4, Bytes: 8},
+		Event{PID: 1, TimestampNS: 200, Operation: 6},
+	)
+	if got := count(rs, "first_decode_candidate"); got != 0 {
+		t.Fatalf("cross-boundary transition emitted %d candidates: %#v", got, rs)
+	}
+	if got := count(rs, "activity_boundary"); got != 2 {
+		t.Fatalf("activity boundaries=%d records=%#v", got, rs)
+	}
+}
+
+func TestRejectedTransitionResetsPeriodLaunches(t *testing.T) {
+	c := transitionCfg()
+	c.DecodeMinLaunches = 2
+	a := New(c)
+	rs := collect(a,
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 0},
+		Event{PID: 1, TimestampNS: 20, Operation: 5},
+		Event{PID: 1, TimestampNS: 21, Operation: 0},
+		Event{PID: 1, TimestampNS: 40, Operation: 6},
+	)
+	if got := count(rs, "first_decode_candidate"); got != 0 {
+		t.Fatalf("rejected transition leaked launch evidence: %#v", rs)
+	}
+}
+
+func TestOperationTransitionMaskValidation(t *testing.T) {
+	c := cfg()
+	c.CandidatePreviousOperationMask = 1
+	if err := c.Validate(); err == nil {
+		t.Fatal("one-sided operation mask accepted")
+	}
+	c.CandidateCurrentOperationMask = uint64(1) << 8
+	if err := c.Validate(); err == nil {
+		t.Fatal("unsupported operation mask accepted")
+	}
+	c.CandidateCurrentOperationMask = 1
+	if err := c.Validate(); err != nil {
+		t.Fatalf("valid operation masks rejected: %v", err)
+	}
+	c.CandidatePreviousOperationMask = (uint64(1) << 0) | (uint64(1) << 4)
+	c.CandidateCurrentOperationMask = uint64(1) << 6
+	c.DecodeMinLaunches = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("transition-v2 zero launch gate rejected: %v", err)
+	}
+	c.CandidatePreviousOperationMask |= uint64(1) << 1
+	if err := c.Validate(); err == nil {
+		t.Fatal("broad zero-launch operation mask accepted")
+	}
+	c = cfg()
+	c.DecodeMinLaunches = 0
+	if err := c.Validate(); err == nil {
+		t.Fatal("zero launch gate accepted without transition masks")
+	}
+	c = transitionCfg()
+	c.CandidatePairWindowNS = 25
+	if err := c.Validate(); err == nil {
+		t.Fatal("pair coalescing accepted with launch-count gate")
+	}
+	c.DecodeMinLaunches = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("valid pair coalescing rejected: %v", err)
+	}
+	c.CandidatePreviousOperationMask = 1
+	if err := c.Validate(); err == nil {
+		t.Fatal("pair coalescing accepted with non-transition-v2 masks")
+	}
+}
+
+func TestDisabledOperationMasksPreserveLegacyCanonicalForm(t *testing.T) {
+	c := cfg()
+	if strings.Contains(c.Canonical(), "operation_mask") {
+		t.Fatalf("legacy canonical form changed: %s", c.Canonical())
+	}
+	c = transitionCfg()
+	got := c.Canonical()
+	for _, key := range []string{"candidate_previous_operation_mask=", "candidate_current_operation_mask="} {
+		if !strings.Contains(got, key) {
+			t.Fatalf("transition canonical form missing %s: %s", key, got)
+		}
+	}
+}
+
+func TestOperationTransitionCanDisableLaunchCountGate(t *testing.T) {
+	events := []Event{
+		{PID: 1, TimestampNS: 1, Operation: 0},
+		{PID: 1, TimestampNS: 20, Operation: 5},
+		{PID: 1, TimestampNS: 21, Operation: 4, Bytes: 8},
+		{PID: 1, TimestampNS: 40, Operation: 6},
+	}
+	enabled := transitionCfg()
+	enabled.DecodeMinLaunches = 0
+	if got := count(collect(New(enabled), events...), "first_decode_candidate"); got != 1 {
+		t.Fatalf("zero launch gate emitted %d candidates", got)
+	}
+	required := transitionCfg()
+	required.DecodeMinLaunches = 1
+	if got := count(collect(New(required), events...), "first_decode_candidate"); got != 0 {
+		t.Fatalf("launch gate emitted %d candidates without an intervening launch", got)
+	}
+}
+
+func TestCandidatePairCoalescesLaunchIntoLaterDtoH(t *testing.T) {
+	a := New(pairCfg())
+	rs := collect(a,
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 0},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+		Event{PID: 1, TimestampNS: 21, Operation: 4, Bytes: 8},
+		Event{PID: 1, TimestampNS: 40, Operation: 6},
+	)
+	if got := count(rs, "first_decode_candidate"); got != 1 {
+		t.Fatalf("coalesced candidates=%d records=%#v", got, rs)
+	}
+	candidate := rs[len(rs)-1]
+	if candidate.TimestampNS != 21 || candidate.TTFTCandidateNS != 20 || candidate.LaunchCount != 2 {
+		t.Fatalf("replacement did not preserve factual DtoH opportunity: %#v", candidate)
+	}
+}
+
+func TestCandidatePairWindowBoundaryIsInclusive(t *testing.T) {
+	within := collect(New(pairCfg()),
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 0},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+		Event{PID: 1, TimestampNS: 27, Operation: 4, Bytes: 8},
+		Event{PID: 1, TimestampNS: 40, Operation: 6},
+	)
+	if got := count(within, "first_decode_candidate"); got != 1 || within[len(within)-1].TimestampNS != 27 {
+		t.Fatalf("equal-window pair did not replace: %#v", within)
+	}
+	beyond := collect(New(pairCfg()),
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 0},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+		Event{PID: 1, TimestampNS: 28, Operation: 4, Bytes: 8},
+	)
+	if got := count(beyond, "first_decode_candidate"); got != 1 || beyond[len(beyond)-1].TimestampNS != 2 {
+		t.Fatalf("expired launch was not committed first: %#v", beyond)
+	}
+}
+
+func TestCandidatePairIgnoresNonCandidateOperations(t *testing.T) {
+	a := New(pairCfg())
+	rs := collect(a,
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 0},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+		Event{PID: 1, TimestampNS: 21, Operation: 5},
+		Event{PID: 1, TimestampNS: 22, Operation: 4, Bytes: 8},
+		Event{PID: 1, TimestampNS: 40, Operation: 6},
+	)
+	if got := count(rs, "first_decode_candidate"); got != 1 || rs[len(rs)-1].TimestampNS != 22 {
+		t.Fatalf("non-candidate operation broke adjacency: %#v", rs)
+	}
+}
+
+func TestCandidatePairConflictFlushesBeforeNewLaunch(t *testing.T) {
+	a := New(pairCfg())
+	rs := collect(a,
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 0},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+		Event{PID: 1, TimestampNS: 21, Operation: 0},
+		Event{PID: 1, TimestampNS: 40, Operation: 6},
+	)
+	if got := count(rs, "first_decode_candidate"); got != 1 {
+		t.Fatalf("first pending launch was not flushed: %#v", rs)
+	}
+	if rs[len(rs)-1].TimestampNS != 2 {
+		t.Fatalf("wrong launch committed on conflict: %#v", rs)
+	}
+	closed := a.CloseAll("test")
+	if count(closed, "decode_candidate") != 0 || count(closed, "analyzer_health") != 1 {
+		t.Fatalf("second unresolved launch was not dropped: %#v", closed)
+	}
+}
+
+func TestCandidatePairDropsUnresolvedLaunchAtEveryBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		close  func(*Analyzer) []Record
+		reason string
+	}{
+		{name: "close_all", close: func(a *Analyzer) []Record { return a.CloseAll("replay_end") }, reason: "unresolved_launch_replay_end"},
+		{name: "expire", close: func(a *Analyzer) []Record { return a.Expire(2000) }, reason: "unresolved_launch_state_timeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(pairCfg())
+			collect(a,
+				Event{PID: 1, TimestampNS: 1, Operation: 0},
+				Event{PID: 1, TimestampNS: 2, Operation: 0},
+				Event{PID: 1, TimestampNS: 20, Operation: 6},
+			)
+			rs := tc.close(a)
+			if count(rs, "first_decode_candidate") != 0 || count(rs, "analyzer_health") != 1 {
+				t.Fatalf("unresolved launch boundary records: %#v", rs)
+			}
+			if rs[0].CloseReason != tc.reason {
+				t.Fatalf("health reason=%q want=%q records=%#v", rs[0].CloseReason, tc.reason, rs)
+			}
+		})
+	}
+}
+
+func TestCandidatePairDropsUnresolvedLaunchOnEventBoundaries(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*Config)
+		nextAt    uint64
+		reason    string
+		healthAt  uint64
+		summaryAt uint64
+	}{
+		{
+			name:      "request_gap",
+			configure: func(c *Config) {},
+			nextAt:    200,
+			reason:    "request_gap",
+			healthAt:  20,
+			summaryAt: 20,
+		},
+		{
+			name: "max_duration",
+			configure: func(c *Config) {
+				c.RequestGapNS = 1000
+				c.MaxActivityDurationNS = 30
+			},
+			nextAt:    40,
+			reason:    "max_duration",
+			healthAt:  20,
+			summaryAt: 20,
+		},
+		{
+			name: "state_timeout",
+			configure: func(c *Config) {
+				c.RequestGapNS = 1000
+				c.StateTimeoutNS = 30
+			},
+			nextAt:    60,
+			reason:    "state_timeout",
+			healthAt:  60,
+			summaryAt: 60,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := pairCfg()
+			tc.configure(&c)
+			a := New(c)
+			collect(a,
+				Event{PID: 1, TimestampNS: 1, Operation: 0},
+				Event{PID: 1, TimestampNS: 2, Operation: 0},
+				Event{PID: 1, TimestampNS: 20, Operation: 6},
+			)
+			rs := a.Feed(Event{PID: 1, TimestampNS: tc.nextAt, Operation: 0})
+			if len(rs) != 3 {
+				t.Fatalf("boundary records=%d want=3: %#v", len(rs), rs)
+			}
+			health, summary, boundary := rs[0], rs[1], rs[2]
+			if health.Type != "analyzer_health" ||
+				health.CloseReason != "unresolved_launch_"+tc.reason ||
+				health.ActivityID != 1 ||
+				health.TimestampNS != tc.healthAt {
+				t.Fatalf("health record: %#v", health)
+			}
+			if summary.Type != "activity_summary" ||
+				summary.CloseReason != tc.reason ||
+				summary.ActivityID != 1 ||
+				summary.TimestampNS != tc.summaryAt ||
+				summary.CandidateCount != 0 {
+				t.Fatalf("summary record: %#v", summary)
+			}
+			if boundary.Type != "activity_boundary" ||
+				boundary.ActivityID != 2 ||
+				boundary.TimestampNS != tc.nextAt {
+				t.Fatalf("new boundary record: %#v", boundary)
+			}
+		})
+	}
+}
+
+func TestCandidatePairDropsUnresolvedLaunchOnCapacityEviction(t *testing.T) {
+	c := pairCfg()
+	c.StateTimeoutNS = 1 << 62
+	c.RequestGapNS = 1 << 62
+	c.MaxActivityDurationNS = 1 << 62
+	a := New(c)
+	collect(a,
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 0},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+	)
+	for pid := uint32(2); pid <= MaxActiveStates; pid++ {
+		collect(a, Event{PID: pid, TimestampNS: uint64(pid + 19), Operation: 0})
+	}
+	rs := a.Feed(Event{PID: MaxActiveStates + 1, TimestampNS: MaxActiveStates + 20, Operation: 0})
+	if len(rs) != 4 {
+		t.Fatalf("eviction records=%d want=4: %#v", len(rs), rs)
+	}
+	if rs[0].Type != "analyzer_health" ||
+		rs[0].CloseReason != "unresolved_launch_capacity_eviction" ||
+		rs[0].PID != 1 ||
+		rs[0].ActivityID != 1 ||
+		rs[0].CandidateCount != 0 {
+		t.Fatalf("unresolved health: %#v", rs[0])
+	}
+	if rs[1].Type != "activity_summary" ||
+		rs[1].CloseReason != "capacity_eviction" ||
+		rs[1].PID != 1 ||
+		rs[1].CandidateCount != 0 {
+		t.Fatalf("eviction summary: %#v", rs[1])
+	}
+	if rs[2].Type != "analyzer_health" ||
+		rs[2].CloseReason != "capacity_eviction" ||
+		rs[2].PID != 1 {
+		t.Fatalf("capacity health: %#v", rs[2])
+	}
+	if rs[3].Type != "activity_boundary" || rs[3].PID != MaxActiveStates+1 {
+		t.Fatalf("replacement boundary: %#v", rs[3])
+	}
+}
+
+func TestCandidatePairCoalescesBeforeAnchoredDedup(t *testing.T) {
+	c := pairCfg()
+	c.CandidatePairWindowNS = 35
+	c.DedupWindowNS = 25
+	a := New(c)
+	rs := collect(a,
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 4, Bytes: 8},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+		Event{PID: 1, TimestampNS: 21, Operation: 0},
+		Event{PID: 1, TimestampNS: 40, Operation: 6},
+		Event{PID: 1, TimestampNS: 50, Operation: 4, Bytes: 8},
+		Event{PID: 1, TimestampNS: 60, Operation: 6},
+	)
+	if count(rs, "first_decode_candidate") != 1 || count(rs, "decode_candidate") != 1 {
+		t.Fatalf("candidate counts: %#v", rs)
+	}
+	candidate := rs[len(rs)-1]
+	if candidate.TimestampNS != 50 ||
+		candidate.CandidateIndex != 2 ||
+		candidate.IntervalCandidateNS != 48 {
+		t.Fatalf("replacement was deduplicated before coalescing: %#v", candidate)
+	}
+}
+
+func TestCandidatePairPreservesReplacementSnapshotsAndIndexes(t *testing.T) {
+	a := New(pairCfg())
+	rs := collect(a,
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 0},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+		Event{PID: 1, TimestampNS: 21, Operation: 4, Bytes: 8},
+		Event{PID: 1, TimestampNS: 40, Operation: 6},
+		Event{PID: 1, TimestampNS: 41, Operation: 0},
+		Event{PID: 1, TimestampNS: 60, Operation: 6},
+		Event{PID: 1, TimestampNS: 61, Operation: 4, Bytes: 8},
+		Event{PID: 1, TimestampNS: 80, Operation: 6},
+	)
+	var candidates []Record
+	for _, r := range rs {
+		if r.Type == "first_decode_candidate" || r.Type == "decode_candidate" {
+			candidates = append(candidates, r)
+		}
+	}
+	if len(candidates) != 2 {
+		t.Fatalf("candidates=%#v", candidates)
+	}
+	first, second := candidates[0], candidates[1]
+	if first.TimestampNS != 21 ||
+		first.CandidateIndex != 1 ||
+		first.CandidateCount != 1 ||
+		first.LaunchCount != 2 ||
+		first.CopyCount != 1 {
+		t.Fatalf("first replacement snapshot: %#v", first)
+	}
+	if second.TimestampNS != 61 ||
+		second.CandidateIndex != 2 ||
+		second.CandidateCount != 2 ||
+		second.LaunchCount != 3 ||
+		second.CopyCount != 2 ||
+		second.IntervalCandidateNS != 40 {
+		t.Fatalf("second replacement snapshot: %#v", second)
+	}
+}
+
+func TestDisabledCandidatePairPreservesExactTransitionRecords(t *testing.T) {
+	c := transitionCfg()
+	c.DecodeMinLaunches = 0
+	a := New(c)
+	rs := collect(a,
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 4, Bytes: 8},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+		Event{PID: 1, TimestampNS: 21, Operation: 0},
+		Event{PID: 1, TimestampNS: 40, Operation: 6},
+		Event{PID: 1, TimestampNS: 200, Operation: 0},
+	)
+	want := []Record{
+		{Type: "activity_boundary", Phase: "prefill_candidate", CloseReason: "start", PID: 1, ActivityID: 1, TimestampNS: 1, ActivityStartNS: 1},
+		{Type: "first_decode_candidate", Phase: "decode_candidate", PID: 1, ActivityID: 1, TimestampNS: 2, ActivityStartNS: 1, CandidateIndex: 1, CandidateCount: 1, LaunchCount: 1, CopyCount: 1, TTFTCandidateNS: 1},
+		{Type: "decode_candidate", Phase: "decode_candidate", PID: 1, ActivityID: 1, TimestampNS: 21, ActivityStartNS: 1, CandidateIndex: 2, CandidateCount: 2, LaunchCount: 2, CopyCount: 1, IntervalCandidateNS: 19},
+		{Type: "activity_summary", Phase: "decode_candidate", CloseReason: "request_gap", PID: 1, ActivityID: 1, TimestampNS: 40, ActivityStartNS: 1, DurationNS: 39, CandidateCount: 2, LaunchCount: 2, CopyCount: 1},
+		{Type: "activity_boundary", Phase: "prefill_candidate", CloseReason: "start", PID: 1, ActivityID: 2, TimestampNS: 200, ActivityStartNS: 200},
+	}
+	if len(rs) != len(want) {
+		t.Fatalf("records=%d want=%d: %#v", len(rs), len(want), rs)
+	}
+	for i := range want {
+		if rs[i] != want[i] {
+			t.Fatalf("record %d=%#v want=%#v", i, rs[i], want[i])
+		}
+	}
+}
+
+func TestCandidatePairStateIsIsolatedByPID(t *testing.T) {
+	a := New(pairCfg())
+	rs := collect(a,
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 0},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+		Event{PID: 2, TimestampNS: 1, Operation: 0},
+		Event{PID: 2, TimestampNS: 2, Operation: 4, Bytes: 8},
+		Event{PID: 2, TimestampNS: 20, Operation: 6},
+		Event{PID: 1, TimestampNS: 21, Operation: 4, Bytes: 8},
+		Event{PID: 1, TimestampNS: 40, Operation: 6},
+	)
+	if got := count(rs, "first_decode_candidate"); got != 2 {
+		t.Fatalf("cross-PID state contamination: %#v", rs)
+	}
+	for _, r := range rs {
+		if r.Type == "first_decode_candidate" {
+			if r.PID == 1 && r.TimestampNS != 21 {
+				t.Fatalf("PID 1 candidate=%#v", r)
+			}
+			if r.PID == 2 && r.TimestampNS != 2 {
+				t.Fatalf("PID 2 candidate=%#v", r)
+			}
+		}
+	}
+}
+
+func TestCandidatePairTimestampRegressionDoesNotMutatePending(t *testing.T) {
+	a := New(pairCfg())
+	collect(a,
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 0},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+	)
+	if rs := a.Feed(Event{PID: 1, TimestampNS: 19, Operation: 4, Bytes: 8}); len(rs) != 0 {
+		t.Fatalf("timestamp regression emitted records: %#v", rs)
+	}
+	rs := collect(a,
+		Event{PID: 1, TimestampNS: 21, Operation: 4, Bytes: 8},
+		Event{PID: 1, TimestampNS: 40, Operation: 6},
+	)
+	if got := count(rs, "first_decode_candidate"); got != 1 || rs[len(rs)-1].TimestampNS != 21 {
+		t.Fatalf("timestamp regression mutated pending state: %#v", rs)
+	}
+}
+
+func TestCandidatePairCanonicalIsDefaultOff(t *testing.T) {
+	c := transitionCfg()
+	if strings.Contains(c.Canonical(), "candidate_pair_window_ns") {
+		t.Fatalf("disabled pair coalescing changed canonical config: %s", c.Canonical())
+	}
+	c.DecodeMinLaunches = 0
+	c.CandidatePairWindowNS = 2_500_000
+	if !strings.Contains(c.Canonical(), "candidate_pair_window_ns=2500000") {
+		t.Fatalf("enabled pair coalescing missing from canonical config: %s", c.Canonical())
+	}
+}

@@ -16,6 +16,7 @@ package analyzer
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math/bits"
 	"sort"
 	"strconv"
@@ -28,17 +29,20 @@ const MaxActiveStates = 4096
 
 // Config contains only parameters that materially affect the state machine.
 type Config struct {
-	Preset                string `json:"preset,omitempty"`
-	RequestGapNS          uint64 `json:"request_gap_ns"`
-	CandidateGapNS        uint64 `json:"candidate_gap_ns"`
-	DedupWindowNS         uint64 `json:"dedup_window_ns"`
-	PrefillMinLaunches    uint64 `json:"prefill_min_launches"`
-	PrefillMinCopies      uint64 `json:"prefill_min_copies"`
-	DecodeMinLaunches     uint64 `json:"decode_min_launches"`
-	CandidateMaxCopyBytes uint64 `json:"candidate_max_copy_bytes"`
-	MinActivityOffsetNS   uint64 `json:"min_activity_offset_ns"`
-	StateTimeoutNS        uint64 `json:"state_timeout_ns"`
-	MaxActivityDurationNS uint64 `json:"max_activity_duration_ns"`
+	Preset                         string `json:"preset,omitempty"`
+	RequestGapNS                   uint64 `json:"request_gap_ns"`
+	CandidateGapNS                 uint64 `json:"candidate_gap_ns"`
+	DedupWindowNS                  uint64 `json:"dedup_window_ns"`
+	PrefillMinLaunches             uint64 `json:"prefill_min_launches"`
+	PrefillMinCopies               uint64 `json:"prefill_min_copies"`
+	DecodeMinLaunches              uint64 `json:"decode_min_launches"`
+	CandidateMaxCopyBytes          uint64 `json:"candidate_max_copy_bytes"`
+	MinActivityOffsetNS            uint64 `json:"min_activity_offset_ns"`
+	StateTimeoutNS                 uint64 `json:"state_timeout_ns"`
+	MaxActivityDurationNS          uint64 `json:"max_activity_duration_ns"`
+	CandidatePreviousOperationMask uint64 `json:"candidate_previous_operation_mask,omitempty"`
+	CandidateCurrentOperationMask  uint64 `json:"candidate_current_operation_mask,omitempty"`
+	CandidatePairWindowNS          uint64 `json:"candidate_pair_window_ns,omitempty"`
 }
 
 type Event struct {
@@ -55,9 +59,16 @@ type Record struct {
 	TTFTCandidateNS, IntervalCandidateNS                                                                         uint64
 }
 
+type candidateOpportunity struct {
+	at, launches, copies uint64
+	operation            uint32
+}
+
 type state struct {
 	id, start, last, candidateAt, candidates, launches, copies, periodLaunches uint64
+	lastOperation                                                              uint32
 	phase                                                                      string
+	pendingLaunch                                                              *candidateOpportunity
 }
 
 type Analyzer struct {
@@ -89,7 +100,36 @@ func (c Config) Canonical() string {
 	add("min_activity_offset_ns", c.MinActivityOffsetNS)
 	add("state_timeout_ns", c.StateTimeoutNS)
 	add("max_activity_duration_ns", c.MaxActivityDurationNS)
+	if c.CandidatePreviousOperationMask != 0 || c.CandidateCurrentOperationMask != 0 {
+		add("candidate_previous_operation_mask", c.CandidatePreviousOperationMask)
+		add("candidate_current_operation_mask", c.CandidateCurrentOperationMask)
+	}
+	if c.CandidatePairWindowNS != 0 {
+		add("candidate_pair_window_ns", c.CandidatePairWindowNS)
+	}
 	return b.String()
+}
+
+func (c Config) Validate() error {
+	const selectableOperationMask = uint64(1<<8) - 1
+	const transitionV2PreviousMask = (uint64(1) << 0) | (uint64(1) << 4)
+	const transitionV2CurrentMask = uint64(1) << 6
+	previous := c.CandidatePreviousOperationMask
+	current := c.CandidateCurrentOperationMask
+	if (previous == 0) != (current == 0) {
+		return fmt.Errorf("candidate operation masks must both be zero or both be nonzero")
+	}
+	if previous&^selectableOperationMask != 0 || current&^selectableOperationMask != 0 {
+		return fmt.Errorf("candidate operation masks contain unsupported operations")
+	}
+	if c.DecodeMinLaunches == 0 && (previous != transitionV2PreviousMask || current != transitionV2CurrentMask) {
+		return fmt.Errorf("decode-min-launches=0 requires the transition-v2 operation masks")
+	}
+	if c.CandidatePairWindowNS != 0 &&
+		(previous != transitionV2PreviousMask || current != transitionV2CurrentMask || c.DecodeMinLaunches != 0) {
+		return fmt.Errorf("candidate pair coalescing requires the transition-v2 operation masks and decode-min-launches=0")
+	}
+	return nil
 }
 
 // sha256Hex is a compact FIPS 180-4 SHA-256 implementation. Keeping it local avoids
@@ -141,7 +181,12 @@ func sha256Hex(s string) string {
 	}
 	return string(out)
 }
-func (c Config) Digest() string { return sha256Hex(c.Canonical()) }
+
+// SHA256Hex returns the SHA-256 digest of data without pulling the standard
+// crypto package's large lookup tables into the Wasm module.
+func SHA256Hex(data []byte) string { return sha256Hex(string(data)) }
+
+func (c Config) Digest() string { return SHA256Hex([]byte(c.Canonical())) }
 
 func isLaunch(op uint32) bool { return op == 0 || op == 1 || op == 2 }
 func isCopy(op uint32) bool   { return op == 3 || op == 4 }
@@ -157,12 +202,20 @@ func selected(e Event, c Config) bool {
 
 func (a *Analyzer) start(e Event) *state {
 	a.nextID++
-	s := &state{id: a.nextID, start: e.TimestampNS, last: e.TimestampNS, phase: "prefill_candidate"}
+	s := &state{id: a.nextID, start: e.TimestampNS, last: e.TimestampNS, lastOperation: e.Operation, phase: "prefill_candidate"}
 	a.states[e.PID] = s
 	return s
 }
 
-func (a *Analyzer) candidate(pid uint32, s *state, at uint64) []Record {
+func (a *Analyzer) candidateOpportunity(s *state, at uint64, currentOperation *uint32) *candidateOpportunity {
+	if a.Config.CandidatePreviousOperationMask != 0 {
+		if currentOperation == nil ||
+			a.Config.CandidatePreviousOperationMask&(uint64(1)<<s.lastOperation) == 0 ||
+			a.Config.CandidateCurrentOperationMask&(uint64(1)<<*currentOperation) == 0 {
+			s.periodLaunches = 0
+			return nil
+		}
+	}
 	if at < s.start+a.Config.MinActivityOffsetNS || s.periodLaunches < a.Config.DecodeMinLaunches {
 		s.periodLaunches = 0
 		return nil
@@ -172,23 +225,88 @@ func (a *Analyzer) candidate(pid uint32, s *state, at uint64) []Record {
 		s.periodLaunches = 0
 		return nil
 	}
+	opportunity := &candidateOpportunity{at: at, launches: s.launches, copies: s.copies, operation: s.lastOperation}
+	s.periodLaunches = 0
+	return opportunity
+}
+
+func (a *Analyzer) commitCandidate(pid uint32, s *state, opportunity candidateOpportunity) []Record {
 	// Anchored de-duplication: never move the retained candidate timestamp.
-	if s.candidateAt != 0 && at-s.candidateAt < a.Config.DedupWindowNS {
-		s.periodLaunches = 0
+	if s.candidateAt != 0 && opportunity.at-s.candidateAt < a.Config.DedupWindowNS {
 		return nil
 	}
 	s.candidates++
-	r := Record{Type: "decode_candidate", Phase: "decode_candidate", PID: pid, ActivityID: s.id, TimestampNS: at, ActivityStartNS: s.start, CandidateIndex: s.candidates, CandidateCount: s.candidates, LaunchCount: s.launches, CopyCount: s.copies}
+	r := Record{Type: "decode_candidate", Phase: "decode_candidate", PID: pid, ActivityID: s.id, TimestampNS: opportunity.at, ActivityStartNS: s.start, CandidateIndex: s.candidates, CandidateCount: s.candidates, LaunchCount: opportunity.launches, CopyCount: opportunity.copies}
 	if s.candidateAt == 0 {
 		r.Type = "first_decode_candidate"
-		r.TTFTCandidateNS = at - s.start
+		r.TTFTCandidateNS = opportunity.at - s.start
 		s.phase = "decode_candidate"
 	} else {
-		r.IntervalCandidateNS = at - s.candidateAt
+		r.IntervalCandidateNS = opportunity.at - s.candidateAt
 	}
-	s.candidateAt = at
-	s.periodLaunches = 0
+	s.candidateAt = opportunity.at
 	return []Record{r}
+}
+
+func (a *Analyzer) flushPendingLaunch(pid uint32, s *state) []Record {
+	if s.pendingLaunch == nil {
+		return nil
+	}
+	opportunity := *s.pendingLaunch
+	s.pendingLaunch = nil
+	return a.commitCandidate(pid, s, opportunity)
+}
+
+func (a *Analyzer) resolveOpportunity(pid uint32, s *state, opportunity candidateOpportunity) []Record {
+	if a.Config.CandidatePairWindowNS == 0 {
+		return a.commitCandidate(pid, s, opportunity)
+	}
+	out := []Record{}
+	if s.pendingLaunch != nil {
+		pending := s.pendingLaunch
+		if opportunity.operation == 4 &&
+			opportunity.at >= pending.at &&
+			opportunity.at-pending.at <= a.Config.CandidatePairWindowNS {
+			s.pendingLaunch = nil
+			return a.commitCandidate(pid, s, opportunity)
+		}
+		out = append(out, a.flushPendingLaunch(pid, s)...)
+	}
+	if opportunity.operation == 0 {
+		pending := opportunity
+		s.pendingLaunch = &pending
+		return out
+	}
+	return append(out, a.commitCandidate(pid, s, opportunity)...)
+}
+
+func (a *Analyzer) dropPendingLaunch(pid uint32, s *state, reason string, at uint64) []Record {
+	if s.pendingLaunch == nil {
+		return nil
+	}
+	s.pendingLaunch = nil
+	return []Record{{
+		Type:            "analyzer_health",
+		CloseReason:     "unresolved_launch_" + reason,
+		PID:             pid,
+		ActivityID:      s.id,
+		TimestampNS:     at,
+		ActivityStartNS: s.start,
+		CandidateCount:  s.candidates,
+		LaunchCount:     s.launches,
+		CopyCount:       s.copies,
+	}}
+}
+
+func (a *Analyzer) closeCandidates(pid uint32, s *state, reason string, at uint64) []Record {
+	if a.Config.CandidatePairWindowNS != 0 {
+		return a.dropPendingLaunch(pid, s, reason, at)
+	}
+	opportunity := a.candidateOpportunity(s, s.last, nil)
+	if opportunity == nil {
+		return nil
+	}
+	return a.commitCandidate(pid, s, *opportunity)
 }
 
 func (a *Analyzer) close(pid uint32, s *state, reason string, at uint64) Record {
@@ -209,7 +327,7 @@ func (a *Analyzer) evictOne(at uint64) []Record {
 		}
 	}
 	s := a.states[victim]
-	out := a.candidate(victim, s, s.last)
+	out := a.closeCandidates(victim, s, "capacity_eviction", at)
 	out = append(out, a.close(victim, s, "capacity_eviction", at))
 	out = append(out, Record{Type: "analyzer_health", CloseReason: "capacity_eviction", PID: victim, ActivityID: s.id, TimestampNS: at})
 	return out
@@ -228,7 +346,7 @@ func (a *Analyzer) Feed(e Event) []Record {
 		return nil
 	}
 	if s != nil && e.TimestampNS-s.last >= a.Config.StateTimeoutNS {
-		out = append(out, a.candidate(e.PID, s, s.last)...)
+		out = append(out, a.closeCandidates(e.PID, s, "state_timeout", e.TimestampNS)...)
 		out = append(out, a.close(e.PID, s, "state_timeout", e.TimestampNS))
 		s = nil
 	} else if s != nil && (e.TimestampNS-s.last >= a.Config.RequestGapNS || e.TimestampNS-s.start >= a.Config.MaxActivityDurationNS) {
@@ -236,7 +354,7 @@ func (a *Analyzer) Feed(e Event) []Record {
 		if e.TimestampNS-s.start >= a.Config.MaxActivityDurationNS {
 			reason = "max_duration"
 		}
-		out = append(out, a.candidate(e.PID, s, s.last)...)
+		out = append(out, a.closeCandidates(e.PID, s, reason, s.last)...)
 		out = append(out, a.close(e.PID, s, reason, s.last))
 		s = nil
 	}
@@ -246,8 +364,20 @@ func (a *Analyzer) Feed(e Event) []Record {
 		}
 		s = a.start(e)
 		out = append(out, Record{Type: "activity_boundary", Phase: "prefill_candidate", CloseReason: "start", PID: e.PID, ActivityID: s.id, TimestampNS: e.TimestampNS, ActivityStartNS: e.TimestampNS})
-	} else if e.TimestampNS-s.last >= a.Config.CandidateGapNS {
-		out = append(out, a.candidate(e.PID, s, s.last)...)
+	} else {
+		resolvedOpportunity := false
+		if e.TimestampNS-s.last >= a.Config.CandidateGapNS {
+			if opportunity := a.candidateOpportunity(s, s.last, &e.Operation); opportunity != nil {
+				out = append(out, a.resolveOpportunity(e.PID, s, *opportunity)...)
+				resolvedOpportunity = true
+			}
+		}
+		if !resolvedOpportunity &&
+			s.pendingLaunch != nil &&
+			e.TimestampNS > s.pendingLaunch.at &&
+			e.TimestampNS-s.pendingLaunch.at > a.Config.CandidatePairWindowNS {
+			out = append(out, a.flushPendingLaunch(e.PID, s)...)
+		}
 	}
 	if isLaunch(e.Operation) {
 		s.launches++
@@ -257,6 +387,7 @@ func (a *Analyzer) Feed(e Event) []Record {
 		s.copies++
 	}
 	s.last = e.TimestampNS
+	s.lastOperation = e.Operation
 	return out
 }
 
@@ -275,7 +406,7 @@ func (a *Analyzer) Expire(now uint64) []Record {
 	for _, pi := range pids {
 		pid := uint32(pi)
 		s := a.states[pid]
-		out = append(out, a.candidate(pid, s, s.last)...)
+		out = append(out, a.closeCandidates(pid, s, "state_timeout", now)...)
 		out = append(out, a.close(pid, s, "state_timeout", now))
 	}
 	return out
@@ -299,7 +430,7 @@ func (a *Analyzer) CloseAll(reason string) []Record {
 	for _, pi := range pids {
 		p := uint32(pi)
 		s := a.states[p]
-		out = append(out, a.candidate(p, s, s.last)...)
+		out = append(out, a.closeCandidates(p, s, reason, s.last)...)
 		out = append(out, a.close(p, s, reason, s.last))
 	}
 	return out

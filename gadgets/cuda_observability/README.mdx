@@ -58,6 +58,46 @@ $ sudo ig run ghcr.io/inspektor-gadget/gadget/cuda_observability:%IG_TAG% \
 The first heuristic record includes the effective preset, canonical
 configuration, and its SHA-256 digest.
 
+Request lifecycle correlation is a separate experimental, default-disabled
+mode. It requires a version-1 marker library loaded into the same host process
+that issues the CUDA calls:
+
+```bash
+$ sudo ig run ./cuda_observability.tar \
+    --host -o json \
+    --request-marker-library=/absolute/path/libig_gpu_request_marker.so
+```
+
+The marker protocol emits only a random process epoch and a domain-separated,
+128-bit HMAC of the serving request ID. It never emits request text, tokens, or
+the raw serving request ID. Validated lifecycle intervals are emitted only
+after the bounded reorder watermark passes. Malformed, missing, duplicate,
+overlapping, stale, or unknown markers emit bounded health diagnostics and
+never manufacture request attribution. Raw CUDA records remain available.
+
+Request-aware CUDA analysis is intentionally offline. While a valid request is
+active, each factual CUDA return record carries hidden pseudonymous request
+context and an exact-thread return sequence. Marker mutation during an in-flight
+CUDA call invalidates the epoch. Each raw marker reports whether the kernel
+accepted its state transition. Every accepted START resets the request-local
+sequence, and an accepted END or ORPHAN carries the final successfully reserved
+CUDA sequence. A pristine replay requires accepted READY, START, and END
+transitions, stable zero loss generation, and exactly one event for every
+sequence from 1 through that terminal value. It then replays the production
+analyzer separately for each exact
+`(host TGID, host TID, process epoch, request HMAC)` stream in return-sequence
+order.
+The gadget does not emit live request-attributed TTFT or cadence success
+records, because independent datasource delivery cannot prove completeness.
+
+The offline checker assumes an honest, exactly-once event collector. IG may
+attach separate BPF map instances to multiple processes in one container; their
+terminal map snapshots are summed with overflow checks and any observed failure
+counter fails closed. Those snapshots are diagnostic rather than completeness
+authority because map iteration can race still-active producers. Request-local
+terminal sequence is the completeness authority. An omitted whole map instance
+still cannot be discovered without an external attachment manifest.
+
 ## Raw telemetry
 
 The gadget traces selected CUDA Driver API entry and return points, including:
@@ -72,6 +112,15 @@ Each `cuda_calls` record contains the return code, host-side duration, operation
 metadata, and Inspektor Gadget process/container attribution. Bounded aggregate
 rows report call, error, byte, duration, unmatched-return, map-update, and
 buffer-reservation counts by operation.
+
+Raw CUDA calls can arrive in large bursts. Each attached eBPF instance therefore
+uses a 16 MiB ring buffer for `cuda_calls`; the independent request-marker and
+process-exit buffers remain smaller. Kernel memory scales with the number of
+attached instances, so eight attachments reserve about 128 MiB for raw CUDA
+events. Custom source builds may override the power-of-two
+`CUDA_OBSERVABILITY_EVENT_RING_BYTES` compile definition, with a minimum of
+1 MiB. A nonzero `reserve_failures` count means raw records were lost and any
+request-aware completeness claim must fail closed.
 
 ## Heuristic candidates
 
@@ -125,13 +174,68 @@ observation; stack-specific presets are valid only for their named stack.
 
 Default value: `"generic-conservative-v1"`
 
+The experimental immutable preset
+`vllm-0.10.2-qwen2.5-0.5b-a100-sequential-transition-v2` uses CUDA operation
+transitions calibrated only for that exact sequential vLLM, model, and GPU
+stack. The operation transition is the discriminator, so the legacy per-period
+launch-count gate is disabled for this preset. Its repeated candidates estimate
+content cadence; its first candidate remains a CUDA-derived heuristic and is
+not a validated wire-level TTFT.
+
+The newer immutable preset
+`vllm-0.10.2-qwen2.5-0.5b-a100-sequential-transition-v3` adds directional
+launch-to-D2H candidate coalescing before anchored deduplication. Its 3 ms
+window is the whole-millisecond ceiling above the 2.277645 ms useful-pair tail
+in the preserved calibration corpus. The first observed calibration
+cross-cycle replacement was 31.968417 ms. These are observed calibration
+bounds, not general runtime guarantees, and the preset remains experimental
+until a fresh immutable validation corpus passes.
+
 ### `--request-gap`
 
 Override the inactivity gap that closes an activity candidate as a Go duration.
 
+### `--request-marker-library`
+
+Enable experimental request lifecycle correlation by attaching
+`ig_gpu_request_marker_v1` from the supplied absolute library path.
+
+Default value: `""` (disabled)
+
+This mode currently supports only a single CUDA-issuing vLLM EngineCore process
+with sequential requests. The serving integration must use a random HMAC key of
+at least 256 bits and must isolate every marker/logging failure from serving
+behavior.
+
+### `--request-marker-reorder-window`
+
+Set the bounded boot-clock reorder window used before marker lifecycle records
+become final.
+
+Default value: `"50ms"`
+
+### `--request-marker-state-timeout`
+
+Set the maximum open marker lifecycle duration before fail-closed invalidation.
+
+Default value: `"5m"`
+
 ### `--candidate-gap`
 
 Override the quiet gap that qualifies a decode candidate as a Go duration.
+
+### `--candidate-pair-window`
+
+Enable experimental directional coalescing of an adjacent kernel-launch
+candidate followed by a D2H-async candidate within this duration. The default
+is disabled. This override requires the transition-v2/v3 operation masks and
+`decode-min-launches=0`; select the named transition-v2 preset to enable it
+manually, or transition-v3 for the frozen 3 ms calibration value.
+
+An unresolved launch half is not emitted as a completed cadence candidate when
+the activity closes. Instead, the gadget emits an `analyzer_health` record with
+an `unresolved_launch_*` reason while preserving the underlying raw CUDA
+telemetry.
 
 ### `--dedup-window`
 
@@ -178,3 +282,10 @@ Override the maximum activity lifetime as a Go duration.
    version.
 5. Missing uprobes, event-buffer pressure, or analyzer-capacity eviction can
    reduce observations. Check aggregate and analyzer-health records.
+6. Decode-like CUDA cycles can precede the first streamed content. Operation-
+   transition presets therefore do not make the first candidate an exact TTFT
+   measurement.
+7. A request `END` marker is scheduler lifecycle completion, not proof that all
+   GPU work completed. Trailing CUDA activity must be measured separately.
+8. Request correlation is invalid when request execution spans worker
+   processes or when requests overlap in the CUDA-issuing process.
