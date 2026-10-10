@@ -376,6 +376,47 @@ func TestCandidatePairWindowBoundaryIsInclusive(t *testing.T) {
 	}
 }
 
+func TestTransitionV4PairWindowBoundary(t *testing.T) {
+	c := pairCfg()
+	c.CandidatePairWindowNS = 6_000_000
+	c.RequestGapNS = 10_000_000
+	c.StateTimeoutNS = 10_000_000
+	c.MaxActivityDurationNS = 20_000_000
+	within := collect(New(c),
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 0},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+		Event{PID: 1, TimestampNS: 6_000_002, Operation: 4, Bytes: 8},
+		Event{PID: 1, TimestampNS: 6_000_020, Operation: 6},
+	)
+	if got := count(within, "first_decode_candidate"); got != 1 ||
+		within[len(within)-1].TimestampNS != 6_000_002 {
+		t.Fatalf("6ms pair did not replace: %#v", within)
+	}
+	beyond := collect(New(c),
+		Event{PID: 1, TimestampNS: 1, Operation: 0},
+		Event{PID: 1, TimestampNS: 2, Operation: 0},
+		Event{PID: 1, TimestampNS: 20, Operation: 6},
+		Event{PID: 1, TimestampNS: 6_000_003, Operation: 4, Bytes: 8},
+	)
+	if got := count(beyond, "first_decode_candidate"); got != 1 ||
+		beyond[len(beyond)-1].TimestampNS != 2 {
+		t.Fatalf("6ms+1 pair did not preserve launch: %#v", beyond)
+	}
+}
+
+func TestCandidatePairDoesNotSynthesizeTerminalDtoH(t *testing.T) {
+	a := New(pairCfg())
+	rs := collect(a,
+		Event{PID: 1, TimestampNS: 1, Operation: 4, Bytes: 8},
+	)
+	rs = append(rs, a.CloseAll("request_end")...)
+	if count(rs, "first_decode_candidate") != 0 ||
+		count(rs, "decode_candidate") != 0 {
+		t.Fatalf("terminal DtoH synthesized a candidate: %#v", rs)
+	}
+}
+
 func TestCandidatePairIgnoresNonCandidateOperations(t *testing.T) {
 	a := New(pairCfg())
 	rs := collect(a,

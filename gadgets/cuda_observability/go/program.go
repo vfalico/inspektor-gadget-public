@@ -89,6 +89,14 @@ func preset(name string) (analyzer.Config, bool) {
 		base.CandidatePreviousOperationMask = (uint64(1) << 0) | (uint64(1) << 4)
 		base.CandidateCurrentOperationMask = uint64(1) << 6
 		base.CandidatePairWindowNS = uint64((3 * time.Millisecond).Nanoseconds())
+	case "vllm-0.10.2-qwen2.5-0.5b-a100-sequential-transition-v4":
+		base.RequestGapNS = uint64((12500 * time.Microsecond).Nanoseconds())
+		base.CandidateGapNS = uint64((300 * time.Microsecond).Nanoseconds())
+		base.DedupWindowNS = uint64((2 * time.Millisecond).Nanoseconds())
+		base.DecodeMinLaunches = 0
+		base.CandidatePreviousOperationMask = (uint64(1) << 0) | (uint64(1) << 4)
+		base.CandidateCurrentOperationMask = uint64(1) << 6
+		base.CandidatePairWindowNS = uint64((6 * time.Millisecond).Nanoseconds())
 	case "tgi-3.3.6-qwen2.5-0.5b-a100-sequential":
 		base.CandidateGapNS = 1050000
 		base.DedupWindowNS = 2000000

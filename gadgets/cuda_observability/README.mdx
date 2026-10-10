@@ -199,6 +199,16 @@ A100 80GB PCIe, `max-num-seqs=1`, and one CUDA-emitting PID/TID. The validation
 does not cover batching, concurrency, Ray, multiprocessing, other models,
 other GPUs, or semantic token timestamps.
 
+The experimental transition-v4 preset widens only the pair window to 6 ms. The
+value is the whole-millisecond ceiling above the 5.037726 ms useful-pair tail
+observed during residual analysis, while the first preserved cross-cycle pair
+was 31.968417 ms. Production-analyzer replay of the immutable 24-request corpus
+removed all 10 false positives without changing any true positive or false
+negative: precision 1.0, recall 0.9865, and F1 0.9932. Batches 3 and 4 were held
+out from threshold selection and their candidate timestamps were unchanged.
+The preset remains default-disabled and requires fresh live validation before
+superseding transition-v3.
+
 ### `--request-gap`
 
 Override the inactivity gap that closes an activity candidate as a Go duration.
@@ -238,7 +248,8 @@ Enable experimental directional coalescing of an adjacent kernel-launch
 candidate followed by a D2H-async candidate within this duration. The default
 is disabled. This override requires the transition-v2/v3 operation masks and
 `decode-min-launches=0`; select the named transition-v2 preset to enable it
-manually, or transition-v3 for the frozen 3 ms calibration value.
+manually, transition-v3 for the accepted 3 ms value, or transition-v4 for the
+offline-reviewed 6 ms candidate.
 
 An unresolved launch half is not emitted as a completed cadence candidate when
 the activity closes. Instead, the gadget emits an `analyzer_health` record with
