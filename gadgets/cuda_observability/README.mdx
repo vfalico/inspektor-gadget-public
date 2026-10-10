@@ -33,12 +33,12 @@ counts, request IDs, or proof of GPU completion.
 <Tabs groupId="env">
     <TabItem value="kubectl-gadget" label="kubectl gadget">
         ```bash
-        $ kubectl gadget run ghcr.io/vfalico/cuda_observability:v0.1.0 [flags]
+        $ kubectl gadget run ghcr.io/vfalico/cuda_observability:v0.1.0 --verify-image=false [flags]
         ```
     </TabItem>
     <TabItem value="ig" label="ig">
         ```bash
-        $ sudo ig run ghcr.io/vfalico/cuda_observability:v0.1.0 [flags]
+        $ sudo ig run ghcr.io/vfalico/cuda_observability:v0.1.0 --verify-image=false [flags]
         ```
     </TabItem>
 </Tabs>
@@ -47,6 +47,7 @@ The default mode emits factual CUDA calls:
 
 ```bash
 $ sudo ig run ghcr.io/vfalico/cuda_observability:v0.1.0 \
+    --verify-image=false \
     --host -o json
 ```
 
@@ -54,6 +55,7 @@ Enable inference candidates explicitly:
 
 ```bash
 $ sudo ig run ghcr.io/vfalico/cuda_observability:v0.1.0 \
+    --verify-image=false \
     --host -o json \
     --heuristics=true \
     --preset=generic-conservative-v1
@@ -121,6 +123,7 @@ For high-rate serving workloads, opt into capacity-safe raw emission:
 
 ```bash
 $ sudo ig run ghcr.io/vfalico/cuda_observability:v0.1.0 \
+    --verify-image=false \
     --host -o json \
     --emit-context-get-device=false
 ```
@@ -177,6 +180,11 @@ Important metric names include:
 
 Candidate metric names deliberately retain the `_candidate` suffix. They must
 not be relabeled as serving-level TTFT or inter-token latency.
+
+The `v0.1.0` image is digest-pinned but unsigned. Released IG versions verify
+signatures by default, so the examples explicitly use `--verify-image=false`.
+Consumers should pin the published immutable digest rather than relying only on
+the human-readable tag.
 
 ## Parameters
 
