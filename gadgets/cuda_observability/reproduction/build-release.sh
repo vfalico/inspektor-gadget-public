@@ -27,16 +27,15 @@ source_epoch=$(git -C "$repo_root" show -s --format=%ct "$actual_commit")
 short_commit=${actual_commit:0:12}
 build_one=localhost/cuda_observability:v0.1.0-build1-"$short_commit"
 build_two=localhost/cuda_observability:v0.1.0-build2-"$short_commit"
-work_dir=$(mktemp -d "$repo_root/.cuda-release-build.XXXXXX")
-metadata_dir="$work_dir/cuda_observability"
+work_dir=$(mktemp -d)
+metadata_dir="$work_dir/gadgets/cuda_observability"
 
 cleanup() {
     rm -rf "$work_dir"
 }
 trap cleanup EXIT
 
-git -C "$repo_root" archive "$actual_commit" gadgets/cuda_observability |
-    tar -x -C "$work_dir" --strip-components=1
+git -C "$repo_root" archive "$actual_commit" | tar -x -C "$work_dir"
 python3 - "$metadata_dir/gadget.yaml" "$actual_commit" <<'PY'
 from pathlib import Path
 import sys
@@ -60,7 +59,7 @@ PY
 mkdir -p "$output_dir"
 for image in "$build_one" "$build_two"; do
     sudo -E \
-        IG_SOURCE_PATH="$repo_root" \
+        IG_SOURCE_PATH="$work_dir" \
         SOURCE_DATE_EPOCH="$source_epoch" \
         "$ig_bin" image build \
         --builder-image "$builder_image" \
