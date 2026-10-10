@@ -188,8 +188,16 @@ launch-to-D2H candidate coalescing before anchored deduplication. Its 3 ms
 window is the whole-millisecond ceiling above the 2.277645 ms useful-pair tail
 in the preserved calibration corpus. The first observed calibration
 cross-cycle replacement was 31.968417 ms. These are observed calibration
-bounds, not general runtime guarantees, and the preset remains experimental
-until a fresh immutable validation corpus passes.
+bounds, not general runtime guarantees.
+
+A fresh immutable validation corpus on the exact named stack passed 24 of 24
+pristine sequential requests with precision 0.9777, recall 0.9865, F1 0.9821,
+median absolute cadence error 1.274 ms, and p90 absolute error 1.626 ms against
+independent streamed-content truth. The preset remains experimental,
+default-disabled, and limited to vLLM 0.10.2, Qwen2.5-0.5B-Instruct, an NVIDIA
+A100 80GB PCIe, `max-num-seqs=1`, and one CUDA-emitting PID/TID. The validation
+does not cover batching, concurrency, Ray, multiprocessing, other models,
+other GPUs, or semantic token timestamps.
 
 ### `--request-gap`
 
