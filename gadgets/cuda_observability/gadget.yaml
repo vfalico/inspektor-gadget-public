@@ -1,7 +1,7 @@
 name: cuda observability
 description: Factual CUDA Driver API telemetry with opt-in inference activity candidates
-homepageURL: https://inspektor-gadget.io/
-documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/cuda_observability
+homepageURL: https://github.com/vfalico/inspektor-gadget-public/tree/cuda-observability/gadgets/cuda_observability
+documentationURL: https://github.com/vfalico/inspektor-gadget-public/blob/cuda-observability/gadgets/cuda_observability/README.mdx
 sourceURL: https://github.com/vfalico/inspektor-gadget-public/tree/cuda-observability/gadgets/cuda_observability
 datasources:
   correlation_loss:

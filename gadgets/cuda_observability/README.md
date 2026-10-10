@@ -9,5 +9,5 @@ device attribution and complete aggregate accounting. Host API duration is not
 GPU execution time, and the optional TTFT and decode-interval candidates are
 not semantic token timings or request identities.
 
-Check the full documentation on
-https://inspektor-gadget.io/docs/latest/gadgets/cuda_observability.
+Read the full documentation in
+[`README.mdx`](README.mdx).

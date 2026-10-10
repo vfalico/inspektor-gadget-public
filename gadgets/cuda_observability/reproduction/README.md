@@ -4,9 +4,9 @@ This bundle runs an unmodified vLLM container, GitHub Copilot CLI, and the
 `cuda_observability` gadget on one Linux NVIDIA host. The gadget uses external
 eBPF observation; it does not patch vLLM, CUDA, or Copilot.
 
-The bundle is a publication rehearsal until immutable public source, image,
-model, and container digests replace the local defaults. It never pushes an OCI
-image.
+The released image is `ghcr.io/vfalico/cuda_observability:v0.1.0`. For a
+reproducible run, resolve that tag once and use the resulting immutable digest.
+This bundle never pushes an OCI image.
 
 ## Reference stack
 
@@ -17,34 +17,33 @@ image.
 - one GPU, sequential traffic, `max-num-seqs=1`, eager execution
 - transition-v4 A100/Qwen/vLLM preset
 
-The reported T-758 values were measured on an A100 80GB. Other GPUs are useful
-for functional testing but are not expected to reproduce the same agreement.
+The published comparison values were measured on an A100 80GB. Other GPUs are
+useful for functional testing but are not expected to reproduce the same
+agreement.
 
-## Local image rehearsal
+## Build the release image
 
-Build the gadget from the repository root:
-
-```bash
-export IG_SOURCE_PATH=$PWD
-export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
-sudo -E ig image build \
-  gadgets/cuda_observability \
-  -t localhost/cuda_observability:reproduction
-```
-
-Export it without publishing:
+From a clean checkout, provide the exact source commit and build the fixed
+release tag twice:
 
 ```bash
-sudo ig image export \
-  localhost/cuda_observability:reproduction \
-  cuda_observability-reproduction.tar
-sha256sum cuda_observability-reproduction.tar
+export RELEASE_SOURCE_COMMIT=$(git rev-parse HEAD)
+gadgets/cuda_observability/reproduction/build-release.sh ./release-output
 ```
+
+The script refuses a dirty or mismatched checkout, uses a digest-pinned builder,
+injects an exact commit source URL into the image metadata, requires two
+identical builds, tags the verified bytes as
+`ghcr.io/vfalico/cuda_observability:v0.1.0`, and exports:
+
+- `cuda_observability-v0.1.0.tar`;
+- `release-identities.txt`; and
+- `SHA256SUMS`.
 
 On another host, copy the archive and load it:
 
 ```bash
-sudo ig image import cuda_observability-reproduction.tar
+sudo ig image import cuda_observability-v0.1.0.tar
 ```
 
 ## Run
@@ -67,7 +66,7 @@ Use environment variables to select local paths:
 export REPRO_IG_BIN=/path/to/ig
 export REPRO_COPILOT_BIN=/path/to/copilot
 export REPRO_MODEL_CACHE=/path/to/huggingface-cache
-export REPRO_GADGET_IMAGE=localhost/cuda_observability:reproduction
+export REPRO_GADGET_IMAGE=ghcr.io/vfalico/cuda_observability@sha256:<manifest>
 export REPRO_GPU_DEVICE=0
 ```
 

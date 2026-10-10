@@ -33,12 +33,12 @@ counts, request IDs, or proof of GPU completion.
 <Tabs groupId="env">
     <TabItem value="kubectl-gadget" label="kubectl gadget">
         ```bash
-        $ kubectl gadget run ghcr.io/inspektor-gadget/gadget/cuda_observability:%IG_TAG% [flags]
+        $ kubectl gadget run ghcr.io/vfalico/cuda_observability:v0.1.0 [flags]
         ```
     </TabItem>
     <TabItem value="ig" label="ig">
         ```bash
-        $ sudo ig run ghcr.io/inspektor-gadget/gadget/cuda_observability:%IG_TAG% [flags]
+        $ sudo ig run ghcr.io/vfalico/cuda_observability:v0.1.0 [flags]
         ```
     </TabItem>
 </Tabs>
@@ -46,14 +46,14 @@ counts, request IDs, or proof of GPU completion.
 The default mode emits factual CUDA calls:
 
 ```bash
-$ sudo ig run ghcr.io/inspektor-gadget/gadget/cuda_observability:%IG_TAG% \
+$ sudo ig run ghcr.io/vfalico/cuda_observability:v0.1.0 \
     --host -o json
 ```
 
 Enable inference candidates explicitly:
 
 ```bash
-$ sudo ig run ghcr.io/inspektor-gadget/gadget/cuda_observability:%IG_TAG% \
+$ sudo ig run ghcr.io/vfalico/cuda_observability:v0.1.0 \
     --host -o json \
     --heuristics=true \
     --preset=generic-conservative-v1
@@ -120,7 +120,7 @@ unmatched-return, map-update, and buffer-reservation counts by operation.
 For high-rate serving workloads, opt into capacity-safe raw emission:
 
 ```bash
-$ sudo ig run ghcr.io/inspektor-gadget/gadget/cuda_observability:%IG_TAG% \
+$ sudo ig run ghcr.io/vfalico/cuda_observability:v0.1.0 \
     --host -o json \
     --emit-context-get-device=false
 ```
@@ -205,28 +205,32 @@ The newer immutable preset
 `vllm-0.10.2-qwen2.5-0.5b-a100-sequential-transition-v3` adds directional
 launch-to-D2H candidate coalescing before anchored deduplication. Its 3 ms
 window is the whole-millisecond ceiling above the 2.277645 ms useful-pair tail
-in the preserved calibration corpus. The first observed calibration
-cross-cycle replacement was 31.968417 ms. These are observed calibration
-bounds, not general runtime guarantees.
+in the private calibration corpus. The first observed calibration cross-cycle
+replacement was 31.968417 ms. These are descriptive observations, not general
+runtime guarantees. The calibration corpus is not distributed in this source
+repository, so these exact values are not independently reproducible here.
 
-A fresh immutable validation corpus on the exact named stack passed 24 of 24
-pristine sequential requests with precision 0.9777, recall 0.9865, F1 0.9821,
-median absolute cadence error 1.274 ms, and p90 absolute error 1.626 ms against
-independent streamed-content truth. The preset remains experimental,
-default-disabled, and limited to vLLM 0.10.2, Qwen2.5-0.5B-Instruct, an NVIDIA
-A100 80GB PCIe, `max-num-seqs=1`, and one CUDA-emitting PID/TID. The validation
-does not cover batching, concurrency, Ray, multiprocessing, other models,
-other GPUs, or semantic token timestamps.
+Private exact-stack validation passed 24 of 24 pristine sequential requests
+with precision 0.9777, recall 0.9865, F1 0.9821, median absolute cadence error
+1.274 ms, and p90 absolute error 1.626 ms against independent streamed-content
+truth. The corpus is not distributed in this repository; the values are
+disclosed as descriptive validation evidence rather than a reproducible public
+benchmark. The preset remains experimental, default-disabled, and limited to
+vLLM 0.10.2, Qwen2.5-0.5B-Instruct, an NVIDIA A100 80GB PCIe,
+`max-num-seqs=1`, and one CUDA-emitting PID/TID. The validation does not cover
+batching, concurrency, Ray, multiprocessing, other models, other GPUs, or
+semantic token timestamps.
 
 The experimental transition-v4 preset widens only the pair window to 6 ms. The
 value is the whole-millisecond ceiling above the 5.037726 ms useful-pair tail
 observed during residual analysis, while the first preserved cross-cycle pair
-was 31.968417 ms. Production-analyzer replay of the immutable 24-request corpus
-removed all 10 false positives without changing any true positive or false
-negative: precision 1.0, recall 0.9865, and F1 0.9932. Batches 3 and 4 were held
-out from threshold selection and their candidate timestamps were unchanged.
-The preset remains default-disabled and requires fresh live validation before
-superseding transition-v3.
+was 31.968417 ms. Private production-analyzer replay of the same 24-request
+corpus removed all 10 false positives without changing any true positive or
+false negative: precision 1.0, recall 0.9865, and F1 0.9932. Two batches were
+held out from threshold selection and their candidate timestamps were
+unchanged. The corpus is not included here, so these exact replay results are
+not a public reproduction claim. The preset remains default-disabled and
+requires fresh live validation before superseding transition-v3.
 
 ### `--request-gap`
 

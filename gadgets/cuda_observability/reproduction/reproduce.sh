@@ -42,7 +42,7 @@ vllm_image=${REPRO_VLLM_IMAGE:-vllm/vllm-openai:v0.10.2}
 model=${REPRO_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
 model_revision=${REPRO_MODEL_REVISION:-}
 model_cache=${REPRO_MODEL_CACHE:-"$HOME/.cache/huggingface"}
-gadget_image=${REPRO_GADGET_IMAGE:-localhost/cuda_observability:reproduction}
+gadget_image=${REPRO_GADGET_IMAGE:-ghcr.io/vfalico/cuda_observability:v0.1.0}
 ig_bin=${REPRO_IG_BIN:-ig}
 copilot_bin=${REPRO_COPILOT_BIN:-$(command -v copilot || true)}
 gpu_device=${REPRO_GPU_DEVICE:-0}
@@ -166,7 +166,7 @@ cleanup() {
         printf 'vllm_image=%s\n' "$vllm_image"
         printf 'gadget_image=%s\n' "$gadget_image"
         printf 'model=%s\n' "$model"
-        printf 'model_revision=%s\n' "${model_revision:-unpinned-preliminary}"
+        printf 'model_revision=%s\n' "${model_revision:-unpinned}"
         printf 'preset=%s\n' "$preset"
         printf 'ig_scope=%s\n' "$ig_scope"
     } >"$run_dir/identities.txt"

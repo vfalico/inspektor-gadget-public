@@ -1,15 +1,15 @@
-version: 0.55.0
+version: 0.1.0
 name: "cuda observability"
 displayName: "cuda observability"
 category: monitoring-logging
 createdAt: "2026-10-09T07:10:00Z"
 description: Factual CUDA Driver API telemetry with explicitly enabled inference activity candidates
 logoURL: https://inspektor-gadget.io/media/brand-icon.svg
-license: ""
-homeURL: "https://inspektor-gadget.io/docs/latest/gadgets/cuda_observability/"
+license: Apache-2.0
+homeURL: "https://github.com/vfalico/inspektor-gadget-public/tree/cuda-observability/gadgets/cuda_observability"
 containersImages:
   - name: gadget
-    image: "ghcr.io/vfalico/cuda_observability:latest"
+    image: "ghcr.io/vfalico/cuda_observability:v0.1.0"
     platforms:
       - linux/amd64
 keywords:
@@ -24,7 +24,7 @@ links:
 install: |
   # Run
   ```bash
-  sudo ig run ghcr.io/vfalico/cuda_observability:latest
+  sudo ig run ghcr.io/vfalico/cuda_observability:v0.1.0
   ```
 provider:
   name: Veaceslav Falico
