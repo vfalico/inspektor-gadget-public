@@ -27,7 +27,7 @@ source_epoch=$(git -C "$repo_root" show -s --format=%ct "$actual_commit")
 short_commit=${actual_commit:0:12}
 build_one=localhost/cuda_observability:v0.1.0-build1-"$short_commit"
 build_two=localhost/cuda_observability:v0.1.0-build2-"$short_commit"
-work_dir=$(mktemp -d)
+work_dir=$(mktemp -d "$repo_root/.cuda-release-build.XXXXXX")
 metadata_dir="$work_dir/cuda_observability"
 
 cleanup() {
