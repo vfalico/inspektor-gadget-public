@@ -14,6 +14,9 @@ datasources:
       cuda_emitted:
         annotations:
           description: CUDA return records successfully submitted to the event buffer.
+      cuda_omitted:
+        annotations:
+          description: CUDA returns intentionally omitted from per-call raw output by explicit emission configuration.
       exit_attempts:
         annotations:
           description: Tracked marker-process leader exits observed.
@@ -239,6 +242,12 @@ datasources:
         annotations:
           description: Count of failures to insert entry state into the bounded pending-call
             map for this operation.
+      raw_emitted:
+        annotations:
+          description: Count of completed calls successfully emitted as per-call raw records.
+      intentionally_omitted:
+        annotations:
+          description: Count of completed calls deliberately omitted from per-call raw output by explicit emission configuration.
       pid:
         annotations:
           description: Not populated for global aggregates; PID is deliberately excluded
@@ -450,6 +459,10 @@ datasources:
           logs.name: timestamp
 params:
   ebpf:
+    emit_context_get_device:
+      key: emit-context-get-device
+      defaultValue: "true"
+      description: Emit individual cuCtxGetDevice return records. Set false to retain device caching and complete aggregates while intentionally omitting this high-rate operation from raw output.
     targ_comm:
       key: targ_comm
       defaultValue: ""

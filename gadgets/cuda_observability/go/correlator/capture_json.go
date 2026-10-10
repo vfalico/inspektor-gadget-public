@@ -52,6 +52,8 @@ type captureObject struct {
 type captureArrayRow struct {
 	OperationRaw          *uint32 `json:"operation_raw"`
 	Calls                 uint64  `json:"calls"`
+	RawEmitted            uint64  `json:"raw_emitted"`
+	IntentionalOmissions  uint64  `json:"intentionally_omitted"`
 	UnmatchedReturns      uint64  `json:"unmatched_returns"`
 	ReserveFailures       uint64  `json:"reserve_failures"`
 	PendingUpdateFailures uint64  `json:"pending_update_failures"`
@@ -59,6 +61,7 @@ type captureArrayRow struct {
 	Generation            *uint64 `json:"generation"`
 	CUDACompleted         uint64  `json:"cuda_completed"`
 	CUDAEmitted           uint64  `json:"cuda_emitted"`
+	CUDAOmitted           uint64  `json:"cuda_omitted"`
 	MarkerInvocations     uint64  `json:"marker_invocations"`
 	MarkerAccepted        uint64  `json:"marker_accepted"`
 	MarkerRejected        uint64  `json:"marker_rejected"`
@@ -100,6 +103,7 @@ func addFooter(total *CaptureFooter, row captureArrayRow) error {
 		{&total.Generation, *row.Generation},
 		{&total.CUDACompleted, row.CUDACompleted},
 		{&total.CUDAEmitted, row.CUDAEmitted},
+		{&total.CUDAOmitted, row.CUDAOmitted},
 		{&total.MarkerInvocations, row.MarkerInvocations},
 		{&total.MarkerAccepted, row.MarkerAccepted},
 		{&total.MarkerRejected, row.MarkerRejected},
@@ -144,7 +148,7 @@ func parseCaptureArray(line []byte, capture *CheckedRequestCapture) error {
 				return fmt.Errorf("mixed capture footer and CUDA statistics row")
 			}
 			if err := requireRowKeys(fields,
-				"cuda_completed", "cuda_emitted", "exit_attempts",
+				"cuda_completed", "cuda_emitted", "cuda_omitted", "exit_attempts",
 				"exit_emitted", "exit_reserve_failures", "generation", "key",
 				"marker_accepted", "marker_emitted", "marker_invocations",
 				"marker_rejected", "marker_reserve_failures",
@@ -161,7 +165,8 @@ func parseCaptureArray(line []byte, capture *CheckedRequestCapture) error {
 		case row.OperationRaw != nil:
 			if err := requireRowKeys(fields,
 				"calls", "duration_ns", "errors", "operation", "operation_raw",
-				"pending_update_failures", "requested_bytes",
+				"intentionally_omitted", "pending_update_failures", "raw_emitted",
+				"requested_bytes",
 				"reserve_failures", "unmatched_returns",
 			); err != nil {
 				return err
@@ -171,6 +176,12 @@ func parseCaptureArray(line []byte, capture *CheckedRequestCapture) error {
 			}
 			operationKeys[*row.OperationRaw] = struct{}{}
 			if err := addCounter(&capture.CUDAStats.CompletedCalls, row.Calls); err != nil {
+				return err
+			}
+			if err := addCounter(&capture.CUDAStats.RawEmitted, row.RawEmitted); err != nil {
+				return err
+			}
+			if err := addCounter(&capture.CUDAStats.IntentionalOmissions, row.IntentionalOmissions); err != nil {
 				return err
 			}
 			if err := addCounter(&capture.CUDAStats.UnmatchedReturns, row.UnmatchedReturns); err != nil {

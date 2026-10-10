@@ -59,6 +59,7 @@ type CaptureFooter struct {
 	Generation            uint64
 	CUDACompleted         uint64
 	CUDAEmitted           uint64
+	CUDAOmitted           uint64
 	MarkerInvocations     uint64
 	MarkerAccepted        uint64
 	MarkerRejected        uint64
@@ -72,6 +73,8 @@ type CaptureFooter struct {
 
 type CUDAStatsSummary struct {
 	CompletedCalls        uint64
+	RawEmitted            uint64
+	IntentionalOmissions  uint64
 	UnmatchedReturns      uint64
 	ReserveFailures       uint64
 	PendingUpdateFailures uint64
@@ -151,6 +154,9 @@ func validatePristineAccounting(capture CheckedRequestCapture) error {
 	// request-completeness proof. Any observed failure still fails closed.
 	if footer.Generation != 0 {
 		return fmt.Errorf("capture is not pristine: loss generation %d", footer.Generation)
+	}
+	if footer.CUDAOmitted != 0 || capture.CUDAStats.IntentionalOmissions != 0 {
+		return fmt.Errorf("capture intentionally omits raw CUDA records")
 	}
 	if footer.StateInsertFailures != 0 ||
 		footer.MarkerReserveFailures != 0 ||

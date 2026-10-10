@@ -108,6 +108,8 @@ struct cuda_stat {
 	gadget_counter__u64 errors;
 	gadget_counter__u64 requested_bytes;
 	gadget_counter__u64 duration_ns;
+	gadget_counter__u64 raw_emitted;
+	gadget_counter__u64 intentionally_omitted;
 	gadget_counter__u64 unmatched_returns;
 	gadget_counter__u64 reserve_failures;
 	gadget_counter__u64 pending_update_failures;
@@ -168,6 +170,7 @@ struct correlation_loss_state {
 	__u64 generation;
 	__u64 cuda_completed;
 	__u64 cuda_emitted;
+	__u64 cuda_omitted;
 	__u64 marker_invocations;
 	__u64 marker_accepted;
 	__u64 marker_rejected;
@@ -227,6 +230,9 @@ struct {
 	__type(key, __u32);
 	__type(value, __s32);
 } process_devices SEC(".maps");
+
+const volatile bool emit_context_get_device = true;
+GADGET_PARAM(emit_context_get_device);
 
 #ifndef CUDA_OBSERVABILITY_EVENT_RING_BYTES
 #define CUDA_OBSERVABILITY_EVENT_RING_BYTES (128 * 1024 * 1024)
@@ -348,6 +354,21 @@ static __always_inline void unwind_request_cuda(__u64 pid_tgid)
 	state->cuda_depth--;
 }
 
+static __always_inline void complete_request_cuda_without_event(__u64 pid_tgid)
+{
+	struct request_process_state *state =
+		bpf_map_lookup_elem(&request_processes, &pid_tgid);
+
+	if (!state)
+		return;
+	if (state->cuda_depth == 0) {
+		state->context_state = REQUEST_CONTEXT_EPOCH_INVALID;
+		return;
+	}
+	state->cuda_depth--;
+	state->request_sequence++;
+}
+
 static __always_inline int call_enter(struct pending_call *pending)
 {
 	struct call_key key = {
@@ -430,6 +451,16 @@ static __always_inline int call_exit(struct pt_regs *ctx,
 			__sync_fetch_and_add(&s->errors, 1);
 	}
 
+	if (expected == CUDA_OP_CONTEXT_GET_DEVICE &&
+	    !emit_context_get_device) {
+		complete_request_cuda_without_event(key.pid_tgid);
+		if (s)
+			__sync_fetch_and_add(&s->intentionally_omitted, 1);
+		if (capture)
+			__sync_fetch_and_add(&capture->cuda_omitted, 1);
+		return 0;
+	}
+
 	event = gadget_reserve_buf(&events, sizeof(*event));
 	if (!event) {
 		unwind_request_cuda(key.pid_tgid);
@@ -467,8 +498,11 @@ static __always_inline int call_exit(struct pt_regs *ctx,
 		if (s)
 			__sync_fetch_and_add(&s->reserve_failures, 1);
 		record_correlation_loss();
-	} else if (capture) {
-		__sync_fetch_and_add(&capture->cuda_emitted, 1);
+	} else {
+		if (s)
+			__sync_fetch_and_add(&s->raw_emitted, 1);
+		if (capture)
+			__sync_fetch_and_add(&capture->cuda_emitted, 1);
 	}
 	return 0;
 }

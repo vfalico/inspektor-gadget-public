@@ -35,19 +35,22 @@ func TestParseJSONLCaptureAcceptsNumericMarkerAndStringDerivedReasons(t *testing
 
 func TestParseJSONLCaptureAggregatesIndependentMapSnapshots(t *testing.T) {
 	input := strings.NewReader(
-		`[{"cuda_completed":2,"cuda_emitted":2,"exit_attempts":0,"exit_emitted":0,"exit_reserve_failures":0,"generation":0,"key":0,"marker_accepted":2,"marker_emitted":2,"marker_invocations":2,"marker_rejected":0,"marker_reserve_failures":0,"state_insert_failures":0}]` + "\n" +
-			`[{"cuda_completed":3,"cuda_emitted":3,"exit_attempts":1,"exit_emitted":1,"exit_reserve_failures":0,"generation":0,"key":0,"marker_accepted":1,"marker_emitted":1,"marker_invocations":1,"marker_rejected":0,"marker_reserve_failures":0,"state_insert_failures":0}]` + "\n" +
-			`[{"calls":2,"duration_ns":7,"errors":0,"operation":"CUDA_OP_LAUNCH_KERNEL","operation_raw":0,"pending_update_failures":0,"requested_bytes":0,"reserve_failures":0,"unmatched_returns":0}]` + "\n" +
-			`[{"calls":3,"duration_ns":11,"errors":0,"operation":"CUDA_OP_LAUNCH_KERNEL","operation_raw":0,"pending_update_failures":0,"requested_bytes":0,"reserve_failures":0,"unmatched_returns":0}]` + "\n")
+		`[{"cuda_completed":2,"cuda_emitted":2,"cuda_omitted":0,"exit_attempts":0,"exit_emitted":0,"exit_reserve_failures":0,"generation":0,"key":0,"marker_accepted":2,"marker_emitted":2,"marker_invocations":2,"marker_rejected":0,"marker_reserve_failures":0,"state_insert_failures":0}]` + "\n" +
+			`[{"cuda_completed":3,"cuda_emitted":2,"cuda_omitted":1,"exit_attempts":1,"exit_emitted":1,"exit_reserve_failures":0,"generation":0,"key":0,"marker_accepted":1,"marker_emitted":1,"marker_invocations":1,"marker_rejected":0,"marker_reserve_failures":0,"state_insert_failures":0}]` + "\n" +
+			`[{"calls":2,"duration_ns":7,"errors":0,"intentionally_omitted":0,"operation":"CUDA_OP_LAUNCH_KERNEL","operation_raw":0,"pending_update_failures":0,"raw_emitted":2,"requested_bytes":0,"reserve_failures":0,"unmatched_returns":0}]` + "\n" +
+			`[{"calls":3,"duration_ns":11,"errors":0,"intentionally_omitted":1,"operation":"CUDA_OP_LAUNCH_KERNEL","operation_raw":0,"pending_update_failures":0,"raw_emitted":2,"requested_bytes":0,"reserve_failures":0,"unmatched_returns":0}]` + "\n")
 	capture, err := ParseJSONLCapture(input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if capture.Footer == nil ||
 		capture.Footer.CUDACompleted != 5 ||
+		capture.Footer.CUDAOmitted != 1 ||
 		capture.Footer.MarkerAccepted != 3 ||
 		capture.Footer.ExitAttempts != 1 ||
-		capture.CUDAStats.CompletedCalls != 5 {
+		capture.CUDAStats.CompletedCalls != 5 ||
+		capture.CUDAStats.RawEmitted != 4 ||
+		capture.CUDAStats.IntentionalOmissions != 1 {
 		t.Fatalf("capture=%#v", capture)
 	}
 }

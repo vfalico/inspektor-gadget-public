@@ -12,7 +12,11 @@ The `cuda_observability` gadget records factual CUDA Driver API returns and can
 optionally derive bounded inference-activity timing candidates from launch and
 copy patterns.
 
-Raw `cuda_calls` output is unchanged when heuristics are enabled. The
+Raw `cuda_calls` output is unchanged when heuristics are enabled. By default,
+every traced return is emitted. The explicit
+`--emit-context-get-device=false` capacity-safe mode retains device caching and
+complete aggregate statistics while intentionally omitting individual
+`cuCtxGetDevice` records from raw output. The
 `duration_raw` field is host API entry-to-return latency, not GPU execution
 time. Candidate fields are not semantic TTFT, inter-token latency, token
 counts, request IDs, or proof of GPU completion.
@@ -110,8 +114,23 @@ The gadget traces selected CUDA Driver API entry and return points, including:
 
 Each `cuda_calls` record contains the return code, host-side duration, operation
 metadata, and Inspektor Gadget process/container attribution. Bounded aggregate
-rows report call, error, byte, duration, unmatched-return, map-update, and
-buffer-reservation counts by operation.
+rows report call, error, byte, duration, raw-emission, intentional-omission,
+unmatched-return, map-update, and buffer-reservation counts by operation.
+
+For high-rate serving workloads, opt into capacity-safe raw emission:
+
+```bash
+$ sudo ig run ghcr.io/inspektor-gadget/gadget/cuda_observability:%IG_TAG% \
+    --host -o json \
+    --emit-context-get-device=false
+```
+
+This remains a CUDA-only gadget with no application hooks, but its per-call
+`cuda_calls` stream is intentionally incomplete. `cuCtxGetDevice` probes still
+update device attribution and aggregate calls, errors, and duration.
+`intentionally_omitted` and `cuda_omitted` distinguish this configured omission
+from `reserve_failures` and loss generation. Request-marker completeness replay
+rejects filtered captures.
 
 Raw CUDA calls can arrive in large bursts. Each attached eBPF instance therefore
 uses a 128 MiB ring buffer for `cuda_calls`; the independent request-marker and
