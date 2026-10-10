@@ -9,7 +9,7 @@ license: ""
 homeURL: "https://inspektor-gadget.io/docs/latest/gadgets/cuda_observability/"
 containersImages:
   - name: gadget
-    image: "ghcr.io/inspektor-gadget/gadget/cuda_observability:latest"
+    image: "ghcr.io/vfalico/cuda_observability:latest"
     platforms:
       - linux/amd64
 keywords:
@@ -20,11 +20,11 @@ keywords:
   - opentelemetry
 links:
   - name: source
-    url: "https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/cuda_observability"
+    url: "https://github.com/vfalico/inspektor-gadget-public/tree/cuda-observability/gadgets/cuda_observability"
 install: |
   # Run
   ```bash
-  sudo ig run ghcr.io/inspektor-gadget/gadget/cuda_observability:latest
+  sudo ig run ghcr.io/vfalico/cuda_observability:latest
   ```
 provider:
-  name: Inspektor Gadget
+  name: Veaceslav Falico
